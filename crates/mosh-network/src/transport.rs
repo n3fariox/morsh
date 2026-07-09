@@ -1,6 +1,7 @@
 use crate::constants::*;
 use crate::connection::Connection;
-use mosh_crypto::{Nonce, Session};
+use crate::fragment::add_chaff;
+use mosh_crypto::Nonce;
 use mosh_proto::transport::Instruction as TransportInstruction;
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,8 @@ pub struct TransportReceiver {
     state_num: u64,
     /// What we've acknowledged to the remote.
     acked_state_num: u64,
+    /// The remote's last state number (from their new_num field).
+    remote_state_num: u64,
     /// Nonce sequence counter for received packets.
     nonce_seq: u64,
     /// Whether this is the client side.
@@ -56,6 +59,12 @@ pub struct TransportReceiver {
     last_recv_time: Instant,
     /// Shutdown state.
     shutdown_received: bool,
+    /// Whether we have a pending delayed ACK to send.
+    pending_ack: bool,
+    /// When the delayed ACK should fire (after ACK_DELAY_MS from last receive).
+    ack_deadline: Option<Instant>,
+    /// Last time we sent an ACK (for periodic ACK interval).
+    last_ack_time: Instant,
 }
 
 /// A received state diff with metadata.
@@ -215,13 +224,18 @@ impl TransportSender {
 
 impl TransportReceiver {
     pub fn new(client_side: bool) -> Self {
+        let now = Instant::now();
         Self {
             state_num: 0,
             acked_state_num: 0,
+            remote_state_num: 0,
             nonce_seq: 0,
             client_side,
-            last_recv_time: Instant::now(),
+            last_recv_time: now,
             shutdown_received: false,
+            pending_ack: false,
+            ack_deadline: None,
+            last_ack_time: now,
         }
     }
 
@@ -233,6 +247,11 @@ impl TransportReceiver {
     /// Get the acked state number.
     pub fn acked_state_num(&self) -> u64 {
         self.acked_state_num
+    }
+
+    /// Get the remote's last state number.
+    pub fn remote_state_num(&self) -> u64 {
+        self.remote_state_num
     }
 
     /// Whether we've received a shutdown.
@@ -257,9 +276,35 @@ impl TransportReceiver {
         }
     }
 
-    /// Record that we received a packet.
+    /// Record that we received a packet. Schedules a delayed ACK.
     pub fn record_recv(&mut self, now: Instant) {
         self.last_recv_time = now;
+        // Schedule a delayed ACK if one isn't already pending
+        if !self.pending_ack {
+            self.pending_ack = true;
+            self.ack_deadline = Some(now + Duration::from_millis(ACK_DELAY_MS));
+        }
+    }
+
+    /// Check if we should send an ACK now.
+    /// Returns true if the delayed ACK deadline has passed, or if the
+    /// periodic ACK interval has elapsed.
+    pub fn should_send_ack(&self, now: Instant) -> bool {
+        // Delayed ACK: we received data and the deadline has passed
+        if let Some(deadline) = self.ack_deadline {
+            if now >= deadline {
+                return true;
+            }
+        }
+        // Periodic ACK: send empty ACKs at ACK_INTERVAL even without data
+        now.duration_since(self.last_ack_time) >= Duration::from_millis(ACK_INTERVAL_MS)
+    }
+
+    /// Mark that we just sent an ACK. Clears the pending ACK state.
+    pub fn ack_sent(&mut self, now: Instant) {
+        self.pending_ack = false;
+        self.ack_deadline = None;
+        self.last_ack_time = now;
     }
 
     /// Get the next nonce for receiving.
@@ -315,16 +360,21 @@ impl Transport {
         &mut self.connection
     }
 
-    /// Send a state diff.
+    /// Send a state diff. Clears any pending ACK since the diff piggybacks it.
     pub async fn send_diff(
         &mut self,
         diff: Vec<u8>,
         ack_num: u64,
         throwaway_num: u64,
     ) -> Result<(), String> {
-        let inst = self.sender.build_instruction(diff, ack_num, throwaway_num);
+        let mut inst = self.sender.build_instruction(diff, ack_num, throwaway_num);
+        // Add chaff for traffic analysis resistance
+        let chaff_byte = (self.sender.state_num() & 0xFF) as u8;
+        add_chaff(&mut inst, chaff_byte);
         self.connection.send(&inst).await?;
-        self.sender.record_send(Instant::now());
+        let now = Instant::now();
+        self.sender.record_send(now);
+        self.receiver.ack_sent(now);
         Ok(())
     }
 
@@ -332,8 +382,10 @@ impl Transport {
     pub async fn send_shutdown(&mut self, ack_num: u64) -> Result<(), String> {
         let inst = self.sender.build_shutdown_instruction(ack_num);
         self.connection.send(&inst).await?;
-        self.sender.record_send(Instant::now());
+        let now = Instant::now();
+        self.sender.record_send(now);
         self.sender.shutdown_retries += 1;
+        self.receiver.ack_sent(now);
         Ok(())
     }
 
@@ -343,6 +395,11 @@ impl Transport {
             Some(inst) => {
                 self.receiver.record_recv(Instant::now());
                 let diff = TransportReceiver::parse_instruction(&inst);
+
+                // Track the remote's state number for acks
+                if diff.new_num > self.receiver.remote_state_num {
+                    self.receiver.remote_state_num = diff.new_num;
+                }
 
                 // Update our ack tracking
                 self.receiver.record_ack_sent(diff.ack_num);
@@ -361,6 +418,21 @@ impl Transport {
     /// Check if it's time to send.
     pub fn should_send(&self, now: Instant) -> bool {
         self.sender.should_send(now)
+    }
+
+    /// Check if we should send an empty ACK now.
+    pub fn should_send_ack(&self, now: Instant) -> bool {
+        self.receiver.should_send_ack(now)
+    }
+
+    /// Send an empty ACK (no diff). Used for delayed ACKs and periodic ACKs.
+    pub async fn send_ack(&mut self, ack_num: u64) -> Result<(), String> {
+        let inst = self.sender.build_instruction(Vec::new(), ack_num, self.sender.throwaway_num);
+        self.connection.send(&inst).await?;
+        let now = Instant::now();
+        self.sender.record_send(now);
+        self.receiver.ack_sent(now);
+        Ok(())
     }
 
     /// Update send interval from RTT.
@@ -509,5 +581,66 @@ mod tests {
         assert!(inst.diff.is_none());
         assert_eq!(inst.old_num, Some(1));
         assert_eq!(inst.new_num, Some(1));
+    }
+
+    #[test]
+    fn delayed_ack_scheduled_on_recv() {
+        let mut receiver = TransportReceiver::new(true);
+        let now = Instant::now();
+
+        // Initially no pending ACK
+        assert!(!receiver.pending_ack);
+        assert!(!receiver.should_send_ack(now));
+
+        // After recording a receive, a delayed ACK is scheduled
+        receiver.record_recv(now);
+        assert!(receiver.pending_ack);
+        assert!(!receiver.should_send_ack(now)); // Too early
+
+        // After ACK_DELAY_MS, should send
+        assert!(receiver.should_send_ack(now + Duration::from_millis(ACK_DELAY_MS)));
+    }
+
+    #[test]
+    fn delayed_ack_cleared_on_send() {
+        let mut receiver = TransportReceiver::new(true);
+        let now = Instant::now();
+
+        receiver.record_recv(now);
+        assert!(receiver.pending_ack);
+
+        // Sending an ACK clears the pending state
+        receiver.ack_sent(now + Duration::from_millis(50));
+        assert!(!receiver.pending_ack);
+        assert!(receiver.ack_deadline.is_none());
+    }
+
+    #[test]
+    fn periodic_ack_interval() {
+        let mut receiver = TransportReceiver::new(true);
+        let now = Instant::now();
+
+        // No pending ACK, but periodic ACK interval triggers
+        assert!(receiver.should_send_ack(now + Duration::from_millis(ACK_INTERVAL_MS)));
+
+        // After sending an ACK, reset the interval
+        receiver.ack_sent(now + Duration::from_millis(ACK_INTERVAL_MS));
+        assert!(!receiver.should_send_ack(now + Duration::from_millis(ACK_INTERVAL_MS + 100)));
+
+        // But after another full interval, it triggers again
+        assert!(receiver.should_send_ack(now + Duration::from_millis(ACK_INTERVAL_MS * 2)));
+    }
+
+    #[test]
+    fn multiple_recacks_only_one_pending() {
+        let mut receiver = TransportReceiver::new(true);
+        let now = Instant::now();
+
+        receiver.record_recv(now);
+        let deadline1 = receiver.ack_deadline;
+
+        // Second receive should NOT reset the deadline
+        receiver.record_recv(now + Duration::from_millis(50));
+        assert_eq!(receiver.ack_deadline, deadline1);
     }
 }

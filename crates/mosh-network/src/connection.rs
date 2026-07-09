@@ -20,6 +20,8 @@ pub struct Connection {
     server: bool,
     has_remote_addr: bool,
     last_heard: Instant,
+    /// Send nonce sequence counter. Each send increments this.
+    send_seq: u64,
 }
 
 impl Connection {
@@ -44,6 +46,7 @@ impl Connection {
             server: true,
             has_remote_addr: false,
             last_heard: now,
+            send_seq: 0,
         })
     }
 
@@ -68,6 +71,7 @@ impl Connection {
             server: false,
             has_remote_addr: false,
             last_heard: now,
+            send_seq: 0,
         })
     }
 
@@ -112,11 +116,27 @@ impl Connection {
     pub async fn recv(&mut self) -> Result<Option<TransportInstruction>, String> {
         let mut buf = vec![0u8; MTU_IPV4 + 64];
 
-        for socket in &self.sockets {
-            match socket.try_recv(&mut buf) {
+        let socket_count = self.sockets.len();
+        for idx in 0..socket_count {
+            let result = if self.server && !self.has_remote_addr {
+                // Server uses recv_from to learn client address
+                let (len, peer) = match self.sockets[idx].recv_from(&mut buf).await {
+                    Ok(r) => r,
+                    Err(e) => return Err(format!("Recv error: {e}")),
+                };
+                // Learn client address
+                self.remote_addr = Some(peer);
+                self.has_remote_addr = true;
+                log::info!("Learned client address: {peer}");
+                Ok(len)
+            } else {
+                self.sockets[idx].try_recv(&mut buf)
+            };
+
+            match result {
                 Ok(len) => {
-                    let data = &buf[..len];
-                    let frag = self.decrypt_fragment(data)?;
+                    let data = buf[..len].to_vec();
+                    let frag = self.decrypt_fragment(&data)?;
                     self.last_heard = Instant::now();
                     self.last_roundtrip_success = Instant::now();
                     return self.assembler.add_fragment(frag);
@@ -164,9 +184,22 @@ impl Connection {
         self.rtt.update(rtt_ms);
     }
 
-    fn encrypt_fragment(&mut self, frag: &Fragment) -> Result<Vec<u8>, String> {
+    /// Get the current send sequence number (for testing).
+    pub fn send_seq(&self) -> u64 {
+        self.send_seq
+    }
+
+    /// Encrypt a fragment (public for testing).
+    pub fn encrypt_fragment(&mut self, frag: &Fragment) -> Result<Vec<u8>, String> {
         let plaintext = frag.to_bytes();
-        let nonce = Nonce::from_val(0); // seq=0 for now; caller should manage direction+seq
+        // Build nonce: direction bit (bit 63) + sequence number
+        let nonce_val = if self.server {
+            self.send_seq // Server sends without high bit
+        } else {
+            (1u64 << 63) | self.send_seq // Client sends with high bit set
+        };
+        let nonce = Nonce::from_val(nonce_val);
+        self.send_seq += 1;
         let msg = mosh_crypto::Message::new(nonce, plaintext);
         let ciphertext = self.session.encrypt(&msg);
         Ok(ciphertext)

@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Send initial state
     let init_diff = user_stream.diff_from(&sent_stream);
     if !init_diff.is_empty() {
-        let ack_num = terminal_state.echo_ack();
+        let ack_num = transport.receiver.remote_state_num();
         let throwaway = transport.sender.throwaway_num();
         transport.send_diff(init_diff.clone(), ack_num, throwaway).await?;
         sent_stream = user_stream.clone();
@@ -193,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if user_stream.len() > sent_stream.len() {
                     let diff = user_stream.diff_from(&sent_stream);
                     if !diff.is_empty() {
-                        let ack_num = terminal_state.echo_ack();
+                        let ack_num = transport.receiver.remote_state_num();
                         let throwaway = transport.sender.throwaway_num();
                         if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                             log::warn!("Send error: {e}");

@@ -1,7 +1,9 @@
 use mosh_crypto::{Base64Key, Session};
 use mosh_network::{Connection, Transport};
+use mosh_proto::client::UserMessage;
 use mosh_statesync::Complete;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
+use prost::Message;
 use std::env;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -184,8 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let diff = terminal_state.diff_from(&client_assumed_state);
 
                         if !diff.is_empty() && last_send_time.elapsed() >= send_interval {
-                            // Send diff to client
-                            let ack_num = 0; // TODO: track user stream acks
+                            // Send diff to client, acking the client's state
+                            let ack_num = transport.receiver.remote_state_num();
                             let throwaway = transport.sender.throwaway_num();
                             if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                                 log::warn!("Send error: {e}");
@@ -207,10 +209,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv_diff() => {
                 match result {
                     Ok(Some(diff)) => {
-                        // Apply keystrokes/resize to PTY
-                        for byte in &diff.diff {
-                            if let Err(e) = pty_writer.write_all(&[*byte]) {
-                                log::warn!("PTY write error: {e}");
+                        // Decode the UserMessage protobuf to extract keystrokes/resize
+                        if !diff.diff.is_empty() {
+                            match UserMessage::decode(diff.diff.as_slice()) {
+                                Ok(user_msg) => {
+                                    for inst in &user_msg.instruction {
+                                        // Extract keystrokes
+                                        if let Some(ref keystroke) = inst.keystroke {
+                                            if let Some(ref keys) = keystroke.keys {
+                                                for &byte in keys {
+                                                    if let Err(e) = pty_writer.write_all(&[byte]) {
+                                                        log::warn!("PTY write error: {e}");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Handle resize
+                                        if let Some(ref resize) = inst.resize {
+                                            let w = resize.width.unwrap_or(80) as u16;
+                                            let h = resize.height.unwrap_or(24) as u16;
+                                            let _ = pair.master.resize(portable_pty::PtySize {
+                                                rows: h,
+                                                cols: w,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                            });
+                                            // Update terminal state dimensions
+                                            terminal_state = Complete::new(w, h)?;
+                                            log::info!("Client resize: {w}x{h}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to decode UserMessage: {e}");
+                                }
                             }
                         }
                         if let Err(e) = pty_writer.flush() {
@@ -229,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Check if there's a pending diff to send
                 let diff = terminal_state.diff_from(&client_assumed_state);
                 if !diff.is_empty() && last_send_time.elapsed() >= send_interval {
-                    let ack_num = 0;
+                    let ack_num = transport.receiver.remote_state_num();
                     let throwaway = transport.sender.throwaway_num();
                     if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                         log::warn!("Send error: {e}");
