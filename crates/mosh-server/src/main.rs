@@ -239,12 +239,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Keepalive: send empty ACK to keep connection alive
             _ = keepalive_timer.tick() => {
+                // Don't send keepalives until client has connected
+                if !transport.connection().has_remote() {
+                    continue;
+                }
                 let now = std::time::Instant::now();
                 // Only send keepalive if we haven't sent anything recently
                 if now.duration_since(transport.sender.last_send_time()).as_millis() > 2000 {
                     let ack_num = transport.receiver.remote_state_num();
                     if let Err(e) = transport.send_ack(ack_num).await {
-                        log::warn!("Keepalive ACK error: {e}");
+                        log::debug!("Keepalive ACK error: {e}");
                     }
                 }
             }

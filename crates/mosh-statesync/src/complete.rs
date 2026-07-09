@@ -93,7 +93,19 @@ fn apply_vt_to_snapshot(snap: &mut ScreenSnapshot, data: &[u8]) {
                 params.push(param_str.parse::<u16>().unwrap_or(0));
             }
 
-            if i < data.len() {
+            // Handle DEC private mode: ESC [ ? <params> <final>
+            // The '?' prefix was not consumed in the param loop (it's not a digit/';').
+            if i < data.len() && data[i] == b'?' {
+                i += 1; // skip '?'
+                // Skip mode number digits
+                while i < data.len() && data[i].is_ascii_digit() {
+                    i += 1;
+                }
+                // Skip final character (h/l for set/reset)
+                if i < data.len() {
+                    i += 1;
+                }
+            } else if i < data.len() {
                 match data[i] {
                     b'H' | b'f' => {
                         // CUP: cursor position (1-based)
@@ -332,5 +344,35 @@ mod tests {
         let diff = a.diff_from(&b);
         // Should be empty or minimal (just cursor positioning)
         assert!(diff.len() < 10);
+    }
+
+    #[test]
+    fn dec_private_mode_not_visible() {
+        // \x1b[?2004l = disable bracketed paste mode
+        // This should be consumed by the VT parser, not written as visible text
+        let mut c = Complete::new(80, 1).unwrap();
+        c.apply_string(b"\x1b[?2004l");
+        let snap = c.snapshot();
+        // Row should be empty — the sequence is a mode change, not text
+        assert!(snap.rows[0][0].text.is_empty());
+    }
+
+    #[test]
+    fn dec_private_mode_with_text() {
+        // Shell outputs bracketed paste mode then prints text
+        let mut c = Complete::new(80, 1).unwrap();
+        c.apply_string(b"\x1b[?2004h$ ");
+        let snap = c.snapshot();
+        assert_eq!(snap.rows[0][0].text, "$");
+        assert_eq!(snap.rows[0][1].text, " ");
+    }
+
+    #[test]
+    fn cursor_visibility_sequence() {
+        // \x1b[?25l = hide cursor, \x1b[?25h = show cursor
+        let mut c = Complete::new(10, 1).unwrap();
+        c.apply_string(b"\x1b[?25l");
+        // Should not write "?25l" as text
+        assert!(c.snapshot().rows[0][0].text.is_empty());
     }
 }
