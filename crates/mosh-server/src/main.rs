@@ -31,11 +31,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "-p" => {
                 i += 1;
+                if i >= args.len() {
+                    eprintln!("mosh-server: -p requires a port argument");
+                    std::process::exit(1);
+                }
                 bind_port = args[i].parse().map_err(|e| format!("Invalid port: {e}"))?;
             }
             "-a" => {
                 i += 1;
+                if i >= args.len() {
+                    eprintln!("mosh-server: -a requires an address argument");
+                    std::process::exit(1);
+                }
                 bind_addr = args[i].clone();
+            }
+            "-e" => {
+                // -e command [args...]: execute command instead of shell
+                i += 1;
+                while i < args.len() && !args[i].starts_with('-') {
+                    command_args.push(args[i].clone());
+                    i += 1;
+                }
+                // Don't increment i again — the while loop already advanced past args
+                continue;
+            }
+            "-h" | "--help" => {
+                eprintln!("Usage: mosh-server [options] [command]");
+                eprintln!();
+                eprintln!("Starts a mosh-server that listens for a mosh-client connection.");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  -p PORT     Bind to this port (default: random)");
+                eprintln!("  -a ADDR     Bind to this address (default: 0.0.0.0)");
+                eprintln!("  -e CMD...   Execute command instead of shell");
+                eprintln!("  -h, --help  Show this help message");
+                eprintln!("  -v, --version  Show version information");
+                eprintln!();
+                eprintln!("Environment:");
+                eprintln!("  MOSH_KEY    Encryption key (auto-generated if not set)");
+                eprintln!("  SHELL       Shell to run (default: /bin/sh)");
+                eprintln!();
+                eprintln!("The server prints 'MOSH CONNECT <ip> <port> <key>' to stdout");
+                eprintln!("when ready, which is used by the mosh wrapper to start the client.");
+                std::process::exit(0);
+            }
+            "-v" | "--version" => {
+                eprintln!("mosh-server (mosh-rust) {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
             }
             _ => {
                 command_args.push(args[i].clone());
@@ -70,7 +112,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::new_server(bind_addr, session).await
         .map_err(|e| format!("Failed to bind: {e}"))?;
 
-    let local_addr = connection.remote_addr().unwrap_or(bind_addr);
+    let local_addr = if bind_addr.ip().is_unspecified() {
+        // Determine the actual IP address the client can reach by
+        // checking which local address would be used for outbound traffic.
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| {
+                // Connect to a public address to trigger route lookup
+                s.connect("8.8.8.8:53").ok()?;
+                s.local_addr().ok()
+            })
+            .map(|a| SocketAddr::new(a.ip(), connection.local_addr().unwrap_or(bind_addr).port()))
+            .unwrap_or(bind_addr)
+    } else {
+        connection.local_addr().unwrap_or(bind_addr)
+    };
 
     println!(
         "MOSH CONNECT {} {} {}",

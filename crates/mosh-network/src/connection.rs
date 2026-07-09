@@ -89,6 +89,11 @@ impl Connection {
         self.remote_addr
     }
 
+    /// Get the local address of the socket (what we're bound to).
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.sockets.last().and_then(|s| s.local_addr().ok())
+    }
+
     pub fn rtt(&self) -> &RttEstimator {
         &self.rtt
     }

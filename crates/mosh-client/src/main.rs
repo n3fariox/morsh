@@ -112,6 +112,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+
+    // Handle help and version flags before other arg parsing
+    if args.len() >= 2 {
+        match args[1].as_str() {
+            "-h" | "--help" => {
+                eprintln!("Usage: mosh-client <server-ip:port>");
+                eprintln!();
+                eprintln!("Connects to a mosh-server using the mosh state synchronization protocol.");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  -h, --help       Show this help message");
+                eprintln!("  -v, --version    Show version information");
+                eprintln!();
+                eprintln!("Environment:");
+                eprintln!("  MOSH_KEY    Base64 encryption key (from mosh-server output)");
+                std::process::exit(0);
+            }
+            "-v" | "--version" => {
+                eprintln!("mosh-client (mosh-rust) {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: mosh-client <server-ip:port>");
         eprintln!("  Environment: MOSH_KEY (base64 key from mosh-server)");
