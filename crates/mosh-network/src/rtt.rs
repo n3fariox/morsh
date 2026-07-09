@@ -11,8 +11,8 @@ pub struct RttEstimator {
 impl RttEstimator {
     pub fn new() -> Self {
         Self {
-            srtt_ms: 1000,
-            rttvar_ms: 500,
+            srtt_ms: 50,
+            rttvar_ms: 25,
             have_sample: false,
         }
     }
@@ -70,8 +70,8 @@ mod tests {
     #[test]
     fn initial_state() {
         let rtt = RttEstimator::new();
-        assert_eq!(rtt.srtt_ms(), 1000);
-        assert_eq!(rtt.rttvar_ms(), 500);
+        assert_eq!(rtt.srtt_ms(), 50);
+        assert_eq!(rtt.rttvar_ms(), 25);
         assert!(rtt.rto_ms() >= MIN_RTO_MS);
     }
 
@@ -98,7 +98,7 @@ mod tests {
     fn rto_clamped() {
         let mut rtt = RttEstimator::new();
         rtt.update(10000); // way too high, ignored
-        assert_eq!(rtt.srtt_ms(), 1000); // unchanged
+        assert_eq!(rtt.srtt_ms(), 50); // unchanged
 
         let mut rtt2 = RttEstimator::new();
         rtt2.update(1);

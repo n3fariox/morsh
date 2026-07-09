@@ -122,6 +122,11 @@ impl TransportSender {
         self.state
     }
 
+    /// Get the last time we sent a packet.
+    pub fn last_send_time(&self) -> Instant {
+        self.last_send_time
+    }
+
     /// Set the send state.
     pub fn set_state(&mut self, state: SendState) {
         self.state = state;
@@ -398,7 +403,15 @@ impl Transport {
     pub async fn recv_diff(&mut self) -> Result<Option<ReceivedDiff>, String> {
         match self.connection.recv().await? {
             Some(inst) => {
-                self.receiver.record_recv(Instant::now());
+                let now = Instant::now();
+                self.receiver.record_recv(now);
+
+                // Measure RTT: time between our last send and this receive
+                let elapsed = now.duration_since(self.sender.last_send_time());
+                if elapsed.as_millis() > 0 && elapsed.as_millis() < 5000 {
+                    self.connection.record_rtt(elapsed.as_millis() as u64);
+                }
+
                 let diff = TransportReceiver::parse_instruction(&inst);
 
                 // Track the remote's state number for acks
