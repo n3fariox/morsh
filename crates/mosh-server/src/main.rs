@@ -3,6 +3,7 @@ use mosh_network::{Connection, Transport};
 use mosh_network::transport::SendState;
 use mosh_proto::client::UserMessage;
 use mosh_statesync::Complete;
+use mosh_terminal::ScreenSnapshot;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use prost::Message;
 use std::env;
@@ -137,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| format!("Failed to get PTY writer: {e}"))?;
 
-    let mut client_assumed_state = Complete::new(80, 24)?;
+    let mut client_assumed_state: ScreenSnapshot = Complete::new(80, 24)?.snapshot();
 
     log::info!("Entering serve loop");
 
@@ -162,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                                 log::warn!("Send error: {e}");
                             } else {
-                                client_assumed_state = terminal_state.clone();
+                                client_assumed_state = terminal_state.snapshot();
                                 transport.sender.advance_state();
                             }
                         }
@@ -175,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let ack_num = transport.receiver.remote_state_num();
                             let throwaway = transport.sender.throwaway_num();
                             let _ = transport.send_diff(diff, ack_num, throwaway).await;
-                            client_assumed_state = terminal_state.clone();
+                            client_assumed_state = terminal_state.snapshot();
                             transport.sender.advance_state();
                         }
                         break Ok(());
