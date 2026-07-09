@@ -151,25 +151,16 @@ mosh-rust/
      - Receive UDP → decrypt keystrokes → write to PTY master
      - Handle shell exit
 
-### Phase 7: Wrapper Binary (replaces mosh.pl)
+### Phase 7: Wrapper Binary (replaces mosh.pl) ✅ DONE
 **Goal:** Native Rust `mosh` command that SSHes to remote and launches mosh-server.
 
-1. **SSH connection** via `russh`
-   - Connect to remote host, authenticate (key, password, agent/Pageant)
-   - Execute `mosh-server new` on remote
+1. **Wrapper binary** (`crates/mosh-wrapper/src/main.rs`) ✅
+   - CLI via clap: `mosh [--ssh=COMMAND] [--port=PORT] user@host [command]`
+   - SSH to remote via system ssh command
    - Read `MOSH CONNECT` line from stdout
    - Parse IP, port, base64 key
-
-2. **Connection management**
    - Set `MOSH_KEY` environment variable
-   - Spawn `mosh-client` (or invoke client code in-process via library API)
-   - Handle SSH session cleanup
-   - Forward locale settings, X forwarding if requested
-
-3. **CLI** via `clap`
-   - Match mosh.pl's argument style: `mosh [--port=PORT] [--ssh=COMMAND] user@host [command]`
-   - `--start-server` flag to skip SSH and just start server
-   - `--experimental` flag for future protocol extensions
+   - Exec `mosh-client` with server address
 
 ### Phase 8: Windows Polish
 **Goal:** First-class Windows experience.
@@ -232,7 +223,7 @@ Phase 1-7 maintains wire compatibility. Phase 8+ can introduce:
 | Phase 4: Prediction | 1 crate | ~1,200 |
 | Phase 5: Client ✅ | 1 binary | ~200 (done) |
 | Phase 6: Server ✅ | 1 binary | ~250 (done) |
-| Phase 7: Wrapper | 1 binary | ~600 |
+| Phase 7: Wrapper ✅ | 1 binary | ~120 (done) |
 | Phase 8: Windows Polish | Tweaks | ~500 |
 | **Total** | | **~7,100** |
 
