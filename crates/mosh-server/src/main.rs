@@ -141,6 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Entering serve loop");
 
+    // Keepalive timer: send empty ACKs every 3s when idle (like stock mosh)
+    let mut keepalive_timer = tokio::time::interval(Duration::from_millis(3000));
+    keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
             // PTY output → compute diff → send to client
@@ -229,6 +233,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {}
                     Err(e) => {
                         log::warn!("Recv error: {e}");
+                    }
+                }
+            }
+
+            // Keepalive: send empty ACK to keep connection alive
+            _ = keepalive_timer.tick() => {
+                let now = std::time::Instant::now();
+                // Only send keepalive if we haven't sent anything recently
+                if now.duration_since(transport.sender.last_send_time()).as_millis() > 2000 {
+                    let ack_num = transport.receiver.remote_state_num();
+                    if let Err(e) = transport.send_ack(ack_num).await {
+                        log::warn!("Keepalive ACK error: {e}");
                     }
                 }
             }

@@ -103,8 +103,14 @@ impl NotificationEngine {
     }
 
     /// Whether there's a message to display.
+    /// Only shows for explicit messages or sustained connection problems.
     pub fn has_message(&self) -> bool {
-        !self.message.is_empty() || self.need_countup()
+        if !self.message.is_empty() {
+            return true;
+        }
+        // Only show countup banner if server has been late for a while (>10s)
+        // to avoid flickering between packets
+        self.server_late() && self.seconds_since_heard() > 10
     }
 
     /// Get the notification text to render.
@@ -206,10 +212,19 @@ mod tests {
     #[test]
     fn notification_server_late() {
         let mut engine = NotificationEngine::new();
-        engine.last_word_from_server = Instant::now() - Duration::from_secs(10);
 
+        // 3 seconds: not late yet
+        engine.last_word_from_server = Instant::now() - Duration::from_secs(3);
+        assert!(!engine.server_late());
+        assert!(!engine.has_message());
+
+        // 8 seconds: late but <10s threshold → no banner
+        engine.last_word_from_server = Instant::now() - Duration::from_secs(8);
         assert!(engine.server_late());
-        assert!(engine.need_countup());
+        assert!(!engine.has_message()); // suppressed to avoid flicker
+
+        // 12 seconds: late AND >10s → banner shows
+        engine.last_word_from_server = Instant::now() - Duration::from_secs(12);
         assert!(engine.has_message());
     }
 

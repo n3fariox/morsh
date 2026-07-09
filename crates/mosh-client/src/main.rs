@@ -197,13 +197,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         notifications.clear_network_error();
                         notifications.server_heard(std::time::Instant::now());
 
-                        // Render notification bar BEFORE content (so it's at top)
-                        if notifications.has_message() {
-                            if let Some(vt) = notifications.render() {
-                                stdout.write_all(vt.as_bytes())?;
-                            }
-                        }
-
                         terminal_state.apply_string(&diff.diff);
 
                         // Update prediction frame tracking from server acks
