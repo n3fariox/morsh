@@ -112,10 +112,10 @@ mosh-rust/
    - Timestamp diff with 16-bit wrapping arithmetic
    - 13 tests: fragment roundtrip, multi-fragment, assembly, chaff, RTT, RTO, send interval, timestamps
 
-### Phase 4: Prediction Engine
+### Phase 4: Prediction Engine ✅ DONE
 **Goal:** Speculative local echo for low-latency feel.
 
-1. **`mosh-prediction` crate**
+1. **`mosh-prediction` crate** ✅
    - `PredictionEngine`: Track per-cell predictions, cursor moves, epochs
    - `ConditionalOverlayCell`: Predicted replacement cells
    - `ConditionalCursorMove`: Predicted cursor positions
@@ -123,6 +123,7 @@ mosh-rust/
    - Epoch system: Tentative vs confirmed predictions, culling on mismatch
    - `NotificationEngine`: Status overlay (connection state, warnings)
    - Display modes: Always, Never, Adaptive (default)
+   - 20 tests passing
 
 ### Phase 5: Client Binary ✅ DONE
 **Goal:** `mosh-client` that can connect to a stock mosh-server.
@@ -220,7 +221,7 @@ Phase 1-7 maintains wire compatibility. Phase 8+ can introduce:
 | Phase 1: Crypto + Proto ✅ | 2 crates | ~500 (done) |
 | Phase 2: Terminal (libghostty-vt) ✅ | Integration + adapter | ~500 (done) |
 | Phase 3: State Sync ✅ | 2 crates | ~2,000 (done) |
-| Phase 4: Prediction | 1 crate | ~1,200 |
+| Phase 4: Prediction ✅ | 1 crate | ~1,200 (done) |
 | Phase 5: Client ✅ | 1 binary | ~200 (done) |
 | Phase 6: Server ✅ | 1 binary | ~250 (done) |
 | Phase 7: Wrapper ✅ | 1 binary | ~120 (done) |
