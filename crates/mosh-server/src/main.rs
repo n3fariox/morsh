@@ -21,15 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: mosh-server [options] [command]");
-        eprintln!("  Options:");
-        eprintln!("    -p PORT     Bind to specific port");
-        eprintln!("    -a ADDRESS  Bind address (default: 0.0.0.0)");
-        eprintln!("  Environment:");
-        eprintln!("    MOSH_KEY    Base64 key (auto-generated if not set)");
-        std::process::exit(1);
-    }
 
     let mut bind_port: u16 = 0;
     let mut bind_addr = "0.0.0.0".to_string();
