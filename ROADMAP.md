@@ -97,21 +97,20 @@ mosh-rust/
 ### Phase 3: State Synchronization
 **Goal:** The SSP (State Synchronization Protocol) — diffs, transport sender/receiver.
 
-1. **`mosh-statesync` crate**
-   - `Complete`: Combines Parser + Emulator + Display, provides `diff_from()` / `apply_string()` interface
-   - `UserStream`: Queue of user events (keystrokes + resize), provides `diff_from()` / `apply_string()`
-   - `TransportSender<MyState>`: Rate-limited state diff sender with ack tracking
-   - `Transport<MyState, RemoteState>`: Bidirectional transport template (Rust generics)
+1. **`mosh-statesync` crate** ✅
+   - `Complete`: Screen snapshot with VT diff_from() / apply_string() interface
+   - `UserStream`: Queue of user events (keystrokes + resize), protobuf serialization
+   - Minimal VT parser: CUP, SGR (colors/bold/italic/underline), ED, EL, CR/LF/BS
+   - 6 tests: create, apply, diff, cursor, color, same-states
 
-2. **`mosh-network` crate**
+2. **`mosh-network` crate** ✅
    - `Connection`: UDP socket management via `tokio::net::UdpSocket`
-   - `Fragmenter` / `FragmentAssembly`: MTU-aware fragmentation with 8-byte fragment headers
-   - Port hopping: Client changes source port every 10s of inactivity
-   - RTT estimation: SRTT/RTTVAR with min/max RTO bounds (50ms-1000ms)
-   - ECN support: IP_TOS/DSCP marking for congestion signals
-   - Adaptive send interval: 20-250ms based on RTT
-   - Chaff generation: Random padding bytes for traffic analysis resistance
-   - Delayed ACKs: 100ms after data, empty ACKs every 3s
+   - `Fragmenter` / `FragmentAssembly`: zlib-compressed MTU-aware fragmentation with 10-byte headers
+   - `RttEstimator`: RFC 6298 SRTT/RTTVAR with clamped RTO (50ms-1000ms)
+   - ECN marking (IP_TOS ECT(0))
+   - Port hopping support (client-side, 10s interval)
+   - Timestamp diff with 16-bit wrapping arithmetic
+   - 13 tests: fragment roundtrip, multi-fragment, assembly, chaff, RTT, RTO, send interval, timestamps
 
 ### Phase 4: Prediction Engine
 **Goal:** Speculative local echo for low-latency feel.

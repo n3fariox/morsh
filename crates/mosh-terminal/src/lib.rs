@@ -7,3 +7,6 @@ pub use terminal::MoshTerminal;
 pub use snapshot::{ScreenSnapshot, CellData, CellStyle, StyleColor};
 pub use display::DisplayDiff;
 pub use keymap::KeyMap;
+
+// Re-export RgbColor for downstream crates
+pub use libghostty_vt::style::RgbColor;

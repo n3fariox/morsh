@@ -4,4 +4,6 @@ members = [
     "crates/mosh-crypto",
     "crates/mosh-proto",
     "crates/mosh-terminal",
+    "crates/mosh-network",
+    "crates/mosh-statesync",
 ]

@@ -1,0 +1,13 @@
+[package]
+name = "mosh-statesync"
+version = "0.1.0"
+edition = "2021"
+description = "State synchronization protocol for mosh-rust"
+
+[dependencies]
+mosh-proto = { path = "../mosh-proto" }
+mosh-terminal = { path = "../mosh-terminal" }
+prost = "0.14"
+log = "0.4"
+
+[dev-dependencies]
