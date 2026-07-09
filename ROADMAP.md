@@ -14,6 +14,7 @@ mosh-rust/
 ├── crates/
 │   ├── mosh-crypto/        # AES-128-OCB3 encryption, key handling, PRNG
 │   ├── mosh-proto/         # Protobuf definitions (prost-generated)
+│   ├── mosh-terminal/      # VT processing wrapper around libghostty-vt
 │   ├── mosh-network/       # UDP transport, fragmentation, RTT estimation, port hopping
 │   ├── mosh-statesync/     # State diffing, sync protocol, Complete/UserStream
 │   └── mosh-prediction/    # Predictive echo overlay engine
@@ -75,18 +76,18 @@ mosh-rust/
 ### Phase 2: Terminal Emulation via libghostty-vt
 **Goal:** VT parsing, framebuffer state, key encoding — powered by libghostty-vt.
 
-1. **Integration via `libghostty-rs`**
-   - Add `libghostty-vt` (via `libghostty-rs` crate) for terminal emulation
-   - Build requirement: Zig 0.15.x on PATH (or prebuilt static lib)
-   - Static linking: zero runtime dependencies beyond libc
+1. **`mosh-terminal` crate** ✅
+   - Wraps `libghostty-vt` for VT sequence processing
+   - `MoshTerminal` struct with `write()`, `resize()`, `dimensions()`, `next_frame()`
+   - Zig 0.15.2 via mise.toml, builds against local Ghostty checkout (`GHOSTTY_SOURCE_DIR`)
+   - 4 tests passing: create, write, resize, frame counter
 
-2. **Adapt for Mosh's state sync needs**
-   - `Terminal` for VT sequence parsing and framebuffer state maintenance
+2. **Adapt for Mosh's state sync needs** — TODO
    - `RenderState` for dirty-tracked cell-level access (enables efficient diffing)
    - `KeyEncoder` for translating raw keystrokes to terminal escape sequences
    - Map libghostty's dirty-cell model to Mosh's `diff_from()` / `apply_string()` protocol
 
-3. **Mosh-specific adaptations**
+3. **Mosh-specific adaptations** — TODO
    - Wrap libghostty-vt's terminal in a `Complete`-like struct for the transport layer
    - Generate ANSI escape sequences from render state diffs (replacing Mosh's `Display`)
    - Handle server-side: PTY output → libghostty parser → framebuffer → diff

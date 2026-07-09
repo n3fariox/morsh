@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "crates/mosh-crypto",
     "crates/mosh-proto",
+    "crates/mosh-terminal",
 ]
