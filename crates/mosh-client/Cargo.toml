@@ -17,6 +17,7 @@ mosh-proto = { path = "../mosh-proto" }
 mosh-terminal = { path = "../mosh-terminal" }
 mosh-network = { path = "../mosh-network" }
 mosh-statesync = { path = "../mosh-statesync" }
+mosh-prediction = { path = "../mosh-prediction" }
 prost = "0.14"
 log = "0.4"
 env_logger = "0.11"

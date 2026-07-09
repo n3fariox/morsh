@@ -690,6 +690,7 @@ dependencies = [
  "log",
  "mosh-crypto",
  "mosh-network",
+ "mosh-prediction",
  "mosh-proto",
  "mosh-statesync",
  "mosh-terminal",

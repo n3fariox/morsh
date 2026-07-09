@@ -3,6 +3,7 @@ use crossterm::{cursor, execute, terminal};
 use futures::StreamExt;
 use mosh_crypto::{Base64Key, Session};
 use mosh_network::{Connection, Transport};
+use mosh_prediction::{DisplayPreference, PredictionEngine};
 use mosh_statesync::{Complete, UserStream};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -53,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut user_stream = UserStream::new();
     let mut sent_stream = UserStream::new(); // What we've already sent
     let mut terminal_state = Complete::new(80, 24)?;
+
+    // Prediction engine for speculative local echo
+    let mut prediction = PredictionEngine::new();
+    prediction.set_display_preference(DisplayPreference::Adaptive);
 
     // Get initial terminal size
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -159,6 +164,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     TermEvent::Key(bytes) => {
                         for byte in bytes {
                             user_stream.push_key(byte);
+                            // Feed to prediction engine for speculative echo
+                            let ch = byte as char;
+                            let (cur_row, cur_col) = prediction.cursor_pos().unwrap_or((0, 0));
+                            let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                            prediction.new_user_byte(
+                                ch,
+                                cur_row,
+                                cur_col,
+                                ' ', // TODO: get actual cell at cursor
+                                cols as usize,
+                                rows as usize,
+                            );
                         }
                     }
                     TermEvent::Resize(w, h) => {
@@ -177,6 +194,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Some(diff)) => {
                         // Apply diff to our terminal state
                         terminal_state.apply_string(&diff.diff);
+
+                        // Validate predictions against new server state
+                        let snap = terminal_state.snapshot();
+                        prediction.validate_predictions(
+                            |r, c| snap.cell(c as u16, r as u16)
+                                .and_then(|d| d.text.chars().next())
+                                .unwrap_or(' '),
+                            snap.cursor_y as usize,
+                            snap.cursor_x as usize,
+                        );
+
                         // Write diff bytes directly to terminal
                         stdout.write_all(&diff.diff)?;
                         stdout.flush()?;
