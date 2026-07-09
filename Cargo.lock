@@ -723,6 +723,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mosh-prediction"
+version = "0.1.0"
+dependencies = [
+ "mosh-crypto",
+ "mosh-terminal",
+]
+
+[[package]]
 name = "mosh-proto"
 version = "0.1.0"
 dependencies = [

@@ -8,5 +8,5 @@ members = [
     "crates/mosh-statesync",
     "crates/mosh-client",
     "crates/mosh-server",
-    "crates/mosh-wrapper",
+    "crates/mosh-wrapper", "crates/mosh-prediction",
 ]
