@@ -1,0 +1,24 @@
+syntax = "proto2";
+
+option optimize_for = LITE_RUNTIME;
+
+package ClientBuffers;
+
+message UserMessage {
+  repeated Instruction instruction = 1;
+}
+
+message Keystroke {
+  optional bytes keys = 4;
+}
+
+message ResizeMessage {
+  optional int32 width = 5;
+  optional int32 height = 6;
+}
+
+// Flattened from proto2 extensions — field numbers preserved for wire compatibility
+message Instruction {
+  optional Keystroke keystroke = 2;
+  optional ResizeMessage resize = 3;
+}
