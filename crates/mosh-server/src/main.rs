@@ -155,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("LANG", "en_US.UTF-8");
+    cmd.env("MOSH", env!("CARGO_PKG_VERSION"));
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system.openpty(pty_size)
