@@ -17,15 +17,88 @@ enum PtyEvent {
     Exited(ExitStatus),
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Parse the SSH_CONNECTION environment variable to get the server's IP.
+/// SSH_CONNECTION format: "client_ip client_port server_ip server_port"
+/// Returns the server_ip (3rd field), or None if not available.
+fn get_ssh_connection_ip() -> Option<String> {
+    let ssh_conn = env::var("SSH_CONNECTION").ok()?;
+    let parts: Vec<&str> = ssh_conn.split_whitespace().collect();
+    if parts.len() >= 3 {
+        let server_ip = parts[2].to_string();
+        if let Some(stripped) = server_ip.strip_prefix("::ffff:") {
+            return Some(stripped.to_string());
+        }
+        return Some(server_ip);
+    }
+    None
+}
+
+/// Fork and create a new session (Unix) or detach from console (Windows).
+/// Returns true in the child process, false in the parent.
+fn fork_and_detach() -> bool {
+    #[cfg(unix)]
+    {
+        use std::process;
+
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("mosh-server: fork failed");
+                std::process::exit(1);
+            }
+            0 => {
+                // Child: create new session to detach from SSH terminal
+                unsafe { libc::setsid(); }
+                true
+            }
+            pid => {
+                // Parent: wait for child to exit, then exit ourselves
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0); }
+                std::process::exit(0);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows: detach from the SSH console
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+        true
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
+/// Redirect stdio to /dev/null (Unix) after daemonizing.
+#[cfg(unix)]
+fn redirect_stdio() {
+    use std::os::unix::io::AsRawFd;
+
+    let devnull = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .expect("Failed to open /dev/null");
+
+    unsafe {
+        libc::dup2(devnull.as_raw_fd(), 0); // stdin
+        libc::dup2(devnull.as_raw_fd(), 1); // stdout
+        libc::dup2(devnull.as_raw_fd(), 2); // stderr
+    }
+}
+
+fn main() {
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
 
     let mut bind_port: u16 = 0;
-    let mut bind_addr = "0.0.0.0".to_string();
+    let mut bind_addr: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
+    let mut use_ssh_connection = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -35,7 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("mosh-server: -p requires a port argument");
                     std::process::exit(1);
                 }
-                bind_port = args[i].parse().map_err(|e| format!("Invalid port: {e}"))?;
+                bind_port = args[i].parse().map_err(|e| format!("Invalid port: {e}")).unwrap_or_else(|e| {
+                    eprintln!("mosh-server: {e}");
+                    std::process::exit(1);
+                });
             }
             "-a" => {
                 i += 1;
@@ -43,16 +119,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("mosh-server: -a requires an address argument");
                     std::process::exit(1);
                 }
-                bind_addr = args[i].clone();
+                bind_addr = Some(args[i].clone());
+            }
+            "-s" => {
+                use_ssh_connection = true;
             }
             "-e" => {
-                // -e command [args...]: execute command instead of shell
                 i += 1;
                 while i < args.len() && !args[i].starts_with('-') {
                     command_args.push(args[i].clone());
                     i += 1;
                 }
-                // Don't increment i again — the while loop already advanced past args
                 continue;
             }
             "-h" | "--help" => {
@@ -63,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Options:");
                 eprintln!("  -p PORT     Bind to this port (default: random)");
                 eprintln!("  -a ADDR     Bind to this address (default: 0.0.0.0)");
+                eprintln!("  -s          Use SSH_CONNECTION to determine bind IP (default)");
                 eprintln!("  -e CMD...   Execute command instead of shell");
                 eprintln!("  -h, --help  Show this help message");
                 eprintln!("  -v, --version  Show version information");
@@ -71,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  MOSH_KEY    Encryption key (auto-generated if not set)");
                 eprintln!("  SHELL       Shell to run (default: /bin/sh)");
                 eprintln!();
-                eprintln!("The server prints 'MOSH CONNECT <ip> <port> <key>' to stdout");
+                eprintln!("The server prints 'MOSH CONNECT <port> <key>' to stdout");
                 eprintln!("when ready, which is used by the mosh wrapper to start the client.");
                 std::process::exit(0);
             }
@@ -100,44 +178,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let key = if let Ok(key_str) = env::var("MOSH_KEY") {
         Base64Key::from_printable(&key_str)
-            .map_err(|e| format!("Invalid MOSH_KEY: {e}"))?
+            .unwrap_or_else(|e| {
+                eprintln!("mosh-server: Invalid MOSH_KEY: {e}");
+                std::process::exit(1);
+            })
     } else {
         Base64Key::random()
     };
 
-    let session = Session::new(*key.data());
-
-    let bind_addr: SocketAddr = format!("{bind_addr}:{bind_port}").parse()
-        .map_err(|e| format!("Invalid bind address: {e}"))?;
-    let connection = Connection::new_server(bind_addr, session).await
-        .map_err(|e| format!("Failed to bind: {e}"))?;
-
-    let local_addr = if bind_addr.ip().is_unspecified() {
-        // Determine the actual IP address the client can reach by
-        // checking which local address would be used for outbound traffic.
-        std::net::UdpSocket::bind("0.0.0.0:0")
-            .ok()
-            .and_then(|s| {
-                // Connect to a public address to trigger route lookup
-                s.connect("8.8.8.8:53").ok()?;
-                s.local_addr().ok()
-            })
-            .map(|a| SocketAddr::new(a.ip(), connection.local_addr().unwrap_or(bind_addr).port()))
-            .unwrap_or(bind_addr)
+    // Determine bind address
+    let ssh_ip = if use_ssh_connection || bind_addr.is_none() {
+        get_ssh_connection_ip()
     } else {
-        connection.local_addr().unwrap_or(bind_addr)
+        None
+    };
+    let desired_ip = bind_addr.as_deref().or(ssh_ip.as_deref());
+
+    // Try binding to get a port, then fork
+    let addr: SocketAddr = if let Some(ip) = desired_ip {
+        format!("{}:{}", ip, bind_port).parse().unwrap_or_else(|_| {
+            format!("0.0.0.0:{}", bind_port).parse().unwrap()
+        })
+    } else {
+        format!("0.0.0.0:{}", bind_port).parse().unwrap()
     };
 
-    println!(
-        "MOSH CONNECT {} {} {}",
-        local_addr.ip(),
-        local_addr.port(),
-        key.printable_key()
-    );
-    println!("MOSH CONNECTION ID: 1");
-    std::io::stdout().flush()?;
+    // Create UDP socket to determine the port
+    let sock = std::net::UdpSocket::bind(addr)
+        .unwrap_or_else(|e| {
+            // Fall back to 0.0.0.0
+            let fallback: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
+            eprintln!("mosh-server: Failed to bind to {addr}: {e}, trying {fallback}");
+            std::net::UdpSocket::bind(fallback).unwrap_or_else(|e| {
+                eprintln!("mosh-server: Failed to bind: {e}");
+                std::process::exit(1);
+            })
+        });
 
-    log::info!("Server started, waiting for client at {local_addr}");
+    let port = sock.local_addr().unwrap().port();
+    drop(sock); // Release the port; tokio will rebind
+
+    // Print MOSH CONNECT before forking so the wrapper can read it
+    println!("MOSH CONNECT {} {}", port, key.printable_key());
+    println!("MOSH CONNECTION ID: 1");
+    std::io::stdout().flush().unwrap();
+
+    // Fork: parent exits, child detaches and runs the server
+    if !fork_and_detach() {
+        // Parent already exited via fork_and_detach
+        unreachable!();
+    }
+
+    // Child: redirect stdio to /dev/null (Unix only)
+    #[cfg(unix)]
+    redirect_stdio();
+
+    log::info!("Server starting on port {port}");
+
+    // Create tokio runtime and run server
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    if let Err(e) = rt.block_on(run_server(bind_port, desired_ip, key, shell)) {
+        log::error!("Server error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_server(
+    bind_port: u16,
+    desired_ip: Option<&str>,
+    key: Base64Key,
+    shell: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session = Session::new(*key.data());
+
+    // Bind to the port
+    let connection = if let Some(ip) = desired_ip {
+        let addr: SocketAddr = format!("{}:{}", ip, bind_port).parse()
+            .map_err(|e| format!("Invalid bind address: {e}"))?;
+        match Connection::new_server(addr, session).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                log::warn!("Failed to bind to {}: {}, trying 0.0.0.0", ip, e);
+                let fallback: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
+                Connection::new_server(fallback, Session::new(*key.data())).await
+                    .map_err(|e| format!("Failed to bind: {e}"))?
+            }
+        }
+    } else {
+        let addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
+        Connection::new_server(addr, session).await
+            .map_err(|e| format!("Failed to bind: {e}"))?
+    };
 
     // Create transport and activate it immediately
     let mut transport = Transport::new_server(connection);
@@ -211,9 +342,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PtyEvent::Output(data) => {
                         terminal_state.apply_string(&data);
 
-                        // Send diff immediately when there's new PTY output.
-                        // Don't wait for adaptive timing — the client needs
-                        // to see updates as soon as they're available.
                         let diff = terminal_state.diff_from(&client_assumed_state);
                         if !diff.is_empty() {
                             let ack_num = transport.receiver.remote_state_num();
@@ -228,7 +356,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     PtyEvent::Exited(status) => {
                         log::info!("Shell exited with status: {}", status.exit_code());
-                        // Send final state + shutdown
                         let diff = terminal_state.diff_from(&client_assumed_state);
                         if !diff.is_empty() {
                             let ack_num = transport.receiver.remote_state_num();
@@ -279,7 +406,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
-                        // Shutdown was detected by recv_diff() internally
                         if transport.receiver.shutdown_received() {
                             log::info!("Client sent shutdown");
                             break Ok(());
@@ -298,12 +424,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Keepalive: send empty ACK to keep connection alive
             _ = keepalive_timer.tick() => {
-                // Don't send keepalives until client has connected
                 if !transport.connection().has_remote() {
                     continue;
                 }
                 let now = std::time::Instant::now();
-                // Only send keepalive if we haven't sent anything recently
                 if now.duration_since(transport.sender.last_send_time()).as_millis() > 2000 {
                     let ack_num = transport.receiver.remote_state_num();
                     if let Err(e) = transport.send_ack(ack_num).await {

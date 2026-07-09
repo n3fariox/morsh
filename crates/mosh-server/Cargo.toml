@@ -19,3 +19,6 @@ mosh-statesync = { path = "../mosh-statesync" }
 prost = "0.14"
 log = "0.4"
 env_logger = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
