@@ -124,47 +124,32 @@ mosh-rust/
    - `NotificationEngine`: Status overlay (connection state, warnings)
    - Display modes: Always, Never, Adaptive (default)
 
-### Phase 5: Client Binary
+### Phase 5: Client Binary ✅ DONE
 **Goal:** `mosh-client` that can connect to a stock mosh-server.
 
-1. **Client main loop** (`src/client.rs`)
-   - Read `MOSH_KEY`, `MOSH_KEY_PAIR` from environment
-   - Parse connection parameters (IP, port, key)
+1. **Client main loop** (`crates/mosh-client/src/main.rs`) ✅
+   - Read `MOSH_KEY` from environment
+   - Parse server address from command line
    - Create `Connection` with UDP socket
-   - Initialize `Transport<UserStream, Complete>` (client orientation)
+   - Initialize `Transport` (client orientation)
    - Enter event loop using `tokio::select!`:
-     - `crossterm::event::read()` → raw keystrokes → `UserStream` → send
-     - `UdpSocket::recv()` → decrypt → `Complete::apply_string()` → render
-     - Timer ticks → `TransportSender::tick()` → send diffs
+     - `crossterm::EventStream` → raw keystrokes → `UserStream` → send
+     - `Transport::recv_diff()` → `Complete::apply_string()` → write to stdout
+     - Timer ticks → send diffs
      - Resize events → resize message
+   - Raw mode + alternate screen buffer
 
-2. **Terminal handling** (platform-specific)
-   - **Windows**: `crossterm::terminal::enable_raw_mode()`, `SetConsoleMode()` for VT processing, `GetConsoleScreenBufferInfo()` for window size
-   - **Unix**: `crossterm` handles raw mode, TIOCGWINSZ for size
-
-3. **Display rendering**
-   - `Display::new_frame()` computes minimal escape sequences
-   - Write to stdout via `crossterm` (or direct bytes for speed)
-   - Handle alternate screen buffer, cursor visibility
-
-### Phase 6: Server Binary
+### Phase 6: Server Binary ✅ DONE
 **Goal:** `mosh-server` that creates a PTY and serves a shell.
 
-1. **Server main loop** (`src/server.rs`)
+1. **Server main loop** (`crates/mosh-server/src/main.rs`) ✅
    - Parse args (IP, port, key, command)
    - Open UDP socket, bind, print `MOSH CONNECT <IP> <PORT> <KEY>` to stdout
-   - Spawn child process via PTY:
-     - **Windows**: `portable-pty` → `CreatePseudoConsole()` → `CreateProcess()` with pseudo console
-     - **Unix**: `portable-pty` → `openpty()` → `fork()` + `execvp()`
+   - Spawn child process via PTY (`portable-pty`)
    - Enter `serve()` loop:
-     - Read PTY master → feed through `Terminal::Complete` → compute diff → encrypt → send UDP
-     - Receive UDP → decrypt keystrokes/resize → write to PTY master
-     - Handle signals (SIGTERM, SIGINT on Unix; `SetConsoleCtrlHandler` on Windows)
-     - No utmp entries on Windows (stub out)
-
-2. **Process management**
-   - Windows: `portable-pty::Child` provides `wait()` and `kill()`
-   - Graceful shutdown: send shutdown marker, wait for ACK, then kill child
+     - Read PTY master → feed through `Complete` → compute diff → send UDP
+     - Receive UDP → decrypt keystrokes → write to PTY master
+     - Handle shell exit
 
 ### Phase 7: Wrapper Binary (replaces mosh.pl)
 **Goal:** Native Rust `mosh` command that SSHes to remote and launches mosh-server.
@@ -242,11 +227,11 @@ Phase 1-7 maintains wire compatibility. Phase 8+ can introduce:
 | Phase | Scope | Estimated Lines |
 |-------|-------|----------------|
 | Phase 1: Crypto + Proto ✅ | 2 crates | ~500 (done) |
-| Phase 2: Terminal (libghostty-vt) | Integration + adapter | ~500 (adapter layer, not full terminal) |
-| Phase 3: State Sync | 2 crates | ~2,000 |
+| Phase 2: Terminal (libghostty-vt) ✅ | Integration + adapter | ~500 (done) |
+| Phase 3: State Sync ✅ | 2 crates | ~2,000 (done) |
 | Phase 4: Prediction | 1 crate | ~1,200 |
-| Phase 5: Client | 1 binary | ~800 |
-| Phase 6: Server | 1 binary | ~1,000 |
+| Phase 5: Client ✅ | 1 binary | ~200 (done) |
+| Phase 6: Server ✅ | 1 binary | ~250 (done) |
 | Phase 7: Wrapper | 1 binary | ~600 |
 | Phase 8: Windows Polish | Tweaks | ~500 |
 | **Total** | | **~7,100** |

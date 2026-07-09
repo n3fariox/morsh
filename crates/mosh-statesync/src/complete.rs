@@ -4,6 +4,7 @@ use mosh_terminal::ScreenSnapshot;
 ///
 /// Tracks a screen snapshot and provides diff_from() / apply_string()
 /// for the state synchronization protocol.
+#[derive(Clone)]
 pub struct Complete {
     snapshot: ScreenSnapshot,
     echo_ack: u64,

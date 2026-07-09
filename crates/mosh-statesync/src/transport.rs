@@ -1,2 +1,1 @@
-pub struct TransportSender;
-pub struct TransportReceiver;
+// Transport logic is in mosh-network::transport

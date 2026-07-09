@@ -1,0 +1,22 @@
+[package]
+name = "mosh-client"
+version = "0.1.0"
+edition = "2021"
+description = "Mosh client binary"
+
+[[bin]]
+name = "mosh-client"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "sync", "signal"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+mosh-crypto = { path = "../mosh-crypto" }
+mosh-proto = { path = "../mosh-proto" }
+mosh-terminal = { path = "../mosh-terminal" }
+mosh-network = { path = "../mosh-network" }
+mosh-statesync = { path = "../mosh-statesync" }
+prost = "0.14"
+log = "0.4"
+env_logger = "0.11"
