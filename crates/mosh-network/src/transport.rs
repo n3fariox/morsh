@@ -127,6 +127,11 @@ impl TransportSender {
         self.state = state;
     }
 
+    /// Get the current send interval.
+    pub fn send_interval_ms(&self) -> u64 {
+        self.send_interval.as_millis() as u64
+    }
+
     /// Update the send interval based on measured RTT.
     pub fn update_send_interval(&mut self, rtt_ms: u64) {
         // Mosh formula: clamp to [SEND_INTERVAL_MIN_MS, SEND_INTERVAL_MAX_MS]
@@ -427,7 +432,9 @@ impl Transport {
 
     /// Send an empty ACK (no diff). Used for delayed ACKs and periodic ACKs.
     pub async fn send_ack(&mut self, ack_num: u64) -> Result<(), String> {
-        let inst = self.sender.build_instruction(Vec::new(), ack_num, self.sender.throwaway_num);
+        let mut inst = self.sender.build_instruction(Vec::new(), ack_num, self.sender.throwaway_num);
+        let chaff_byte = (self.sender.state_num() & 0xFF) as u8;
+        add_chaff(&mut inst, chaff_byte);
         self.connection.send(&inst).await?;
         let now = Instant::now();
         self.sender.record_send(now);

@@ -3,14 +3,13 @@ use crossterm::{cursor, execute, terminal};
 use futures::StreamExt;
 use mosh_crypto::{Base64Key, Session};
 use mosh_network::{Connection, Transport};
-use mosh_prediction::{DisplayPreference, PredictionEngine};
+use mosh_prediction::{DisplayPreference, NotificationEngine, PredictionEngine};
 use mosh_statesync::{Complete, UserStream};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Events from the terminal input thread.
 enum TermEvent {
     Key(Vec<u8>),
     Resize(i32, i32),
@@ -21,7 +20,6 @@ enum TermEvent {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    // Parse command line: mosh-client <server-ip:port>
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: mosh-client <server-ip:port>");
@@ -33,7 +31,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("Invalid server address '{}': {}", args[1], e))?;
 
-    // Read key from environment
     let key_str = std::env::var("MOSH_KEY")
         .map_err(|_| "MOSH_KEY environment variable not set. Run via mosh wrapper.".to_string())?;
     let key = Base64Key::from_printable(&key_str)
@@ -41,38 +38,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Connecting to {server_addr}");
 
-    // Create crypto session
     let session = Session::new(*key.data());
 
-    // Create connection and transport (client side)
     let connection = Connection::new_client(session).await
         .map_err(|e| format!("Failed to create connection: {e}"))?;
     let mut transport = Transport::new_client(connection);
     transport.connection_mut().set_remote_addr(server_addr);
 
-    // State trackers
-    let mut user_stream = UserStream::new();
-    let mut sent_stream = UserStream::new(); // What we've already sent
-    let mut terminal_state = Complete::new(80, 24)?;
+    // Activate the transport (client starts in Active state)
+    transport.sender.set_state(mosh_network::transport::SendState::Active);
 
-    // Prediction engine for speculative local echo
+    let mut user_stream = UserStream::new();
+    let mut sent_stream = UserStream::new();
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let mut terminal_state = Complete::new(cols, rows)?;
+
     let mut prediction = PredictionEngine::new();
     prediction.set_display_preference(DisplayPreference::Adaptive);
+    prediction.set_send_interval(transport.sender.send_interval_ms());
 
-    // Get initial terminal size
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let mut notifications = NotificationEngine::new();
+    notifications.set_escape_key_string("Ctrl-c .".to_string());
+
     user_stream.push_resize(cols as i32, rows as i32);
 
-    // Enable raw mode and alternate screen
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
-    // Channel for terminal events
     let (term_tx, mut term_rx) = mpsc::channel::<TermEvent>(64);
 
-    // Spawn terminal input reader
-    let input_handle = tokio::task::spawn_local(async move {
+    // Use spawn instead of spawn_local (no LocalSet available)
+    let input_handle = tokio::spawn(async move {
         let mut events = EventStream::new();
         while let Some(Ok(event)) = events.next().await {
             match event {
@@ -85,10 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Char(ch) => {
                             if modifiers.contains(KeyModifiers::CONTROL) {
-                                // Ctrl+char: send control code
                                 bytes.push((ch as u8) - b'a' + 1);
                             } else if modifiers.contains(KeyModifiers::ALT) {
-                                // Alt+char: send ESC + char
                                 bytes.push(0x1b);
                                 bytes.push(ch as u8);
                             } else {
@@ -110,7 +105,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
                         KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
                         KeyCode::F(n) => {
-                            // F1-F12
                             match n {
                                 1 => bytes.extend_from_slice(b"\x1bOP"),
                                 2 => bytes.extend_from_slice(b"\x1bOQ"),
@@ -151,37 +145,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transport.sender.advance_state();
     }
 
-    let mut send_timer = tokio::time::interval(Duration::from_millis(50));
+    // Adaptive send timer based on RTT
+    let send_interval = Duration::from_millis(transport.sender.send_interval_ms());
+    let mut send_timer = tokio::time::interval(send_interval);
     send_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     log::info!("Entering event loop");
 
-    // Main event loop
     let result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
             Some(term_event) = term_rx.recv() => {
                 match term_event {
                     TermEvent::Key(bytes) => {
+                        let snap = terminal_state.snapshot();
+                        let (cols, rows) = terminal::size().unwrap_or((80, 24));
                         for byte in bytes {
                             user_stream.push_key(byte);
-                            // Feed to prediction engine for speculative echo
-                            let ch = byte as char;
-                            let (cur_row, cur_col) = prediction.cursor_pos().unwrap_or((0, 0));
-                            let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                            // Get actual cell at cursor for prediction
+                            let (cur_row, cur_col) = prediction.cursor_pos()
+                                .unwrap_or((snap.cursor_y as usize, snap.cursor_x as usize));
+                            let cell_char = snap.cell(cur_col as u16, cur_row as u16)
+                                .and_then(|d| d.text.chars().next())
+                                .unwrap_or(' ');
                             prediction.new_user_byte(
-                                ch,
+                                byte as char,
                                 cur_row,
                                 cur_col,
-                                ' ', // TODO: get actual cell at cursor
+                                cell_char,
                                 cols as usize,
                                 rows as usize,
                             );
                         }
+                        // Update prediction frame tracking
+                        let frame = transport.sender.state_num();
+                        prediction.set_local_frame_sent(frame);
                     }
                     TermEvent::Resize(w, h) => {
                         user_stream.push_resize(w, h);
-                        // Update terminal state dimensions
                         terminal_state = Complete::new(w as u16, h as u16)?;
+                        prediction.reset();
                         log::info!("Resize: {w}x{h}");
                     }
                     TermEvent::Quit => {
@@ -192,8 +194,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv_diff() => {
                 match result {
                     Ok(Some(diff)) => {
-                        // Apply diff to our terminal state
+                        notifications.clear_network_error();
+                        notifications.server_heard(std::time::Instant::now());
+
                         terminal_state.apply_string(&diff.diff);
+
+                        // Update prediction frame tracking from server acks
+                        let acked = transport.sender.acked_state_num();
+                        prediction.set_local_frame_acked(acked);
+                        prediction.set_local_frame_late_acked(diff.new_num);
 
                         // Validate predictions against new server state
                         let snap = terminal_state.snapshot();
@@ -205,7 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             snap.cursor_x as usize,
                         );
 
-                        // Write diff bytes directly to terminal
                         stdout.write_all(&diff.diff)?;
                         stdout.flush()?;
                         log::debug!("Applied diff: {} bytes", diff.diff.len());
@@ -213,8 +221,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {}
                     Err(e) => {
                         log::warn!("Recv error: {e}");
+                        notifications.set_network_error(format!("{e}"));
                     }
                 }
+
+                // Render notification bar if needed
+                if notifications.has_message() {
+                    if let Some(vt) = notifications.render() {
+                        stdout.write_all(vt.as_bytes())?;
+                        stdout.flush()?;
+                    }
+                }
+
+                // Update send interval from RTT
+                let rtt_ms = transport.connection().rtt().srtt_ms();
+                transport.update_send_interval(rtt_ms);
+                prediction.set_send_interval(rtt_ms);
             }
             _ = send_timer.tick() => {
                 // Send pending user stream diffs
@@ -223,19 +245,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !diff.is_empty() {
                         let ack_num = transport.receiver.remote_state_num();
                         let throwaway = transport.sender.throwaway_num();
+                        let bytes_to_send = diff.len();
                         if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                             log::warn!("Send error: {e}");
                         } else {
                             sent_stream = user_stream.clone();
                             transport.sender.advance_state();
-                            log::debug!("Sent {} bytes of user diff", user_stream.len() - sent_stream.len());
+                            log::debug!("Sent {bytes_to_send} bytes of user diff");
                         }
                     }
                 }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Periodic: check for port hopping, etc.
-                if transport.should_hop_port(std::time::Instant::now()) {
+
+                // Send delayed ACK if needed
+                let now = std::time::Instant::now();
+                if transport.should_send_ack(now) {
+                    let ack_num = transport.receiver.remote_state_num();
+                    if let Err(e) = transport.send_ack(ack_num).await {
+                        log::warn!("ACK send error: {e}");
+                    }
+                }
+
+                // Check for port hopping
+                if transport.should_hop_port(now) {
                     if let Err(e) = transport.hop_port().await {
                         log::warn!("Port hop failed: {e}");
                     }
@@ -243,6 +274,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    // Send shutdown marker to server
+    log::info!("Sending shutdown marker");
+    let ack_num = transport.receiver.remote_state_num();
+    if let Err(e) = transport.send_shutdown(ack_num).await {
+        log::warn!("Failed to send shutdown: {e}");
+    }
 
     // Cleanup
     let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);

@@ -1,5 +1,6 @@
 use mosh_crypto::{Base64Key, Session};
 use mosh_network::{Connection, Transport};
+use mosh_network::transport::SendState;
 use mosh_proto::client::UserMessage;
 use mosh_statesync::Complete;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
@@ -10,7 +11,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Events from the PTY reader thread.
 enum PtyEvent {
     Output(Vec<u8>),
     Exited(ExitStatus),
@@ -20,7 +20,6 @@ enum PtyEvent {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    // Parse command line
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: mosh-server [options] [command]");
@@ -32,7 +31,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Parse options
     let mut bind_port: u16 = 0;
     let mut bind_addr = "0.0.0.0".to_string();
     let mut command_args: Vec<String> = Vec::new();
@@ -54,7 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    // Determine shell command
     let shell = if command_args.is_empty() {
         env::var("SHELL").unwrap_or_else(|_| {
             if cfg!(windows) {
@@ -67,7 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command_args[0].clone()
     };
 
-    // Generate or read key
     let key = if let Ok(key_str) = env::var("MOSH_KEY") {
         Base64Key::from_printable(&key_str)
             .map_err(|e| format!("Invalid MOSH_KEY: {e}"))?
@@ -75,21 +71,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Base64Key::random()
     };
 
-    // Create crypto session
     let session = Session::new(*key.data());
 
-    // Create server connection
     let bind_addr: SocketAddr = format!("{bind_addr}:{bind_port}").parse()
         .map_err(|e| format!("Invalid bind address: {e}"))?;
     let connection = Connection::new_server(bind_addr, session).await
         .map_err(|e| format!("Failed to bind: {e}"))?;
 
-    let local_addr = connection.remote_addr().unwrap_or_else(|| {
-        // If no remote yet, use the bound address
-        bind_addr
-    });
+    let local_addr = connection.remote_addr().unwrap_or(bind_addr);
 
-    // Print connection info for the wrapper to parse
     println!(
         "MOSH CONNECT {} {} {}",
         local_addr.ip(),
@@ -97,19 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key.printable_key()
     );
     println!("MOSH CONNECTION ID: 1");
-
-    // Flush stdout so the wrapper can read the connection info
     std::io::stdout().flush()?;
 
     log::info!("Server started, waiting for client at {local_addr}");
 
-    // Create transport (server side)
+    // Create transport and activate it immediately
     let mut transport = Transport::new_server(connection);
+    transport.sender.set_state(SendState::Active);
 
-    // Create terminal state
     let mut terminal_state = Complete::new(80, 24)?;
 
-    // Spawn PTY
     let pty_size = PtySize {
         rows: 24,
         cols: 80,
@@ -118,7 +105,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut cmd = CommandBuilder::new(&shell);
-    // Set environment variables for the child process
     cmd.env("TERM", "xterm-256color");
     cmd.env("LANG", "en_US.UTF-8");
 
@@ -126,20 +112,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pair = pty_system.openpty(pty_size)
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    // Spawn the child process
     let mut child = pair.slave.spawn_command(cmd)
         .map_err(|e| format!("Failed to spawn shell: {e}"))?;
 
     log::info!("Spawned shell: {shell}");
 
-    // Create channels for PTY output
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyEvent>(64);
 
-    // Get the reader from the PTY master
     let mut pty_reader = pair.master.try_clone_reader()
         .map_err(|e| format!("Failed to clone PTY reader: {e}"))?;
 
-    // Spawn PTY reader thread
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -161,32 +143,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Get the PTY writer
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| format!("Failed to get PTY writer: {e}"))?;
 
-    // State tracking
     let mut client_assumed_state = Complete::new(80, 24)?;
-    let mut last_send_time = std::time::Instant::now();
-    let send_interval = Duration::from_millis(50);
 
     log::info!("Entering serve loop");
 
-    // Main serve loop
     let result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
             // PTY output → compute diff → send to client
             Some(pty_event) = pty_rx.recv() => {
                 match pty_event {
                     PtyEvent::Output(data) => {
-                        // Apply PTY output to terminal state
                         terminal_state.apply_string(&data);
 
-                        // Compute diff from what client last saw
+                        // Use transport's should_send for adaptive timing
+                        let now = std::time::Instant::now();
                         let diff = terminal_state.diff_from(&client_assumed_state);
-
-                        if !diff.is_empty() && last_send_time.elapsed() >= send_interval {
-                            // Send diff to client, acking the client's state
+                        if !diff.is_empty() && transport.should_send(now) {
                             let ack_num = transport.receiver.remote_state_num();
                             let throwaway = transport.sender.throwaway_num();
                             if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
@@ -194,12 +169,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 client_assumed_state = terminal_state.clone();
                                 transport.sender.advance_state();
-                                last_send_time = std::time::Instant::now();
                             }
                         }
                     }
                     PtyEvent::Exited(status) => {
                         log::info!("Shell exited with status: {}", status.exit_code());
+                        // Send final state + shutdown
+                        let diff = terminal_state.diff_from(&client_assumed_state);
+                        if !diff.is_empty() {
+                            let ack_num = transport.receiver.remote_state_num();
+                            let throwaway = transport.sender.throwaway_num();
+                            let _ = transport.send_diff(diff, ack_num, throwaway).await;
+                            client_assumed_state = terminal_state.clone();
+                            transport.sender.advance_state();
+                        }
                         break Ok(());
                     }
                 }
@@ -209,12 +192,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv_diff() => {
                 match result {
                     Ok(Some(diff)) => {
-                        // Decode the UserMessage protobuf to extract keystrokes/resize
                         if !diff.diff.is_empty() {
                             match UserMessage::decode(diff.diff.as_slice()) {
                                 Ok(user_msg) => {
                                     for inst in &user_msg.instruction {
-                                        // Extract keystrokes
                                         if let Some(ref keystroke) = inst.keystroke {
                                             if let Some(ref keys) = keystroke.keys {
                                                 for &byte in keys {
@@ -224,7 +205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             }
                                         }
-                                        // Handle resize
                                         if let Some(ref resize) = inst.resize {
                                             let w = resize.width.unwrap_or(80) as u16;
                                             let h = resize.height.unwrap_or(24) as u16;
@@ -234,7 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 pixel_width: 0,
                                                 pixel_height: 0,
                                             });
-                                            // Update terminal state dimensions
                                             terminal_state = Complete::new(w, h)?;
                                             log::info!("Client resize: {w}x{h}");
                                         }
@@ -245,6 +224,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
+
+                        // Shutdown was detected by recv_diff() internally
+                        if transport.receiver.shutdown_received() {
+                            log::info!("Client sent shutdown");
+                            break Ok(());
+                        }
+
                         if let Err(e) = pty_writer.flush() {
                             log::warn!("PTY flush error: {e}");
                         }
@@ -255,27 +241,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-
-            // Periodic: send pending diffs
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                // Check if there's a pending diff to send
-                let diff = terminal_state.diff_from(&client_assumed_state);
-                if !diff.is_empty() && last_send_time.elapsed() >= send_interval {
-                    let ack_num = transport.receiver.remote_state_num();
-                    let throwaway = transport.sender.throwaway_num();
-                    if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
-                        log::warn!("Send error: {e}");
-                    } else {
-                        client_assumed_state = terminal_state.clone();
-                        transport.sender.advance_state();
-                        last_send_time = std::time::Instant::now();
-                    }
-                }
-            }
         }
     };
 
-    // Cleanup
+    // Send shutdown marker to client
+    log::info!("Sending shutdown marker");
+    let ack_num = transport.receiver.remote_state_num();
+    let _ = transport.send_shutdown(ack_num).await;
+
     log::info!("Shutting down");
     let _ = child.kill();
     result
