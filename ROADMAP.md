@@ -82,16 +82,17 @@ mosh-rust/
    - Zig 0.15.2 via mise.toml, builds against local Ghostty checkout (`GHOSTTY_SOURCE_DIR`)
    - 4 tests passing: create, write, resize, frame counter
 
-2. **Adapt for Mosh's state sync needs** — TODO
-   - `RenderState` for dirty-tracked cell-level access (enables efficient diffing)
-   - `KeyEncoder` for translating raw keystrokes to terminal escape sequences
-   - Map libghostty's dirty-cell model to Mosh's `diff_from()` / `apply_string()` protocol
+2. **Adapt for Mosh's state sync needs** ✅
+   - `ScreenSnapshot` / `CellData` / `CellStyle` — owned grid for easy diffing
+   - `DisplayDiff::full_redraw()` — VT escape sequences from snapshot
+   - `DisplayDiff::diff()` — minimal VT diff between two snapshots (cell-by-cell)
+   - `KeyMap` wrapper around libghostty-vt's `key::Encoder` — char/enter/backspace/arrows/modifiers
 
-3. **Mosh-specific adaptations** — TODO
-   - Wrap libghostty-vt's terminal in a `Complete`-like struct for the transport layer
-   - Generate ANSI escape sequences from render state diffs (replacing Mosh's `Display`)
-   - Handle server-side: PTY output → libghostty parser → framebuffer → diff
-   - Handle client-side: received diff → apply to libghostty framebuffer → render
+3. **Mosh-specific adaptations** ✅
+   - Snapshot model captures full grid, cursor, colors, palette
+   - VT generation uses SGR sequences for styles, CUP for cursor positioning
+   - Diff algorithm skips unchanged rows, emits only changed runs
+   - Style resets emitted correctly between styled/unstyled cells
 
 ### Phase 3: State Synchronization
 **Goal:** The SSP (State Synchronization Protocol) — diffs, transport sender/receiver.
