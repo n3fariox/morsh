@@ -154,10 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PtyEvent::Output(data) => {
                         terminal_state.apply_string(&data);
 
-                        // Use transport's should_send for adaptive timing
-                        let now = std::time::Instant::now();
+                        // Send diff immediately when there's new PTY output.
+                        // Don't wait for adaptive timing — the client needs
+                        // to see updates as soon as they're available.
                         let diff = terminal_state.diff_from(&client_assumed_state);
-                        if !diff.is_empty() && transport.should_send(now) {
+                        if !diff.is_empty() {
                             let ack_num = transport.receiver.remote_state_num();
                             let throwaway = transport.sender.throwaway_num();
                             if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {

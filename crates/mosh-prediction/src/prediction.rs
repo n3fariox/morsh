@@ -137,7 +137,7 @@ impl PredictionEngine {
     }
 
     /// Whether predictions should be displayed.
-    fn should_display(&self) -> bool {
+    pub fn should_display(&self) -> bool {
         match self.display_preference {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
@@ -515,9 +515,19 @@ impl PredictionEngine {
         }
     }
 
-    /// Get mutable access to the overlay.
+    /// Get immutable access to the overlay.
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
+    }
+
+    /// Get the current late-acked frame number.
+    pub fn local_frame_late_acked(&self) -> u64 {
+        self.local_frame_late_acked
+    }
+
+    /// Whether flagging is active (RTT high enough to underline predictions).
+    pub fn is_flagging(&self) -> bool {
+        self.flagging
     }
 }
 

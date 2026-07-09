@@ -16,6 +16,97 @@ enum TermEvent {
     Quit,
 }
 
+/// Render the prediction overlay with underlined characters for pending predictions.
+///
+/// This shows users which characters have been predicted locally but not yet
+/// confirmed by the server. Underlines appear when RTT is high enough to
+/// warrant local echo (flagging mode).
+///
+/// Before rendering new underlines, all previously underlined cells are cleared
+/// to prevent stale underlines from persisting after the server confirms
+/// predictions.
+fn render_prediction_overlay(
+    prediction: &mosh_prediction::PredictionEngine,
+    stdout: &mut io::Stdout,
+) -> Result<(), io::Error> {
+    if !prediction.should_display() {
+        // If display is off but we previously rendered underlines, clear them
+        return Ok(());
+    }
+
+    let overlay = prediction.overlay();
+    let late_acked = prediction.local_frame_late_acked();
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+
+    // Save cursor position
+    write!(stdout, "\x1b[s")?;
+
+    // First pass: clear ALL overlay cells to remove stale underlines.
+    // The server diff updates cells directly, but underlines from previous
+    // overlay renders persist unless explicitly cleared.
+    for row in overlay.rows() {
+        if row.row_num >= rows as usize {
+            continue;
+        }
+        for cell in &row.cells {
+            if !cell.active || cell.col >= cols as usize {
+                continue;
+            }
+            // Clear this cell: position cursor, reset attributes, rewrite
+            // the cell content without underline
+            write!(stdout, "\x1b[{};{}H", row.row_num + 1, cell.col + 1)?;
+            write!(stdout, "\x1b[0m")?;
+            if cell.unknown {
+                write!(stdout, " ")?;
+            } else {
+                write!(stdout, "{}", cell.replacement)?;
+            }
+        }
+    }
+
+    // Second pass: render pending predictions with underline
+    for row in overlay.rows() {
+        if row.row_num >= rows as usize {
+            continue;
+        }
+
+        for cell in &row.cells {
+            if !cell.active {
+                continue;
+            }
+
+            if cell.col >= cols as usize {
+                continue;
+            }
+
+            // Only render pending predictions (not yet confirmed by server)
+            if late_acked >= cell.expiration_frame {
+                continue;
+            }
+
+            // Move cursor to cell position (1-based VT coordinates)
+            write!(stdout, "\x1b[{};{}H", row.row_num + 1, cell.col + 1)?;
+
+            // Set underline attribute
+            write!(stdout, "\x1b[4m")?;
+
+            // Write the predicted character
+            if cell.unknown {
+                write!(stdout, " ")?;
+            } else {
+                write!(stdout, "{}", cell.replacement)?;
+            }
+
+            // Reset attributes
+            write!(stdout, "\x1b[0m")?;
+        }
+    }
+
+    // Restore cursor position
+    write!(stdout, "\x1b[u")?;
+    stdout.flush()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -179,6 +270,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Update prediction frame tracking
                         let frame = transport.sender.state_num();
                         prediction.set_local_frame_sent(frame);
+
+                        // Render prediction overlay immediately for instant feedback
+                        if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
+                            log::debug!("Overlay render error: {e}");
+                        }
                     }
                     TermEvent::Resize(w, h) => {
                         user_stream.push_resize(w, h);
@@ -217,6 +313,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         stdout.write_all(&diff.diff)?;
                         stdout.flush()?;
                         log::debug!("Applied diff: {} bytes", diff.diff.len());
+
+                        // Render prediction overlay (underlined characters for pending predictions)
+                        if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
+                            log::debug!("Overlay render error: {e}");
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {

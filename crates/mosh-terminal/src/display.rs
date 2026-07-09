@@ -59,13 +59,20 @@ impl DisplayDiff {
     ///
     /// Compares cell-by-cell and emits only the necessary changes.
     /// Uses cursor positioning and style changes to minimize output.
+    ///
+    /// To correctly handle escape sequences that change the terminal's internal
+    /// SGR state (e.g. `\x1b[0m`) without changing visible cells between
+    /// snapshots, we visit every position in each changed row and track the
+    /// "pen state" — the terminal's current SGR style. When the pen state
+    /// diverges from what the new snapshot expects, we emit a reset to
+    /// synchronize. This catches escape sequences that happened at unchanged
+    /// positions between snapshots.
     pub fn diff(old: &ScreenSnapshot, new: &ScreenSnapshot) -> String {
         if old.cols != new.cols || old.rows_count != new.rows_count {
             return Self::full_redraw(new);
         }
 
         let mut out = String::with_capacity(new.cols as usize * new.rows_count as usize * 2);
-        let mut last_style = CellStyle::default_style();
 
         for y in 0..new.rows_count as usize {
             let old_row = &old.rows[y];
@@ -83,56 +90,62 @@ impl DisplayDiff {
                 continue;
             }
 
-            // Find changed run within this row
+            // Reset SGR state at start of row to establish a known baseline.
+            // This ensures the pen state is synchronized before we process
+            // any cells.
+            let mut pen_state = CellStyle::default_style();
+            out.push_str("\x1b[0m");
+
+            // Visit EVERY position in this row to track pen state.
+            // Escape sequences can change the pen state at unchanged positions,
+            // so we must check for divergence even where cells are identical.
             let mut x = 0usize;
+            let mut cursor_pos: Option<(usize, usize)> = None; // (y, x) of last cursor position
             while x < new.cols as usize {
-                if old_row.get(x) == new_row.get(x) {
-                    x += 1;
-                    continue;
+                let new_cell = &new_row[x];
+                let is_changed = old_row.get(x) != new_row.get(x);
+
+                // Check if pen state diverges from what the new snapshot expects.
+                if pen_state != new_cell.style {
+                    // Position cursor
+                    cursor_pos = Some((y + 1, x + 1));
+                    out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
+                    // Reset to default, then apply new style if non-default
+                    out.push_str("\x1b[0m");
+                    if !new_cell.style.is_default() {
+                        out.push_str(&style_on(&new_cell.style));
+                    }
+                    pen_state = new_cell.style.clone();
                 }
 
-                // Found a changed cell. Position cursor.
-                out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
-
-                // Emit cells until we hit an unchanged cell or end of row
-                let mut need_style_reset = false;
-                while x < new.cols as usize && old_row.get(x) != new_row.get(x) {
-                    let cell = &new_row[x];
-                    let old_cell = &old_row[x];
-
-                    // If old cell was styled and we haven't reset yet, reset first
-                    if need_style_reset || (!old_cell.style.is_default() && cell.style.is_default()) {
-                        out.push_str("\x1b[0m");
-                        last_style = CellStyle::default_style();
-                        need_style_reset = false;
+                // Emit changed cell content
+                if is_changed {
+                    // Position cursor if not already at the right position
+                    let needed = (y + 1, x + 1);
+                    if cursor_pos != Some(needed) {
+                        out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
                     }
+                    // After writing this char, cursor moves to x+2
+                    cursor_pos = Some((y + 1, x + 2));
 
-                    // Apply new style if different from what's active
-                    if cell.style != last_style {
-                        if !cell.style.is_default() {
-                            out.push_str(&style_on(&cell.style));
-                        }
-                        last_style = cell.style.clone();
-                    }
-
-                    if cell.text.is_empty() {
+                    if new_cell.text.is_empty() {
                         out.push(' ');
                     } else {
-                        out.push_str(&cell.text);
+                        out.push_str(&new_cell.text);
                     }
-
-                    // If cell is wide, skip the next (placeholder) cell
-                    if cell.wide && x + 1 < new.cols as usize {
-                        x += 1;
-                    }
-                    x += 1;
+                } else {
+                    // Unchanged cell — cursor is no longer tracked
+                    cursor_pos = None;
                 }
-            }
-        }
 
-        // Reset style at end if non-default
-        if !last_style.is_default() {
-            out.push_str("\x1b[0m");
+                pen_state = new_cell.style.clone();
+
+                if new_cell.wide && x + 1 < new.cols as usize {
+                    x += 1;
+                    pen_state = new_row[x].style.clone();
+                }
+                x += 1;
+            }
         }
 
         // Position cursor
@@ -293,5 +306,99 @@ mod tests {
         let vt = DisplayDiff::diff(&old, &new);
         // Should contain a reset sequence
         assert!(vt.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn diff_pen_state_divergence_at_unchanged_position() {
+        // Escape sequence changes pen state at unchanged position.
+        // Old: yellow "$" at pos 0, default at pos 1-2
+        // New: yellow "$" at pos 0, default at pos 1, "X" at pos 2
+        // The pen state at pos 1 diverges (old=yellow, new=default)
+        // because \x1b[0m was applied at pos 1 between snapshots.
+        let mut old = ScreenSnapshot::new(10, 1);
+        let mut new = ScreenSnapshot::new(10, 1);
+
+        old.rows[0][0].style.fg = StyleColor::Palette(3);
+        old.rows[0][0].text = "$".into();
+        new.rows[0][0].style.fg = StyleColor::Palette(3);
+        new.rows[0][0].text = "$".into();
+
+        old.rows[0][1].text = " ".into();
+        new.rows[0][1].text = " ".into();
+
+        new.rows[0][2].text = "X".into();
+
+        let vt = DisplayDiff::diff(&old, &new);
+
+        // Should contain reset for pen state divergence at pos 1
+        // and "X" at pos 2
+        assert!(vt.contains("\x1b[0m"));
+        assert!(vt.contains("X"));
+    }
+
+    #[test]
+    fn diff_two_changed_runs_with_pen_divergence_between() {
+        // Two changed runs in same row. Between them, pen state diverges.
+        // Old: yellow "Hi" at 0-1, yellow "XY" at 3-4
+        // New: yellow "Hi" at 0-1, default "ZW" at 3-4
+        // "Hi" is unchanged so not emitted; "ZW" is the changed run.
+        // Pen state diverges at pos 2 (old=yellow, new=default) → reset emitted.
+        let mut old = ScreenSnapshot::new(10, 1);
+        let mut new = ScreenSnapshot::new(10, 1);
+
+        old.rows[0][0].style.fg = StyleColor::Palette(3);
+        old.rows[0][0].text = "H".into();
+        old.rows[0][1].style.fg = StyleColor::Palette(3);
+        old.rows[0][1].text = "i".into();
+        new.rows[0][0].style.fg = StyleColor::Palette(3);
+        new.rows[0][0].text = "H".into();
+        new.rows[0][1].style.fg = StyleColor::Palette(3);
+        new.rows[0][1].text = "i".into();
+
+        old.rows[0][3].style.fg = StyleColor::Palette(3);
+        old.rows[0][3].text = "X".into();
+        old.rows[0][4].style.fg = StyleColor::Palette(3);
+        old.rows[0][4].text = "Y".into();
+        new.rows[0][3].style.fg = StyleColor::Default;
+        new.rows[0][3].text = "Z".into();
+        new.rows[0][4].style.fg = StyleColor::Default;
+        new.rows[0][4].text = "W".into();
+
+        let vt = DisplayDiff::diff(&old, &new);
+
+        // "ZW" should be in output with a pen state reset
+        assert!(vt.contains("ZW"));
+        assert!(vt.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn diff_multiple_rows_each_resets_sgr() {
+        let mut old = ScreenSnapshot::new(5, 2);
+        let mut new = ScreenSnapshot::new(5, 2);
+
+        old.rows[0][0].style.fg = StyleColor::Palette(1);
+        old.rows[0][0].text = "A".into();
+        new.rows[0][0].style.fg = StyleColor::Palette(1);
+        new.rows[0][0].text = "A".into();
+
+        old.rows[1][0].text = "B".into();
+        new.rows[1][0].text = "C".into();
+
+        let vt = DisplayDiff::diff(&old, &new);
+
+        // Row 0 is skipped (all cells identical)
+        // Row 1 has change, should start with SGR reset
+        assert!(vt.contains("\x1b[0m"));
+        assert!(vt.contains("C"));
+    }
+
+    #[test]
+    fn diff_no_unnecessary_resets_for_identical_rows() {
+        let old = ScreenSnapshot::new(5, 2);
+        let new = ScreenSnapshot::new(5, 2);
+
+        let vt = DisplayDiff::diff(&old, &new);
+        // Only cursor positioning, no SGR resets
+        assert!(!vt.contains("\x1b[0m"));
     }
 }
