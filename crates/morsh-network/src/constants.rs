@@ -4,7 +4,7 @@ pub const ADDED_BYTES: usize = 12; // 8 nonce + 4 timestamps
 pub const SESSION_ADDED_BYTES: usize = 16; // OCB tag
 pub const FRAG_HEADER_LEN: usize = 10; // 8 id + 2 combined_fragment_num
 
-pub const SEND_INTERVAL_MIN_MS: u64 = 20;
+pub const SEND_INTERVAL_MIN_MS: u64 = 8;
 pub const SEND_INTERVAL_MAX_MS: u64 = 250;
 pub const ACK_INTERVAL_MS: u64 = 3000;
 pub const ACK_DELAY_MS: u64 = 100;

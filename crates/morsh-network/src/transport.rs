@@ -141,7 +141,8 @@ impl TransportSender {
     pub fn update_send_interval(&mut self, rtt_ms: u64) {
         // Mosh formula: clamp to [SEND_INTERVAL_MIN_MS, SEND_INTERVAL_MAX_MS]
         // Prefer 2x RTT for smooth updates, but at least min, at most max
-        let interval_ms = (rtt_ms * 2)
+        // Mosh formula: max(SRTT/2, SEND_INTERVAL_MIN_MS), clamped to MAX
+        let interval_ms = ((rtt_ms + 1) / 2)
             .max(SEND_INTERVAL_MIN_MS)
             .min(SEND_INTERVAL_MAX_MS);
         self.send_interval = Duration::from_millis(interval_ms);
@@ -499,9 +500,9 @@ mod tests {
         // Initial interval is max
         assert_eq!(sender.send_interval, Duration::from_millis(SEND_INTERVAL_MAX_MS));
 
-        // Update based on 100ms RTT → 200ms interval
+        // Update based on 100ms RTT → SRTT/2 = 50ms interval
         sender.update_send_interval(100);
-        assert_eq!(sender.send_interval, Duration::from_millis(200));
+        assert_eq!(sender.send_interval, Duration::from_millis(50));
 
         // Update based on 10ms RTT → min interval
         sender.update_send_interval(10);

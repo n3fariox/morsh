@@ -18,19 +18,14 @@ enum TermEvent {
 
 /// Render the prediction overlay with underlined characters for pending predictions.
 ///
-/// This shows users which characters have been predicted locally but not yet
-/// confirmed by the server. Underlines appear when RTT is high enough to
-/// warrant local echo (flagging mode).
-///
-/// Before rendering new underlines, all previously underlined cells are cleared
-/// to prevent stale underlines from persisting after the server confirms
-/// predictions.
+/// Shows users which characters have been predicted locally but not yet
+/// confirmed by the server. Uses a single pass with buffered output to
+/// minimize terminal write overhead.
 fn render_prediction_overlay(
     prediction: &morsh_prediction::PredictionEngine,
     stdout: &mut io::Stdout,
 ) -> Result<(), io::Error> {
     if !prediction.should_display() {
-        // If display is off but we previously rendered underlines, clear them
         return Ok(());
     }
 
@@ -38,12 +33,10 @@ fn render_prediction_overlay(
     let late_acked = prediction.local_frame_late_acked();
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
-    // Save cursor position
-    write!(stdout, "\x1b[s")?;
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(4096);
+    buf.push_str("\x1b[s");
 
-    // First pass: clear ALL overlay cells to remove stale underlines.
-    // The server diff updates cells directly, but underlines from previous
-    // overlay renders persist unless explicitly cleared.
     for row in overlay.rows() {
         if row.row_num >= rows as usize {
             continue;
@@ -52,58 +45,20 @@ fn render_prediction_overlay(
             if !cell.active || cell.col >= cols as usize {
                 continue;
             }
-            // Clear this cell: position cursor, reset attributes, rewrite
-            // the cell content without underline
-            write!(stdout, "\x1b[{};{}H", row.row_num + 1, cell.col + 1)?;
-            write!(stdout, "\x1b[0m")?;
-            if cell.unknown {
-                write!(stdout, " ")?;
-            } else {
-                write!(stdout, "{}", cell.replacement)?;
+            let pending = late_acked < cell.expiration_frame;
+            write!(buf, "\x1b[{};{}H\x1b[0m", row.row_num + 1, cell.col + 1).unwrap();
+            if pending {
+                buf.push_str("\x1b[4m");
+            }
+            buf.push(if cell.unknown { ' ' } else { cell.replacement });
+            if pending {
+                buf.push_str("\x1b[0m");
             }
         }
     }
 
-    // Second pass: render pending predictions with underline
-    for row in overlay.rows() {
-        if row.row_num >= rows as usize {
-            continue;
-        }
-
-        for cell in &row.cells {
-            if !cell.active {
-                continue;
-            }
-
-            if cell.col >= cols as usize {
-                continue;
-            }
-
-            // Only render pending predictions (not yet confirmed by server)
-            if late_acked >= cell.expiration_frame {
-                continue;
-            }
-
-            // Move cursor to cell position (1-based VT coordinates)
-            write!(stdout, "\x1b[{};{}H", row.row_num + 1, cell.col + 1)?;
-
-            // Set underline attribute
-            write!(stdout, "\x1b[4m")?;
-
-            // Write the predicted character
-            if cell.unknown {
-                write!(stdout, " ")?;
-            } else {
-                write!(stdout, "{}", cell.replacement)?;
-            }
-
-            // Reset attributes
-            write!(stdout, "\x1b[0m")?;
-        }
-    }
-
-    // Restore cursor position
-    write!(stdout, "\x1b[u")?;
+    buf.push_str("\x1b[u");
+    write!(stdout, "{buf}")?;
     stdout.flush()
 }
 
@@ -302,6 +257,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Render prediction overlay immediately for instant feedback
                         if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
                             log::debug!("Overlay render error: {e}");
+                        }
+
+                        // Send keystroke immediately if enough time has passed since last send
+                        let now = std::time::Instant::now();
+                        if transport.sender.should_send(now) {
+                            if user_stream.len() > sent_stream.len() {
+                                let diff = user_stream.diff_from(&sent_stream);
+                                if !diff.is_empty() {
+                                    let ack_num = transport.receiver.remote_state_num();
+                                    let throwaway = transport.sender.throwaway_num();
+                                    let bytes_to_send = diff.len();
+                                    if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
+                                        log::warn!("Send error: {e}");
+                                    } else {
+                                        sent_stream = user_stream.clone();
+                                        transport.sender.advance_state();
+                                        log::debug!("Sent {bytes_to_send} bytes (immediate)");
+                                    }
+                                }
+                            }
                         }
                     }
                     TermEvent::Resize(w, h) => {
