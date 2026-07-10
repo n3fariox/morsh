@@ -71,8 +71,10 @@ impl Complete {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn create_complete() {
         let c = Complete::new(80, 24);
         assert!(c.is_ok());
@@ -80,6 +82,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn apply_text_to_snapshot() {
         let mut c = Complete::new(80, 1).unwrap();
         c.apply_string(b"Hello");
@@ -90,24 +93,25 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn apply_cursor_positioning() {
         let mut c = Complete::new(10, 3).unwrap();
-        // Move to row 2, col 3 (1-based)
         c.apply_string(b"\x1b[2;3HX");
         let snap = c.snapshot();
         assert_eq!(snap.rows[1][2].text, "X");
     }
 
     #[test]
+    #[serial]
     fn apply_color_escape() {
         let mut c = Complete::new(10, 1).unwrap();
-        // Bold red text
         c.apply_string(b"\x1b[1;31mX\x1b[0m");
         let snap = c.snapshot();
         assert!(snap.rows[0][0].style.bold);
     }
 
     #[test]
+    #[serial]
     fn diff_from_empty_to_text() {
         let empty = Complete::new(80, 1).unwrap();
         let old_snap = empty.snapshot();
@@ -120,6 +124,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn diff_same_states() {
         let mut a = Complete::new(80, 1).unwrap();
         a.apply_string(b"Hello");
@@ -129,24 +134,21 @@ mod tests {
         b.apply_string(b"Hello");
 
         let diff = b.diff_from(&snap_a);
-        // Should be empty or minimal (just cursor positioning)
         assert!(diff.len() < 10);
     }
 
     #[test]
+    #[serial]
     fn dec_private_mode_not_visible() {
-        // \x1b[?2004l = disable bracketed paste mode
-        // This should be consumed by ghostty-vt, not written as visible text
         let mut c = Complete::new(80, 1).unwrap();
         c.apply_string(b"\x1b[?2004l");
         let snap = c.snapshot();
-        // Row should be empty — the sequence is a mode change, not text
         assert!(snap.rows[0][0].text.is_empty());
     }
 
     #[test]
+    #[serial]
     fn dec_private_mode_with_text() {
-        // Shell outputs bracketed paste mode then prints text
         let mut c = Complete::new(80, 1).unwrap();
         c.apply_string(b"\x1b[?2004h$ ");
         let snap = c.snapshot();
@@ -155,11 +157,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cursor_visibility_sequence() {
-        // \x1b[?25l = hide cursor, \x1b[?25h = show cursor
         let mut c = Complete::new(10, 1).unwrap();
         c.apply_string(b"\x1b[?25l");
-        // Should not write "?25l" as text
         assert!(c.snapshot().rows[0][0].text.is_empty());
     }
 }

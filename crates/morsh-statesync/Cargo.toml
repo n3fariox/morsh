@@ -11,3 +11,4 @@ prost = "0.14"
 log = "0.4"
 
 [dev-dependencies]
+serial_test = "3"
