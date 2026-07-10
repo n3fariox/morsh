@@ -33,9 +33,6 @@ pub struct Session {
 /// Overhead added by encryption: 16-byte OCB tag.
 pub const ADDED_BYTES: usize = 16;
 
-/// Maximum receive MTU.
-pub const RECEIVE_MTU: usize = 2048;
-
 impl Session {
     /// Create a new session with the given 16-byte key.
     pub fn new(key: [u8; 16]) -> Self {
@@ -65,7 +62,7 @@ impl Session {
         assert_eq!(buffer.len() + tag.len(), ct_len);
 
         // Track blocks encrypted (for the 2^47 security limit)
-        self.blocks_encrypted += (pt_len as u64 + 15) / 16;
+        self.blocks_encrypted += (pt_len as u64).div_ceil(16);
         assert!(
             self.blocks_encrypted >> 47 == 0,
             "Encrypted 2^47 blocks — session key must be rotated"

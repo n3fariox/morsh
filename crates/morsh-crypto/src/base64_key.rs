@@ -50,7 +50,7 @@ impl Base64Key {
     /// Encode the key as a 22-character base64 string (no padding).
     pub fn printable_key(&self) -> String {
         use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&self.0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(self.0);
         // encoded is 24 chars with "==" padding — strip the last 2
         encoded[..22].to_string()
     }

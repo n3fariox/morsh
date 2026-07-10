@@ -1,7 +1,6 @@
 use crate::constants::*;
 use crate::connection::Connection;
 use crate::fragment::add_chaff;
-use morsh_crypto::Nonce;
 use morsh_proto::transport::Instruction as TransportInstruction;
 use std::time::{Duration, Instant};
 
@@ -29,10 +28,6 @@ pub struct TransportSender {
     acked_state_num: u64,
     /// Number of throwaway packets received.
     throwaway_num: u64,
-    /// Nonce sequence counter.
-    nonce_seq: u64,
-    /// Whether this is the client side (sets high bit on nonces).
-    client_side: bool,
     /// Last time we sent a packet.
     last_send_time: Instant,
     /// Adaptive send interval based on RTT.
@@ -51,10 +46,6 @@ pub struct TransportReceiver {
     acked_state_num: u64,
     /// The remote's last state number (from their new_num field).
     remote_state_num: u64,
-    /// Nonce sequence counter for received packets.
-    nonce_seq: u64,
-    /// Whether this is the client side.
-    client_side: bool,
     /// Last time we received a packet.
     last_recv_time: Instant,
     /// Shutdown state.
@@ -92,14 +83,12 @@ pub struct Transport {
 }
 
 impl TransportSender {
-    pub fn new(client_side: bool) -> Self {
+    pub fn new(_client_side: bool) -> Self {
         let now = Instant::now();
         Self {
             state_num: 0,
             acked_state_num: 0,
             throwaway_num: 0,
-            nonce_seq: 0,
-            client_side,
             last_send_time: now - Duration::from_secs(1), // Allow immediate first send
             send_interval: Duration::from_millis(SEND_INTERVAL_MAX_MS),
             state: SendState::Pending,
@@ -142,9 +131,7 @@ impl TransportSender {
         // Mosh formula: clamp to [SEND_INTERVAL_MIN_MS, SEND_INTERVAL_MAX_MS]
         // Prefer 2x RTT for smooth updates, but at least min, at most max
         // Mosh formula: max(SRTT/2, SEND_INTERVAL_MIN_MS), clamped to MAX
-        let interval_ms = ((rtt_ms + 1) / 2)
-            .max(SEND_INTERVAL_MIN_MS)
-            .min(SEND_INTERVAL_MAX_MS);
+        let interval_ms = rtt_ms.div_ceil(2).clamp(SEND_INTERVAL_MIN_MS, SEND_INTERVAL_MAX_MS);
         self.send_interval = Duration::from_millis(interval_ms);
     }
 
@@ -186,18 +173,6 @@ impl TransportSender {
         self.throwaway_num
     }
 
-    /// Get the next nonce for sending.
-    fn next_send_nonce(&mut self) -> Nonce {
-        let seq = self.nonce_seq;
-        self.nonce_seq += 1;
-        let val = if self.client_side {
-            (1u64 << 63) | seq
-        } else {
-            seq
-        };
-        Nonce::from_val(val)
-    }
-
     /// Build a TransportInstruction for a state diff.
     pub fn build_instruction(
         &mut self,
@@ -234,14 +209,12 @@ impl TransportSender {
 }
 
 impl TransportReceiver {
-    pub fn new(client_side: bool) -> Self {
+    pub fn new(_client_side: bool) -> Self {
         let now = Instant::now();
         Self {
             state_num: 0,
             acked_state_num: 0,
             remote_state_num: 0,
-            nonce_seq: 0,
-            client_side,
             last_recv_time: now,
             shutdown_received: false,
             pending_ack: false,
@@ -316,18 +289,6 @@ impl TransportReceiver {
         self.pending_ack = false;
         self.ack_deadline = None;
         self.last_ack_time = now;
-    }
-
-    /// Get the next nonce for receiving.
-    fn next_recv_nonce(&mut self) -> Nonce {
-        let seq = self.nonce_seq;
-        self.nonce_seq += 1;
-        let val = if self.client_side {
-            seq // Client receives server's nonces (no high bit)
-        } else {
-            (1u64 << 63) | seq // Server receives client's nonces (high bit set)
-        };
-        Nonce::from_val(val)
     }
 
     /// Parse a received TransportInstruction.
@@ -574,23 +535,6 @@ mod tests {
         assert_eq!(diff.ack_num, 3);
         assert_eq!(diff.throwaway_num, 1);
         assert_eq!(diff.diff, b"data");
-    }
-
-    #[test]
-    fn nonce_direction_bit() {
-        let mut client_sender = TransportSender::new(true);
-        let mut server_sender = TransportSender::new(false);
-
-        let client_nonce = client_sender.next_send_nonce();
-        let server_nonce = server_sender.next_send_nonce();
-
-        // Client nonce should have high bit set
-        let client_val = client_nonce.val();
-        assert!(client_val & (1u64 << 63) != 0, "Client nonce should have direction bit");
-
-        // Server nonce should not have high bit set
-        let server_val = server_nonce.val();
-        assert!(server_val & (1u64 << 63) == 0, "Server nonce should not have direction bit");
     }
 
     #[test]

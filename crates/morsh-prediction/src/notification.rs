@@ -176,7 +176,7 @@ impl NotificationEngine {
         }
 
         // Go back and write the text
-        vt.push_str(&format!("\x1b[1;1H"));
+        vt.push_str("\x1b[1;1H");
         // Truncate text to fit width
         let display_text: String = text.chars().take(width - 1).collect();
         vt.push_str(&display_text);

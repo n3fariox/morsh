@@ -23,7 +23,7 @@ impl DisplayDiff {
             for cell in row {
                 if !cell.style.is_default() && cell.style != last_style {
                     out.push_str(&style_on(&cell.style));
-                    last_style = cell.style.clone();
+                    last_style = cell.style;
                 } else if cell.style.is_default() && !last_style.is_default() {
                     out.push_str("\x1b[0m");
                     last_style = CellStyle::default_style();
@@ -115,7 +115,6 @@ impl DisplayDiff {
                     if !new_cell.style.is_default() {
                         out.push_str(&style_on(&new_cell.style));
                     }
-                    pen_state = new_cell.style.clone();
                 }
 
                 // Emit changed cell content
@@ -138,11 +137,11 @@ impl DisplayDiff {
                     cursor_pos = None;
                 }
 
-                pen_state = new_cell.style.clone();
+                pen_state = new_cell.style;
 
                 if new_cell.wide && x + 1 < new.cols as usize {
                     x += 1;
-                    pen_state = new_row[x].style.clone();
+                    pen_state = new_row[x].style;
                 }
                 x += 1;
             }

@@ -11,8 +11,8 @@ async fn transport_send_receive_encrypted() {
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_session = Session::new(*key.data());
-    let mut server_conn = Connection::new_server(server_addr, server_session).await.unwrap();
-    let mut server_transport = Transport::new_server(server_conn);
+    let server_conn = Connection::new_server(server_addr, server_session).await.unwrap();
+    let _server_transport = Transport::new_server(server_conn);
 
     // Get the actual bound address by creating a temp socket
     let bound_addr = {
@@ -91,7 +91,7 @@ async fn transport_wrong_key_fails() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server_session = Session::new(*key1.data());
-    let mut server_conn = Connection::new_server(addr, server_session).await.unwrap();
+    let server_conn = Connection::new_server(addr, server_session).await.unwrap();
 
     // Get bound address
     let bound_addr = {

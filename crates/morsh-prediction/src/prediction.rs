@@ -154,7 +154,7 @@ impl PredictionEngine {
 
     /// Initialize cursor prediction if none exists.
     fn init_cursor(&mut self, cursor_row: usize, cursor_col: usize) {
-        let dominated = self.cursors.last().map_or(false, |c| {
+        let dominated = self.cursors.last().is_some_and(|c| {
             c.tentative_until_epoch == self.prediction_epoch
         });
 
@@ -174,28 +174,6 @@ impl PredictionEngine {
     /// Get the current cursor position from the cursor predictions.
     pub fn cursor_pos(&self) -> Option<(usize, usize)> {
         self.cursors.last().filter(|c| c.active).map(|c| (c.row, c.col))
-    }
-
-    /// Kill all predictions in a given epoch.
-    fn kill_epoch(&mut self, epoch: u64, cursor_row: usize, cursor_col: usize) {
-        // Remove tentative cursors
-        self.cursors.retain(|c| !c.is_tentative(epoch - 1));
-
-        // Add a new cursor at current position
-        self.cursors.push(ConditionalCursorMove::new(
-            cursor_row,
-            cursor_col,
-            self.prediction_epoch,
-        ));
-        if let Some(last) = self.cursors.last_mut() {
-            last.active = true;
-            last.expiration_frame = self.local_frame_sent + 1;
-        }
-
-        // Kill tentative overlay cells
-        self.overlay.kill_epoch(epoch - 1);
-
-        self.become_tentative();
     }
 
     /// Reset all predictions.
@@ -448,11 +426,7 @@ impl PredictionEngine {
 
                 match validity {
                     Validity::IncorrectOrExpired => {
-                        if cell.is_tentative(self.confirmed_epoch) {
-                            should_reset = true;
-                        } else {
-                            should_reset = true;
-                        }
+                        should_reset = true;
                     }
                     Validity::Correct => {
                         if cell.tentative_until_epoch > max_confirmed {

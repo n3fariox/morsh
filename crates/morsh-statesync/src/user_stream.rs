@@ -18,6 +18,12 @@ pub struct UserStream {
     events: Vec<UserEvent>,
 }
 
+impl Default for UserStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UserStream {
     pub fn new() -> Self {
         Self { events: Vec::new() }

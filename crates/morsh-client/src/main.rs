@@ -261,20 +261,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Send keystroke immediately if enough time has passed since last send
                         let now = std::time::Instant::now();
-                        if transport.sender.should_send(now) {
-                            if user_stream.len() > sent_stream.len() {
-                                let diff = user_stream.diff_from(&sent_stream);
-                                if !diff.is_empty() {
-                                    let ack_num = transport.receiver.remote_state_num();
-                                    let throwaway = transport.sender.throwaway_num();
-                                    let bytes_to_send = diff.len();
-                                    if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
-                                        log::warn!("Send error: {e}");
-                                    } else {
-                                        sent_stream = user_stream.clone();
-                                        transport.sender.advance_state();
-                                        log::debug!("Sent {bytes_to_send} bytes (immediate)");
-                                    }
+                        if transport.sender.should_send(now) && user_stream.len() > sent_stream.len() {
+                            let diff = user_stream.diff_from(&sent_stream);
+                            if !diff.is_empty() {
+                                let ack_num = transport.receiver.remote_state_num();
+                                let throwaway = transport.sender.throwaway_num();
+                                let bytes_to_send = diff.len();
+                                if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
+                                    log::warn!("Send error: {e}");
+                                } else {
+                                    sent_stream = user_stream.clone();
+                                    transport.sender.advance_state();
+                                    log::debug!("Sent {bytes_to_send} bytes (immediate)");
                                 }
                             }
                         }
@@ -331,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => {}
                     Err(e) => {
                         log::warn!("Recv error: {e}");
-                        notifications.set_network_error(format!("{e}"));
+                        notifications.set_network_error(e.to_string());
                     }
                 }
 

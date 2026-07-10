@@ -45,6 +45,12 @@ pub struct Fragmenter {
     next_id: u64,
 }
 
+impl Default for Fragmenter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Fragmenter {
     pub fn new() -> Self {
         Self { next_id: 1 }
@@ -103,7 +109,7 @@ impl Fragmenter {
         }
 
         let mut fragments = Vec::new();
-        let total = (compressed.len() + max_payload - 1) / max_payload;
+        let total = compressed.len().div_ceil(max_payload);
         for (i, chunk) in compressed.chunks(max_payload).enumerate() {
             fragments.push(Fragment {
                 id,
@@ -120,6 +126,12 @@ impl Fragmenter {
 pub struct FragmentAssembly {
     pending: std::collections::HashMap<u64, std::collections::HashMap<u16, Vec<u8>>>,
     final_flags: std::collections::HashMap<u64, u16>,
+}
+
+impl Default for FragmentAssembly {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FragmentAssembly {

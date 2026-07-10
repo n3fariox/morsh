@@ -105,3 +105,10 @@ jobs:
         env:
           GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache

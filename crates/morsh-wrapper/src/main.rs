@@ -181,7 +181,7 @@ fn main() {
 
 /// Resolve a hostname to an IP address via DNS.
 fn resolve_host(host: &str) -> String {
-    let hostname = host.split('@').last().unwrap_or(host);
+    let hostname = host.split('@').next_back().unwrap_or(host);
     let hostname = hostname.split(':').next().unwrap_or(hostname);
 
     log::info!("Resolving hostname: {hostname}");

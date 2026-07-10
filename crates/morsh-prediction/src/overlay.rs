@@ -187,6 +187,12 @@ pub struct Overlay {
     rows: HashMap<usize, OverlayRow>,
 }
 
+impl Default for Overlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Overlay {
     pub fn new() -> Self {
         Self {

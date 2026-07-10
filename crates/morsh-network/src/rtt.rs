@@ -8,6 +8,12 @@ pub struct RttEstimator {
     have_sample: bool,
 }
 
+impl Default for RttEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RttEstimator {
     pub fn new() -> Self {
         Self {
@@ -30,11 +36,7 @@ impl RttEstimator {
             self.have_sample = true;
         } else {
             // alpha = 1/8, beta = 1/4
-            let diff = if self.srtt_ms > rtt_ms {
-                self.srtt_ms - rtt_ms
-            } else {
-                rtt_ms - self.srtt_ms
-            };
+            let diff = self.srtt_ms.abs_diff(rtt_ms);
             self.rttvar_ms = (3 * self.rttvar_ms + diff) / 4;
             self.srtt_ms = (7 * self.srtt_ms + rtt_ms) / 8;
         }
@@ -58,7 +60,7 @@ impl RttEstimator {
 
     /// Compute adaptive send interval: ceil(SRTT / 2), clamped.
     pub fn send_interval_ms(&self) -> u64 {
-        let interval = (self.srtt_ms + 1) / 2;
+        let interval = self.srtt_ms.div_ceil(2);
         interval.clamp(crate::constants::SEND_INTERVAL_MIN_MS, crate::constants::SEND_INTERVAL_MAX_MS)
     }
 }

@@ -122,53 +122,44 @@ impl MoshTerminal {
         let mut row_snapshots: Vec<(bool, Vec<CellData>)> = Vec::new();
         {
             let mut ri = row_iteration;
-            loop {
-                match ri.next() {
-                    Some(row) => {
-                        let dirty = row.dirty().unwrap_or(false);
-                        let mut cells = Vec::with_capacity(cols as usize);
-                        let cell_iteration = cell_iter
-                            .update(row)
-                            .map_err(|e| format!("CellIterator::update: {e:?}"))?;
-                        {
-                            let mut ci = cell_iteration;
-                            loop {
-                                match ci.next() {
-                                    Some(cell) => {
-                                        buf.clear();
-                                        let _ = cell.graphemes_utf8(&mut buf);
-                                        let text = if buf.is_empty() {
-                                            String::new()
-                                        } else {
-                                            buf.clone()
-                                        };
+            while let Some(row) = ri.next() {
+                let dirty = row.dirty().unwrap_or(false);
+                let mut cells = Vec::with_capacity(cols as usize);
+                let cell_iteration = cell_iter
+                    .update(row)
+                    .map_err(|e| format!("CellIterator::update: {e:?}"))?;
+                {
+                    let mut ci = cell_iteration;
+                    while let Some(cell) = ci.next() {
+                        buf.clear();
+                        let _ = cell.graphemes_utf8(&mut buf);
+                        let text = if buf.is_empty() {
+                            String::new()
+                        } else {
+                            buf.clone()
+                        };
 
-                                        let style = match cell.style() {
-                                            Ok(s) => convert_style(&s),
-                                            Err(_) => CellStyle::default_style(),
-                                        };
+                        let style = match cell.style() {
+                            Ok(s) => convert_style(&s),
+                            Err(_) => CellStyle::default_style(),
+                        };
 
-                                        let wide = false; // TODO: detect wide chars
+                        let wide = false; // TODO: detect wide chars
 
-                                        cells.push(CellData {
-                                            text,
-                                            wide,
-                                            style,
-                                        });
-                                    }
-                                    None => break,
-                                }
-                            }
-                        }
-                        // Pad short rows
-                        while cells.len() < cols as usize {
-                            cells.push(CellData::empty());
-                        }
-                        row_snapshots.push((dirty, cells));
+                        cells.push(CellData {
+                            text,
+                            wide,
+                            style,
+                        });
                     }
-                    None => break,
                 }
+                // Pad short rows
+                while cells.len() < cols as usize {
+                    cells.push(CellData::empty());
+                }
+                row_snapshots.push((dirty, cells));
             }
+
         }
 
         // Take only `rows` worth of rows
@@ -217,7 +208,7 @@ fn convert_style(s: &libghostty_vt::style::Style) -> CellStyle {
 fn convert_color(c: &libghostty_vt::style::StyleColor) -> StyleColor {
     match c {
         libghostty_vt::style::StyleColor::None => StyleColor::Default,
-        libghostty_vt::style::StyleColor::Palette(idx) => StyleColor::Palette(idx.0 as u8),
+        libghostty_vt::style::StyleColor::Palette(idx) => StyleColor::Palette(idx.0),
         libghostty_vt::style::StyleColor::Rgb(rgb) => StyleColor::Rgb(*rgb),
     }
 }

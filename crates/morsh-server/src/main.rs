@@ -421,8 +421,7 @@ async fn run_server(
 
     let mut cmd = if command_args.is_empty() {
         // Interactive shell mode — spawn shell directly
-        let mut c = CommandBuilder::new(&shell);
-        c
+        CommandBuilder::new(&shell)
     } else {
         // Command mode (-e CMD...) — run through sh -c like stock mosh
         let full_cmd = command_args.join(" ");
@@ -516,7 +515,6 @@ async fn run_server(
                             let ack_num = transport.receiver.remote_state_num();
                             let throwaway = transport.sender.throwaway_num();
                             let _ = transport.send_diff(diff, ack_num, throwaway).await;
-                            client_assumed_state = terminal_state.snapshot();
                             transport.sender.advance_state();
                         }
                         break Ok(());
