@@ -23,16 +23,10 @@ jobs:
             os: ubuntu-latest
             zig_arch: linux-x86_64
             zig_ext: tar.xz
-            zig_dir: zig-linux-x86_64-${{ env.ZIG_VERSION }}
-            zig_global_cache: ~/.cache/zig
-            archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             zig_arch: windows-x86_64
             zig_ext: zip
-            zig_dir: zig-windows-x86_64-${{ env.ZIG_VERSION }}
-            zig_global_cache: ${{ runner.temp }}\\zig-global-cache
-            archive: zip
 
     steps:
       - name: Checkout
@@ -59,12 +53,12 @@ jobs:
             curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.zip"
             7z x "$RUNNER_TEMP/zig.zip" -o"$RUNNER_TEMP" -y
           fi
-          echo "$RUNNER_TEMP/${{ matrix.zig_dir }}" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/zig-${{ matrix.zig_arch }}-${{ env.ZIG_VERSION }}" >> "$GITHUB_PATH"
 
       - name: Cache zig
         uses: actions/cache@v4
         with:
-          path: ${{ matrix.zig_global_cache }}
+          path: ~/.cache/zig
           key: zig-${{ env.ZIG_VERSION }}-${{ matrix.os }}
 
       - name: Clone ghostty
@@ -90,11 +84,10 @@ jobs:
       - name: Build (Linux musl)
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
         env:
           GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
-          ZIG_GLOBAL_CACHE_DIR: ${{ matrix.zig_global_cache }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
           CC: zig
           CFLAGS: "-target x86_64-linux-musl"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zig
@@ -102,11 +95,10 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: |
-          cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
         env:
           GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
-          ZIG_GLOBAL_CACHE_DIR: ${{ matrix.zig_global_cache }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -115,9 +107,9 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           STAGING="morsh-${TAG}-${{ matrix.target }}"
           mkdir -p "$STAGING"
-          cp target/${{ matrix.target }}/release/mosh \
-             target/${{ matrix.target }}/release/mosh-client \
-             target/${{ matrix.target }}/release/mosh-server \
+          cp target/${{ matrix.target }}/release/morsh \
+             target/${{ matrix.target }}/release/morsh-client \
+             target/${{ matrix.target }}/release/morsh-server \
              "$STAGING/"
           tar czf "${STAGING}.tar.gz" "$STAGING"
           echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
@@ -129,9 +121,9 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           STAGING="morsh-${TAG}-${{ matrix.target }}"
           mkdir -p "$STAGING"
-          cp target/${{ matrix.target }}/release/mosh.exe \
-             target/${{ matrix.target }}/release/mosh-client.exe \
-             target/${{ matrix.target }}/release/mosh-server.exe \
+          cp target/${{ matrix.target }}/release/morsh.exe \
+             target/${{ matrix.target }}/release/morsh-client.exe \
+             target/${{ matrix.target }}/release/morsh-server.exe \
              "$STAGING/"
           7z a "${STAGING}.zip" "$STAGING"
           echo "ASSET=${STAGING}.zip" >> "$GITHUB_ENV"

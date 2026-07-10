@@ -20,14 +20,10 @@ jobs:
           - os: ubuntu-latest
             zig_arch: linux-x86_64
             zig_ext: tar.xz
-            zig_dir: zig-linux-x86_64-${{ env.ZIG_VERSION }}
-            zig_global_cache: ~/.cache/zig
             allow_fail: false
           - os: windows-latest
             zig_arch: windows-x86_64
             zig_ext: zip
-            zig_dir: zig-windows-x86_64-${{ env.ZIG_VERSION }}
-            zig_global_cache: ${{ runner.temp }}\\zig-global-cache
             allow_fail: true
     continue-on-error: ${{ matrix.allow_fail }}
 
@@ -54,12 +50,12 @@ jobs:
             curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.zip"
             7z x "$RUNNER_TEMP/zig.zip" -o"$RUNNER_TEMP" -y
           fi
-          echo "$RUNNER_TEMP/${{ matrix.zig_dir }}" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/zig-${{ matrix.zig_arch }}-${{ env.ZIG_VERSION }}" >> "$GITHUB_PATH"
 
       - name: Cache zig
         uses: actions/cache@v4
         with:
-          path: ${{ matrix.zig_global_cache }}
+          path: ~/.cache/zig
           key: zig-${{ env.ZIG_VERSION }}-${{ matrix.os }}
 
       - name: Clone ghostty
@@ -87,11 +83,11 @@ jobs:
         run: cargo build --workspace
         env:
           GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
-          ZIG_GLOBAL_CACHE_DIR: ${{ matrix.zig_global_cache }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
       - name: Test
         shell: bash
         run: cargo test --workspace
         env:
           GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
-          ZIG_GLOBAL_CACHE_DIR: ${{ matrix.zig_global_cache }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
