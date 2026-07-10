@@ -24,14 +24,26 @@ pub struct Connection {
     send_seq: u64,
 }
 
+/// Create a UDP socket, set nonblocking, and apply ECN marking (ECT(0)).
+/// Cross-platform: uses IP_TOS on both Unix and Windows (Win10 1903+).
+fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
+    let std_socket = std::net::UdpSocket::bind(addr)
+        .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
+    std_socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to set nonblocking: {e}"))?;
+
+    let sock_ref = socket2::SockRef::from(&std_socket);
+    let _ = sock_ref.set_tos(0x02);
+
+    tokio::net::UdpSocket::from_std(std_socket)
+        .map_err(|e| format!("Failed to create tokio socket: {e}"))
+}
+
 impl Connection {
     /// Create a server-side connection (single socket, no port hopping).
     pub async fn new_server(bind_addr: SocketAddr, session: Session) -> Result<Self, String> {
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
-
-        set_ecn_marking(&socket);
+        let socket = bind_udp(bind_addr)?;
 
         let now = Instant::now();
         Ok(Self {
@@ -52,11 +64,7 @@ impl Connection {
 
     /// Create a client-side connection.
     pub async fn new_client(session: Session) -> Result<Self, String> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
-
-        set_ecn_marking(&socket);
+        let socket = bind_udp("0.0.0.0:0".parse().unwrap())?;
 
         let now = Instant::now();
         Ok(Self {
@@ -163,11 +171,7 @@ impl Connection {
 
     /// Create a new socket for port hopping.
     pub async fn hop_port(&mut self) -> Result<(), String> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("Failed to bind new socket: {e}"))?;
-
-        set_ecn_marking(&socket);
+        let socket = bind_udp("0.0.0.0:0".parse().unwrap())?;
 
         self.sockets.push(socket);
         self.prune_sockets();
@@ -220,24 +224,6 @@ impl Connection {
 /// Timestamp diff accounting for 16-bit wrapping.
 pub fn timestamp_diff(a: u16, b: u16) -> i32 {
     a.wrapping_sub(b) as i16 as i32
-}
-
-fn set_ecn_marking(_socket: &UdpSocket) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = _socket.as_raw_fd();
-        unsafe {
-            let dscp: i32 = 0x02; // ECT(0)
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_TOS,
-                &dscp as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            );
-        }
-    }
 }
 
 #[cfg(test)]

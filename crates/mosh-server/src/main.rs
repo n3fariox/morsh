@@ -72,7 +72,7 @@ fn fork_and_detach() -> bool {
     }
 }
 
-/// Redirect stdio to /dev/null (Unix) after daemonizing.
+/// Redirect stdio to /dev/null (Unix) or NUL (Windows) after daemonizing.
 #[cfg(unix)]
 fn redirect_stdio() {
     use std::os::unix::io::AsRawFd;
@@ -84,10 +84,40 @@ fn redirect_stdio() {
         .expect("Failed to open /dev/null");
 
     unsafe {
-        libc::dup2(devnull.as_raw_fd(), 0); // stdin
-        libc::dup2(devnull.as_raw_fd(), 1); // stdout
-        libc::dup2(devnull.as_raw_fd(), 2); // stderr
+        libc::dup2(devnull.as_raw_fd(), 0);
+        libc::dup2(devnull.as_raw_fd(), 1);
+        libc::dup2(devnull.as_raw_fd(), 2);
     }
+}
+
+#[cfg(windows)]
+fn redirect_stdio() {
+    use std::os::windows::io::AsRawHandle;
+
+    let nul = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")
+        .expect("Failed to open NUL");
+
+    let handle = nul.as_raw_handle();
+
+    unsafe {
+        windows_sys::Win32::System::Console::SetStdHandle(
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            handle,
+        );
+        windows_sys::Win32::System::Console::SetStdHandle(
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            handle,
+        );
+        windows_sys::Win32::System::Console::SetStdHandle(
+            windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+            handle,
+        );
+    }
+
+    std::mem::forget(nul);
 }
 
 fn main() {
@@ -229,8 +259,7 @@ fn main() {
         unreachable!();
     }
 
-    // Child: redirect stdio to /dev/null (Unix only)
-    #[cfg(unix)]
+    // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
     redirect_stdio();
 
     log::info!("Server starting on port {port}");
