@@ -166,7 +166,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut user_stream = UserStream::new();
     let mut sent_stream = UserStream::new();
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = terminal::size()
+        .ok()
+        .filter(|&(c, r)| c > 0 && r > 0)
+        .unwrap_or((80, 24));
     let mut terminal_state = Complete::new(cols, rows)?;
 
     let mut prediction = PredictionEngine::new();
@@ -197,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         KeyCode::Char(ch) => {
-                            if modifiers.contains(KeyModifiers::CONTROL) {
+                            if modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii_lowercase() {
                                 bytes.push((ch as u8) - b'a' + 1);
                             } else if modifiers.contains(KeyModifiers::ALT) {
                                 bytes.push(0x1b);
@@ -339,6 +342,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         stdout.flush()?;
                         log::debug!("Applied diff: {} bytes", diff.diff.len());
 
+                        // Check for server shutdown
+                        if transport.receiver.shutdown_received() {
+                            log::info!("Server sent shutdown");
+                            break Ok(());
+                        }
+
                         // Render prediction overlay (underlined characters for pending predictions)
                         if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
                             log::debug!("Overlay render error: {e}");
@@ -357,6 +366,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prediction.set_send_interval(rtt_ms);
             }
             _ = send_timer.tick() => {
+                // Check for connection loss (no data from server for 15s)
+                let now = std::time::Instant::now();
+                if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(15) {
+                    log::info!("Connection lost (no server response for 15s)");
+                    break Ok(());
+                }
+
                 // Send pending user stream diffs
                 if user_stream.len() > sent_stream.len() {
                     let diff = user_stream.diff_from(&sent_stream);

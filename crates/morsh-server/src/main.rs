@@ -38,7 +38,7 @@ fn get_ssh_connection_ip() -> Option<String> {
 fn fork_and_detach() -> bool {
     #[cfg(unix)]
     {
-        use std::process;
+        log::info!("Forking to daemonize...");
 
         match unsafe { libc::fork() } {
             -1 => {
@@ -47,12 +47,14 @@ fn fork_and_detach() -> bool {
             }
             0 => {
                 // Child: create new session to detach from SSH terminal
+                log::info!("Child forked OK, calling setsid()");
                 unsafe { libc::setsid(); }
+                log::info!("setsid() complete, child PID={}", std::process::id());
                 true
             }
             pid => {
-                // Parent: wait for child to exit, then exit ourselves
-                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0); }
+                // Parent: exit immediately — child continues as daemon
+                log::info!("Parent (PID={}) exiting, child (PID={}) continues as daemon", std::process::id(), pid);
                 std::process::exit(0);
             }
         }
@@ -77,6 +79,7 @@ fn fork_and_detach() -> bool {
 fn redirect_stdio() {
     use std::os::unix::io::AsRawFd;
 
+    log::info!("Redirecting stdio to /dev/null");
     let devnull = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -129,6 +132,8 @@ fn main() {
     let mut bind_addr: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
     let mut use_ssh_connection = false;
+    let mut no_daemonize = false;
+    let mut log_file_path: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -154,6 +159,17 @@ fn main() {
             "-s" => {
                 use_ssh_connection = true;
             }
+            "-D" | "--no-daemonize" => {
+                no_daemonize = true;
+            }
+            "-l" | "--log-file" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("morsh-server: --log-file requires a file path");
+                    std::process::exit(1);
+                }
+                log_file_path = Some(args[i].clone());
+            }
             "-e" => {
                 i += 1;
                 while i < args.len() && !args[i].starts_with('-') {
@@ -172,6 +188,8 @@ fn main() {
                 eprintln!("  -a ADDR     Bind to this address (default: 0.0.0.0)");
                 eprintln!("  -s          Use SSH_CONNECTION to determine bind IP (default)");
                 eprintln!("  -e CMD...   Execute command instead of shell");
+                eprintln!("  -D, --no-daemonize  Run in foreground (don't fork)");
+                eprintln!("  -l, --log-file FILE  Write logs to FILE (daemon mode)");
                 eprintln!("  -h, --help  Show this help message");
                 eprintln!("  -v, --version  Show version information");
                 eprintln!();
@@ -226,11 +244,12 @@ fn main() {
 
     // Try binding to get a port, then fork
     let addr: SocketAddr = if let Some(ip) = desired_ip {
-        format!("{}:{}", ip, bind_port).parse().unwrap_or_else(|_| {
-            format!("0.0.0.0:{}", bind_port).parse().unwrap()
-        })
+        match ip.parse::<std::net::IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, bind_port),
+            Err(_) => SocketAddr::new("0.0.0.0".parse().unwrap(), bind_port),
+        }
     } else {
-        format!("0.0.0.0:{}", bind_port).parse().unwrap()
+        SocketAddr::new("0.0.0.0".parse().unwrap(), bind_port)
     };
 
     // Create UDP socket to determine the port
@@ -253,20 +272,54 @@ fn main() {
     println!("MOSH CONNECTION ID: 1");
     std::io::stdout().flush().unwrap();
 
-    // Fork: parent exits, child detaches and runs the server
-    if !fork_and_detach() {
-        // Parent already exited via fork_and_detach
-        unreachable!();
+    log::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
+
+    if no_daemonize {
+        log::info!("No-daemonize mode, skipping fork and stdio redirect");
+    } else {
+        // Fork: parent exits, child detaches and runs the server
+        if !fork_and_detach() {
+            // Parent already exited via fork_and_detach
+            unreachable!();
+        }
+
+        log::info!("Child process continuing after fork, detaching from SSH");
+
+        // Open log file BEFORE redirecting stdio, so errors are visible on stderr
+        let log_file = log_file_path.as_ref().and_then(|path| {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(file) => {
+                    eprintln!("morsh-server: logging to {path}");
+                    Some(file)
+                }
+                Err(e) => {
+                    eprintln!("morsh-server: failed to open log file {path}: {e}");
+                    None
+                }
+            }
+        });
+
+        // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
+        redirect_stdio();
+
+        // After redirect, dup log file onto stderr so env_logger output lands there
+        if let Some(file) = log_file {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::dup2(file.as_raw_fd(), 2); }
+        }
+
+        log::info!("Stdio redirected to /dev/null");
     }
 
-    // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
-    redirect_stdio();
-
-    log::info!("Server starting on port {port}");
+    log::info!("Server starting on port {port} (PID: {})", std::process::id());
 
     // Create tokio runtime and run server
     let rt = tokio::runtime::Runtime::new().unwrap();
-    if let Err(e) = rt.block_on(run_server(bind_port, desired_ip, key, shell)) {
+    if let Err(e) = rt.block_on(run_server(port, desired_ip, key, shell, command_args)) {
         log::error!("Server error: {e}");
         std::process::exit(1);
     }
@@ -277,13 +330,18 @@ async fn run_server(
     desired_ip: Option<&str>,
     key: Base64Key,
     shell: String,
+    command_args: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    log::info!("run_server entered: port={bind_port}, shell={shell}, ip={:?}, args.len={}", desired_ip, command_args.len());
     let session = Session::new(*key.data());
 
     // Bind to the port
     let connection = if let Some(ip) = desired_ip {
-        let addr: SocketAddr = format!("{}:{}", ip, bind_port).parse()
-            .map_err(|e| format!("Invalid bind address: {e}"))?;
+        let addr = SocketAddr::new(
+            ip.parse::<std::net::IpAddr>()
+                .map_err(|e| format!("Invalid bind address: {e}"))?,
+            bind_port,
+        );
         match Connection::new_server(addr, session).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -303,16 +361,65 @@ async fn run_server(
     let mut transport = Transport::new_server(connection);
     transport.sender.set_state(SendState::Active);
 
+    log::info!("UDP transport ready, waiting for client on port {bind_port}");
+
+    // Wait for the client to send its first packet before spawning the shell.
+    // This ensures the server knows the client's address so PTY output isn't lost.
     let mut terminal_state = Complete::new(80, 24)?;
+    let mut pty_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+    loop {
+        match transport.recv_diff().await {
+                Ok(Some(diff)) => {
+                log::info!("Wait loop received diff: {} bytes (old={}, new={})",
+                    diff.diff.len(), diff.old_num, diff.new_num);
+                if !diff.diff.is_empty() {
+                    match UserMessage::decode(diff.diff.as_slice()) {
+                        Ok(msg) => {
+                            log::info!("Decoded UserMessage with {} instructions", msg.instruction.len());
+                            for inst in &msg.instruction {
+                                if let Some(ref resize) = inst.resize {
+                                    pty_size = PtySize {
+                                        rows: resize.height.unwrap_or(24) as u16,
+                                        cols: resize.width.unwrap_or(80) as u16,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                    };
+                                    terminal_state = Complete::new(pty_size.cols, pty_size.rows)?;
+                                    log::info!("Client initial resize: {}x{}", pty_size.cols, pty_size.rows);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to decode first client message: {e}");
+                        }
+                    }
+                }
+                log::info!("Wait loop breaking, proceeding to spawn PTY");
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                log::warn!("Error waiting for client: {e}");
+                continue;
+            }
+        }
+    }
 
-    let pty_size = PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
+    log::info!("Client connected, spawning shell (remote_state_num={})",
+        transport.receiver.remote_state_num());
+
+    let mut cmd = if command_args.is_empty() {
+        // Interactive shell mode — spawn shell directly
+        let mut c = CommandBuilder::new(&shell);
+        c
+    } else {
+        // Command mode (-e CMD...) — run through sh -c like stock mosh
+        let full_cmd = command_args.join(" ");
+        let mut c = CommandBuilder::new("/bin/sh");
+        c.arg("-c");
+        c.arg(full_cmd);
+        c
     };
-
-    let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("LANG", "en_US.UTF-8");
     cmd.env("MORSH", env!("CARGO_PKG_VERSION"));
@@ -323,6 +430,10 @@ async fn run_server(
 
     let mut child = pair.slave.spawn_command(cmd)
         .map_err(|e| format!("Failed to spawn shell: {e}"))?;
+    // Drop slave handle so we get EOF on the PTY master reader when the child exits.
+    // Without this, the parent's open slave FD keeps the PTY alive and we never
+    // detect that the child has exited.
+    std::mem::drop(pair.slave);
 
     log::info!("Spawned shell: {shell}");
 
@@ -369,17 +480,21 @@ async fn run_server(
             Some(pty_event) = pty_rx.recv() => {
                 match pty_event {
                     PtyEvent::Output(data) => {
+                        log::info!("PTY output: {} bytes", data.len());
                         terminal_state.apply_string(&data);
 
                         let diff = terminal_state.diff_from(&client_assumed_state);
+                        log::info!("Diff from state: {} bytes, state_num={}", diff.len(), transport.sender.state_num());
                         if !diff.is_empty() {
                             let ack_num = transport.receiver.remote_state_num();
                             let throwaway = transport.sender.throwaway_num();
+                            log::info!("Sending diff: ack_num={}, throwaway={}", ack_num, throwaway);
                             if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                                 log::warn!("Send error: {e}");
                             } else {
                                 client_assumed_state = terminal_state.snapshot();
                                 transport.sender.advance_state();
+                                log::info!("Sent diff OK, state_num now={}", transport.sender.state_num());
                             }
                         }
                     }

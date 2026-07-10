@@ -26,6 +26,18 @@ struct Args {
     #[arg(long = "bind-server", default_value = "ssh")]
     bind_server: String,
 
+    /// Path on the remote host for morsh-server debug logs
+    #[arg(long = "server-log-file")]
+    server_log_file: Option<String>,
+
+    /// Run morsh-server in foreground (don't daemonize)
+    #[arg(long = "no-daemonize", short = 'D')]
+    no_daemonize: bool,
+
+    /// Path to morsh-server on the remote host (default: morsh-server, looked up in PATH)
+    #[arg(long = "server", short = 'S', default_value = "morsh-server")]
+    server_path: String,
+
     /// Remote user@host
     host: String,
 
@@ -44,19 +56,50 @@ fn main() {
 
     let args = Args::parse();
 
+    // Determine the server bind IP from the hostname or user-provided value.
+    // This IP is used both for telling the server where to bind and for
+    // the client's connection target, so they always agree.
+    let resolved_ip = match args.bind_server.as_str() {
+        "any" => None,  // server will bind to 0.0.0.0, client uses resolved hostname
+        "ssh" => Some(resolve_host(&args.host)),
+        ip => Some(ip.to_string()),
+    };
+
     // Determine the command to run on remote
+    let server_name = &args.server_path;
     let remote_cmd = if args.command.is_empty() {
-        "morsh-server".to_string()
+        server_name.clone()
     } else {
         let cmd = args.command.join(" ");
-        format!("morsh-server -e {cmd}")
+        format!("{server_name} -e {cmd}")
     };
 
     // Add bind-server flag to the remote command
-    let remote_cmd = match args.bind_server.as_str() {
-        "any" => format!("{remote_cmd} -a 0.0.0.0"),
-        "ssh" => format!("{remote_cmd} -s"),
-        ip => format!("{remote_cmd} -a {ip}"),
+    let remote_cmd = if let Some(ref ip) = resolved_ip {
+        format!("{remote_cmd} -a {ip}")
+    } else {
+        format!("{remote_cmd} -s")
+    };
+
+    // Add server log file if specified
+    let remote_cmd = if let Some(ref path) = args.server_log_file {
+        format!("{remote_cmd} -l {path}")
+    } else {
+        remote_cmd
+    };
+
+    // Add no-daemonize flag if specified
+    let remote_cmd = if args.no_daemonize {
+        format!("{remote_cmd} -D")
+    } else {
+        remote_cmd
+    };
+
+    // Forward RUST_LOG to remote so server debug logs appear on stderr (with -D)
+    let remote_cmd = if let Ok(val) = std::env::var("RUST_LOG") {
+        format!("RUST_LOG={val} {remote_cmd}")
+    } else {
+        remote_cmd
     };
 
     // Build SSH command
@@ -117,8 +160,8 @@ fn main() {
         }
     };
 
-    // Resolve the hostname to an IP address for the client to connect to
-    let server_ip = resolve_host(&args.host);
+    // Use the resolved IP for the client connection (same IP the server bound to)
+    let server_ip = resolved_ip.unwrap_or_else(|| resolve_host(&args.host));
 
     log::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
 
