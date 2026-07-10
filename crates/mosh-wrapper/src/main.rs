@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::io::{BufRead, BufReader};
+use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
 /// Mosh: mobile shell - connects to a remote host via SSH and starts a mosh-server.
@@ -18,6 +19,13 @@ struct Args {
     #[arg(long = "predict", default_value = "adaptive")]
     predict: String,
 
+    /// Control the IP address that mosh-server binds to:
+    ///   ssh  - bind to the IP from SSH_CONNECTION (default)
+    ///   any  - bind to 0.0.0.0
+    ///   IP   - bind to the specified IP address
+    #[arg(long = "bind-server", default_value = "ssh")]
+    bind_server: String,
+
     /// Remote user@host
     host: String,
 
@@ -27,7 +35,6 @@ struct Args {
 
 /// Parsed MOSH CONNECT line from server.
 struct ConnectInfo {
-    address: String,
     port: u16,
     key: String,
 }
@@ -39,23 +46,22 @@ fn main() {
 
     // Determine the command to run on remote
     let remote_cmd = if args.command.is_empty() {
-        // No command specified - server will launch the user's shell
         "mosh-server".to_string()
     } else {
-        // User specified a command - pass it to mosh-server
         let cmd = args.command.join(" ");
         format!("mosh-server -e {cmd}")
     };
 
+    // Add bind-server flag to the remote command
+    let remote_cmd = match args.bind_server.as_str() {
+        "any" => format!("{remote_cmd} -a 0.0.0.0"),
+        "ssh" => format!("{remote_cmd} -s"),
+        ip => format!("{remote_cmd} -a {ip}"),
+    };
+
     // Build SSH command
-    let mut ssh_args = Vec::new();
-    // Split the SSH command string (e.g., "ssh -o StrictHostKeyChecking=no")
-    for arg in args.ssh_command.split_whitespace() {
-        ssh_args.push(arg.to_string());
-    }
-    // Add the host
+    let mut ssh_args: Vec<String> = args.ssh_command.split_whitespace().map(String::from).collect();
     ssh_args.push(args.host.clone());
-    // Add the remote command
     ssh_args.push(remote_cmd);
 
     log::info!("SSH: {} {}", args.ssh_command, args.host);
@@ -85,19 +91,19 @@ fn main() {
             }
         };
 
-        // Log all lines for debugging
         log::debug!("SSH stdout: {line}");
 
-        // Parse "MOSH CONNECT <IP> <PORT> <KEY>"
         if line.starts_with("MOSH CONNECT") {
             let parts: Vec<&str> = line.split_whitespace().collect();
+            // Stock mosh format: MOSH CONNECT port key
             if parts.len() >= 4 {
-                connect_info = Some(ConnectInfo {
-                    address: parts[2].to_string(),
-                    port: parts[3].parse().expect("Invalid port in MOSH CONNECT"),
-                    key: parts[4].to_string(),
-                });
-                break;
+                if let Ok(port) = parts[2].parse::<u16>() {
+                    connect_info = Some(ConnectInfo {
+                        port,
+                        key: parts[3].to_string(),
+                    });
+                    break;
+                }
             }
         }
     }
@@ -111,20 +117,56 @@ fn main() {
         }
     };
 
-    log::info!("Connecting to {}:{} with key {}", info.address, info.port, &info.key[..8]);
+    // Resolve the hostname to an IP address for the client to connect to
+    let server_ip = resolve_host(&args.host);
 
-    // Set environment variables for mosh-client
+    log::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
+
     let client_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("mosh-client")))
         .unwrap_or_else(|| "mosh-client".into());
 
-    // Exec mosh-client
     let exit_status = Command::new(&client_path)
-        .arg(format!("{}:{}", info.address, info.port))
+        .arg(format!("{}:{}", server_ip, info.port))
         .env("MOSH_KEY", &info.key)
         .status()
         .expect("Failed to start mosh-client. Is it in PATH?");
 
     std::process::exit(exit_status.code().unwrap_or(1));
+}
+
+/// Resolve a hostname to an IP address via DNS.
+fn resolve_host(host: &str) -> String {
+    let hostname = host.split('@').last().unwrap_or(host);
+    let hostname = hostname.split(':').next().unwrap_or(hostname);
+
+    log::info!("Resolving hostname: {hostname}");
+
+    let addrs = format!("{hostname}:0")
+        .to_socket_addrs()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to resolve hostname '{hostname}': {e}");
+            std::process::exit(1);
+        });
+
+    // Prefer IPv4 for compatibility
+    for addr in addrs {
+        if addr.ip().is_ipv4() {
+            return addr.ip().to_string();
+        }
+    }
+
+    // Fall back to whatever we got
+    let addrs: Vec<_> = format!("{hostname}:0")
+        .to_socket_addrs()
+        .expect("No addresses found")
+        .collect();
+
+    if let Some(addr) = addrs.first() {
+        return addr.ip().to_string();
+    }
+
+    eprintln!("No addresses found for '{hostname}'");
+    std::process::exit(1);
 }
