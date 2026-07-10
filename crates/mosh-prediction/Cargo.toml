@@ -1,8 +1,0 @@
-[package]
-name = "mosh-prediction"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-mosh-crypto = { path = "../mosh-crypto" }
-mosh-terminal = { path = "../mosh-terminal" }

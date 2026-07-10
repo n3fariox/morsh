@@ -1,4 +1,4 @@
-# Mosh-Rust: Windows-Friendly Mosh in Rust — Implementation Plan
+# morsh: Windows-Friendly Mobile Shell in Rust
 
 ## Overview
 
@@ -9,28 +9,28 @@ A ground-up Rust rewrite of Mosh, starting wire-compatible with stock mosh serve
 ## Architecture
 
 ```
-mosh-rust/
+morsh/
 ├── Cargo.toml              # Workspace root
 ├── crates/
-│   ├── mosh-crypto/        # AES-128-OCB3 encryption, key handling, PRNG
-│   ├── mosh-proto/         # Protobuf definitions (prost-generated)
-│   ├── mosh-terminal/      # VT processing wrapper around libghostty-vt
-│   ├── mosh-network/       # UDP transport, fragmentation, RTT estimation, port hopping
-│   ├── mosh-statesync/     # State diffing, sync protocol, Complete/UserStream
-│   └── mosh-prediction/    # Predictive echo overlay engine
-├── src/
-│   ├── client.rs           # mosh-client binary (Windows + cross-platform)
-│   ├── server.rs           # mosh-server binary (Windows ConPTY + Unix forkpty)
-│   └── wrapper.rs          # mosh wrapper binary (replaces mosh.pl — SSH launch + connection)
-└── proto/                  # Protocol Buffer definitions (copied from mosh)
+│   ├── morsh-crypto/        # AES-128-OCB3 encryption, key handling, PRNG
+│   ├── morsh-proto/         # Protobuf definitions (prost-generated)
+│   ├── morsh-terminal/      # VT processing wrapper around libghostty-vt
+│   ├── morsh-network/       # UDP transport, fragmentation, RTT estimation, port hopping
+│   ├── morsh-statesync/     # State diffing, sync protocol, Complete/UserStream
+│   └── morsh-prediction/    # Predictive echo overlay engine
+├── crates/
+│   ├── morsh-client/        # morsh-client binary (Windows + cross-platform)
+│   ├── morsh-server/        # morsh-server binary (Windows + Unix fork/setsid)
+│   └── morsh-wrapper/       # morsh wrapper binary (replaces mosh.pl — SSH launch + connection)
+└── proto/                   # Protocol Buffer definitions (copied from mosh)
     ├── transportinstruction.proto
     ├── hostinput.proto
     └── userinput.proto
 ```
 
 > **Note:** Terminal emulation (VT parser, framebuffer, display) is handled by
-> **libghostty-vt** via the `libghostty-rs` Rust bindings — no custom
-> `mosh-terminal` crate needed. See Phase 2 details below.
+> **libghostty-vt** via the `libghostty-vt` Rust bindings — no custom
+> `morsh-terminal` crate needed. See Phase 2 details below.
 
 ---
 
@@ -40,7 +40,7 @@ mosh-rust/
 |---------|-------|-----|
 | Crypto AEAD | `ocb3` + `aes` 0.8 | Pure Rust AES-128-OCB3, matches mosh wire format (cipher 0.4 compatible) |
 | Protobuf | `prost` | Mature, idiomatic Rust. prost-build for codegen. Extensions flattened (field numbers preserved) |
-| Terminal emulation | `libghostty-vt` via `libghostty-rs` | Battle-tested VT parser, framebuffer, key encoding. Zero runtime deps. |
+| Terminal emulation | `libghostty-vt` | Battle-tested VT parser, framebuffer, key encoding. Zero runtime deps. |
 | Terminal I/O | `crossterm` | Cross-platform raw mode, input events, resize, colors |
 | PTY | `portable-pty` | ConPTY on Windows, openpty on Unix. WezTerm-proven |
 | Networking | `tokio` (net + time) | Async UDP via IOCP on Windows, timers for retransmit |
@@ -55,14 +55,14 @@ mosh-rust/
 ### Phase 1: Foundation — Crypto + Proto + Wire Format ✅ DONE
 **Goal:** Encrypt/decrypt mosh packets. Validate wire compatibility with stock mosh.
 
-1. **`mosh-crypto` crate** ✅
+1. **`morsh-crypto` crate** ✅
    - `Session` struct: AES-128-OCB3 encrypt/decrypt with `ocb3` crate
    - `Nonce`: 12-byte nonce construction (direction bit + 63-bit sequence number, padded to 12 bytes)
    - `Base64Key`: 16-byte key ↔ 22-char base64 string (no padding)
    - `Prng`: CSPRNG using `getrandom` crate (works on Windows via BCrypt API)
    - Block counter limit (2^47) with panic on overflow
 
-2. **`mosh-proto` crate** ✅
+2. **`morsh-proto` crate** ✅
    - Copied 3 `.proto` files from `~/projects/mosh/src/protobufs/`
    - Prost-build codegen with flattened extensions (proto2 `extend` → direct fields)
    - Separate modules (`transport`, `host`, `client`) to avoid name conflicts
@@ -76,7 +76,7 @@ mosh-rust/
 ### Phase 2: Terminal Emulation via libghostty-vt
 **Goal:** VT parsing, framebuffer state, key encoding — powered by libghostty-vt.
 
-1. **`mosh-terminal` crate** ✅
+1. **`morsh-terminal` crate** ✅
    - Wraps `libghostty-vt` for VT sequence processing
    - `MoshTerminal` struct with `write()`, `resize()`, `dimensions()`, `next_frame()`
    - Zig 0.15.2 via mise.toml, builds against local Ghostty checkout (`GHOSTTY_SOURCE_DIR`)
@@ -97,13 +97,13 @@ mosh-rust/
 ### Phase 3: State Synchronization
 **Goal:** The SSP (State Synchronization Protocol) — diffs, transport sender/receiver.
 
-1. **`mosh-statesync` crate** ✅
+1. **`morsh-statesync` crate** ✅
    - `Complete`: Screen snapshot with VT diff_from() / apply_string() interface
    - `UserStream`: Queue of user events (keystrokes + resize), protobuf serialization
    - Minimal VT parser: CUP, SGR (colors/bold/italic/underline), ED, EL, CR/LF/BS
    - 6 tests: create, apply, diff, cursor, color, same-states
 
-2. **`mosh-network` crate** ✅
+2. **`morsh-network` crate** ✅
    - `Connection`: UDP socket management via `tokio::net::UdpSocket`
    - `Fragmenter` / `FragmentAssembly`: zlib-compressed MTU-aware fragmentation with 10-byte headers
    - `RttEstimator`: RFC 6298 SRTT/RTTVAR with clamped RTO (50ms-1000ms)
@@ -115,7 +115,7 @@ mosh-rust/
 ### Phase 4: Prediction Engine ✅ DONE
 **Goal:** Speculative local echo for low-latency feel.
 
-1. **`mosh-prediction` crate** ✅
+1. **`morsh-prediction` crate** ✅
    - `PredictionEngine`: Track per-cell predictions, cursor moves, epochs
    - `ConditionalOverlayCell`: Predicted replacement cells
    - `ConditionalCursorMove`: Predicted cursor positions
@@ -126,10 +126,10 @@ mosh-rust/
    - 20 tests passing
 
 ### Phase 5: Client Binary ✅ DONE
-**Goal:** `mosh-client` that can connect to a stock mosh-server.
+**Goal:** `morsh-client` that can connect to a stock mosh-server.
 
-1. **Client main loop** (`crates/mosh-client/src/main.rs`) ✅
-   - Read `MOSH_KEY` from environment
+1. **Client main loop** (`crates/morsh-client/src/main.rs`) ✅
+   - Read `MORSH_KEY` from environment
    - Parse server address from command line
    - Create `Connection` with UDP socket
    - Initialize `Transport` (client orientation)
@@ -141,9 +141,9 @@ mosh-rust/
    - Raw mode + alternate screen buffer
 
 ### Phase 6: Server Binary ✅ DONE
-**Goal:** `mosh-server` that creates a PTY and serves a shell.
+**Goal:** `morsh-server` that creates a PTY and serves a shell.
 
-1. **Server main loop** (`crates/mosh-server/src/main.rs`) ✅
+1. **Server main loop** (`crates/morsh-server/src/main.rs`) ✅
    - Parse args (IP, port, key, command)
    - Open UDP socket, bind, print `MOSH CONNECT <IP> <PORT> <KEY>` to stdout
    - Spawn child process via PTY (`portable-pty`)
@@ -153,15 +153,15 @@ mosh-rust/
      - Handle shell exit
 
 ### Phase 7: Wrapper Binary (replaces mosh.pl) ✅ DONE
-**Goal:** Native Rust `mosh` command that SSHes to remote and launches mosh-server.
+**Goal:** Native Rust `morsh` command that SSHes to remote and launches morsh-server.
 
-1. **Wrapper binary** (`crates/mosh-wrapper/src/main.rs`) ✅
-   - CLI via clap: `mosh [--ssh=COMMAND] [--port=PORT] user@host [command]`
+1. **Wrapper binary** (`crates/morsh-wrapper/src/main.rs`) ✅
+   - CLI via clap: `morsh [--ssh=COMMAND] [--port=PORT] user@host [command]`
    - SSH to remote via system ssh command
    - Read `MOSH CONNECT` line from stdout
    - Parse IP, port, base64 key
-   - Set `MOSH_KEY` environment variable
-   - Exec `mosh-client` with server address
+   - Set `MORSH_KEY` environment variable
+   - Exec `morsh-client` with server address
 
 ### Phase 8: Windows Polish
 **Goal:** First-class Windows experience.
@@ -233,8 +233,8 @@ Phase 1-7 maintains wire compatibility. Phase 8+ can introduce:
 ## Phase 1 Status: COMPLETE ✅
 
 - Workspace: `Cargo.toml` with two member crates
-- `mosh-crypto`: 17 tests passing (Session, Nonce, Base64Key, PRNG, block counter)
-- `mosh-proto`: 4 tests passing (all message types + field number verification)
+- `morsh-crypto`: 17 tests passing (Session, Nonce, Base64Key, PRNG, block counter)
+- `morsh-proto`: 4 tests passing (all message types + field number verification)
 - Wire-compatible proto2 extensions handled via field-number-preserving flattening
 
 ## Next: Phase 2 — Terminal Emulation via libghostty-vt

@@ -113,7 +113,7 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          STAGING="mosh-${TAG}-${{ matrix.target }}"
+          STAGING="morsh-${TAG}-${{ matrix.target }}"
           mkdir -p "$STAGING"
           cp target/${{ matrix.target }}/release/mosh \
              target/${{ matrix.target }}/release/mosh-client \
@@ -127,7 +127,7 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          STAGING="mosh-${TAG}-${{ matrix.target }}"
+          STAGING="morsh-${TAG}-${{ matrix.target }}"
           mkdir -p "$STAGING"
           cp target/${{ matrix.target }}/release/mosh.exe \
              target/${{ matrix.target }}/release/mosh-client.exe \
@@ -139,7 +139,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mosh-${{ matrix.target }}
+          name: morsh-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
   release:

@@ -1,0 +1,10 @@
+[package]
+name = "morsh-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal emulation adapter for morsh using libghostty-vt"
+
+[dependencies]
+libghostty-vt = "0.2"
+
+[build-dependencies]

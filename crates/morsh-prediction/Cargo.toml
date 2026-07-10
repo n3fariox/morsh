@@ -1,0 +1,8 @@
+[package]
+name = "morsh-prediction"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+morsh-crypto = { path = "../morsh-crypto" }
+morsh-terminal = { path = "../morsh-terminal" }

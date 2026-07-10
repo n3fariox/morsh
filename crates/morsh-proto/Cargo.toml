@@ -1,0 +1,11 @@
+[package]
+name = "morsh-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol Buffer definitions for the Morsh protocol"
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"

@@ -681,25 +681,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosh-client"
+name = "morsh-client"
 version = "0.1.0"
 dependencies = [
  "crossterm",
  "env_logger",
  "futures",
  "log",
- "mosh-crypto",
- "mosh-network",
- "mosh-prediction",
- "mosh-proto",
- "mosh-statesync",
- "mosh-terminal",
+ "morsh-crypto",
+ "morsh-network",
+ "morsh-prediction",
+ "morsh-proto",
+ "morsh-statesync",
+ "morsh-terminal",
  "prost",
  "tokio",
 ]
 
 [[package]]
-name = "mosh-crypto"
+name = "morsh-crypto"
 version = "0.1.0"
 dependencies = [
  "aes",
@@ -711,28 +711,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosh-network"
+name = "morsh-network"
 version = "0.1.0"
 dependencies = [
  "flate2",
  "log",
- "mosh-crypto",
- "mosh-proto",
+ "morsh-crypto",
+ "morsh-proto",
  "prost",
  "socket2 0.5.10",
  "tokio",
 ]
 
 [[package]]
-name = "mosh-prediction"
+name = "morsh-prediction"
 version = "0.1.0"
 dependencies = [
- "mosh-crypto",
- "mosh-terminal",
+ "morsh-crypto",
+ "morsh-terminal",
 ]
 
 [[package]]
-name = "mosh-proto"
+name = "morsh-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
@@ -740,17 +740,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosh-server"
+name = "morsh-server"
 version = "0.1.0"
 dependencies = [
  "env_logger",
  "libc",
  "log",
- "mosh-crypto",
- "mosh-network",
- "mosh-proto",
- "mosh-statesync",
- "mosh-terminal",
+ "morsh-crypto",
+ "morsh-network",
+ "morsh-proto",
+ "morsh-statesync",
+ "morsh-terminal",
  "portable-pty",
  "prost",
  "tokio",
@@ -758,24 +758,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosh-statesync"
+name = "morsh-statesync"
 version = "0.1.0"
 dependencies = [
  "log",
- "mosh-proto",
- "mosh-terminal",
+ "morsh-proto",
+ "morsh-terminal",
  "prost",
 ]
 
 [[package]]
-name = "mosh-terminal"
+name = "morsh-terminal"
 version = "0.1.0"
 dependencies = [
  "libghostty-vt",
 ]
 
 [[package]]
-name = "mosh-wrapper"
+name = "morsh-wrapper"
 version = "0.1.0"
 dependencies = [
  "clap",

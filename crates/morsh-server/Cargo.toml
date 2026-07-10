@@ -1,0 +1,27 @@
+[package]
+name = "morsh-server"
+version = "0.1.0"
+edition = "2021"
+description = "Morsh server binary"
+
+[[bin]]
+name = "morsh-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "sync", "signal", "fs", "io-util"] }
+portable-pty = "0.8"
+morsh-crypto = { path = "../morsh-crypto" }
+morsh-proto = { path = "../morsh-proto" }
+morsh-terminal = { path = "../morsh-terminal" }
+morsh-network = { path = "../morsh-network" }
+morsh-statesync = { path = "../morsh-statesync" }
+prost = "0.14"
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }

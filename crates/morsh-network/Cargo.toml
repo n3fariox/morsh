@@ -1,0 +1,17 @@
+[package]
+name = "morsh-network"
+version = "0.1.0"
+edition = "2021"
+description = "UDP transport layer for morsh"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "macros", "rt", "sync"] }
+morsh-crypto = { path = "../morsh-crypto" }
+morsh-proto = { path = "../morsh-proto" }
+prost = "0.14"
+flate2 = "1"
+log = "0.4"
+socket2 = "0.5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

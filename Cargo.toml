@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mosh-crypto",
-    "crates/mosh-proto",
-    "crates/mosh-terminal",
-    "crates/mosh-network",
-    "crates/mosh-statesync",
-    "crates/mosh-client",
-    "crates/mosh-server",
-    "crates/mosh-wrapper", "crates/mosh-prediction",
+    "crates/morsh-crypto",
+    "crates/morsh-proto",
+    "crates/morsh-terminal",
+    "crates/morsh-network",
+    "crates/morsh-statesync",
+    "crates/morsh-client",
+    "crates/morsh-server",
+    "crates/morsh-wrapper",
+    "crates/morsh-prediction",
 ]
