@@ -308,8 +308,19 @@ fn main() {
 
         // After redirect, dup log file onto stderr so env_logger output lands there
         if let Some(file) = log_file {
-            use std::os::unix::io::AsRawFd;
-            unsafe { libc::dup2(file.as_raw_fd(), 2); }
+            #[cfg(unix)] {
+                use std::os::unix::io::AsRawFd;
+                unsafe { libc::dup2(file.as_raw_fd(), 2); }
+            }
+            #[cfg(windows)] {
+                use std::os::windows::io::AsRawHandle;
+                unsafe {
+                    windows_sys::Win32::System::Console::SetStdHandle(
+                        windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+                        file.as_raw_handle(),
+                    );
+                }
+            }
         }
 
         log::info!("Stdio redirected to /dev/null");
