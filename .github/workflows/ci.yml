@@ -18,11 +18,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            zig_arch: linux-x86_64
+            zig_arch: x86_64-linux
             zig_ext: tar.xz
             allow_fail: false
           - os: windows-latest
-            zig_arch: windows-x86_64
+            zig_arch: x86_64-windows
             zig_ext: zip
             allow_fail: true
     continue-on-error: ${{ matrix.allow_fail }}

@@ -21,11 +21,11 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            zig_arch: linux-x86_64
+            zig_arch: x86_64-linux
             zig_ext: tar.xz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            zig_arch: windows-x86_64
+            zig_arch: x86_64-windows
             zig_ext: zip
 
     steps:
