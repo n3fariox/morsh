@@ -94,11 +94,19 @@ fn main() {
     }
 
     // Forward RUST_LOG to remote so server debug logs appear on stderr (with -D)
-    let remote_cmd = if let Ok(val) = std::env::var("RUST_LOG") {
-        format!("RUST_LOG={val} {remote_cmd}")
-    } else {
-        remote_cmd
-    };
+    if let Ok(val) = std::env::var("RUST_LOG") {
+        remote_cmd = format!("RUST_LOG={val} {remote_cmd}");
+    }
+
+    // Forward locale variables as -l flags (like stock mosh)
+    let locale_vars = ["LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
+        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL"];
+    for var in &locale_vars {
+        if let Ok(val) = std::env::var(var) {
+            remote_cmd.push_str(&format!(" -l {var}={val}"));
+        }
+    }
 
     // Build SSH command
     let mut ssh_args: Vec<String> = args.ssh_command.split_whitespace().map(String::from).collect();

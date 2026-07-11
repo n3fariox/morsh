@@ -182,14 +182,15 @@ fn main() {
             "-l" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("morsh-server: -l requires a locale");
+                    eprintln!("morsh-server: -l requires NAME=VALUE");
                     std::process::exit(1);
                 }
                 let val = &args[i];
                 if let Some((name, value)) = val.split_once('=') {
                     locale_vars.push((name.to_string(), value.to_string()));
                 } else {
-                    locale_vars.push(("LC_ALL".to_string(), val.clone()));
+                    eprintln!("morsh-server: -l argument must be NAME=VALUE, got '{val}'");
+                    std::process::exit(1);
                 }
             }
             "--log-file" => {
@@ -212,8 +213,7 @@ fn main() {
                 eprintln!("  -p PORT[:PORT2]  Bind to this port/range (default: random)");
                 eprintln!("  -i LOCALADDR   Bind to this address (default: 0.0.0.0)");
                 eprintln!("  -s             Use SSH_CONNECTION for bind IP");
-                eprintln!("  -l NAME=VALUE  Set environment variable in shell");
-                eprintln!("  -l LOCALE      Shorthand for LC_ALL=LOCALE");
+                eprintln!("  -l NAME=VALUE  Set locale-related environment variable");
                 eprintln!("  -D, --no-daemonize  Run in foreground (morsh extension)");
                 eprintln!("  --log-file FILE     Write logs to FILE (morsh extension)");
                 eprintln!("  -c COLORS       Terminal color count (ignored)");
