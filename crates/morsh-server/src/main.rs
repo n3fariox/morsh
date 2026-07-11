@@ -164,10 +164,10 @@ fn main() {
                     std::process::exit(1);
                 });
             }
-            "-a" | "-i" => {
+            "-i" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("morsh-server: {} requires an address argument", args[i]);
+                    eprintln!("morsh-server: -i requires an address argument");
                     std::process::exit(1);
                 }
                 bind_addr = Some(args[i].clone());
@@ -186,14 +186,6 @@ fn main() {
                 }
                 log_file_path = Some(args[i].clone());
             }
-            "-e" => {
-                i += 1;
-                while i < args.len() && !args[i].starts_with('-') {
-                    command_args.push(args[i].clone());
-                    i += 1;
-                }
-                continue;
-            }
             "-c" => {
                 i += 1; // skip color count (ignored)
             }
@@ -204,9 +196,8 @@ fn main() {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -p PORT[:PORT2]  Bind to this port/range (default: random)");
-                eprintln!("  -i, -a LOCALADDR  Bind to this address (default: 0.0.0.0)");
-                eprintln!("  -s              Use SSH_CONNECTION for bind IP");
-                eprintln!("  -e CMD...       Execute command instead of shell (morsh extension)");
+                eprintln!("  -i LOCALADDR   Bind to this address (default: 0.0.0.0)");
+                eprintln!("  -s             Use SSH_CONNECTION for bind IP");
                 eprintln!("  -D, --no-daemonize  Run in foreground (morsh extension)");
                 eprintln!("  -l, --log-file FILE  Write logs to FILE (morsh extension)");
                 eprintln!("  -c COLORS       Terminal color count (ignored)");
