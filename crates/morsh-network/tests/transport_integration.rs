@@ -73,12 +73,15 @@ async fn transport_send_receive_encrypted() {
     };
     server_transport.connection_mut().send(&server_inst).await.unwrap();
 
-    // Client receives
+    // Client receives — drain any empty ACKs that the server sent during recv_diff
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let received = client_transport.recv_diff().await.unwrap();
+    let received = loop {
+        match client_transport.recv_diff().await.unwrap() {
+            Some(d) if !d.diff.is_empty() || d.new_num == u64::MAX => break d,
+            _ => continue,
+        }
+    };
 
-    assert!(received.is_some(), "Client should have received a packet");
-    let received = received.unwrap();
     assert_eq!(received.diff, server_data);
     assert_eq!(received.old_num, 1);
 }
