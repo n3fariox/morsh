@@ -65,47 +65,52 @@ fn main() {
         ip => Some(ip.to_string()),
     };
 
-    // Determine the command to run on remote
-    // Build in stock mosh-server style: mosh-server new [-i IP] [-s] [-p PORT] [-D] [-l FILE] [-- CMD...]
-    let server_name = &args.server_path;
-    let mut remote_cmd = format!("{server_name} new");
+    // Build remote command: server options before --, command after --
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(args.server_path.clone());
+    parts.push("new".to_string());
 
-    // Add bind-server flag to the remote command
+    // Bind address
     if let Some(ref ip) = resolved_ip {
-        remote_cmd.push_str(&format!(" -i {ip}"));
+        parts.push("-i".to_string());
+        parts.push(ip.clone());
     } else {
-        remote_cmd.push_str(" -s");
+        parts.push("-s".to_string());
     }
 
-    // Add server log file if specified
-    if let Some(ref path) = args.server_log_file {
-        remote_cmd.push_str(&format!(" -l {path}"));
-    }
-
-    // Add no-daemonize flag if specified
-    if args.no_daemonize {
-        remote_cmd.push_str(" -D");
-    }
-
-    // Add command after -- separator (stock mosh convention)
-    if !args.command.is_empty() {
-        remote_cmd.push_str(" -- ");
-        remote_cmd.push_str(&args.command.join(" "));
-    }
-
-    // Forward RUST_LOG to remote so server debug logs appear on stderr (with -D)
-    if let Ok(val) = std::env::var("RUST_LOG") {
-        remote_cmd = format!("RUST_LOG={val} {remote_cmd}");
-    }
-
-    // Forward locale variables as -l flags (like stock mosh)
+    // Locale vars from client (like stock mosh, before --)
     let locale_vars = ["LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
         "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
         "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL"];
     for var in &locale_vars {
         if let Ok(val) = std::env::var(var) {
-            remote_cmd.push_str(&format!(" -l {var}={val}"));
+            parts.push("-l".to_string());
+            parts.push(format!("{var}={val}"));
         }
+    }
+
+    // Log file (no short form, --log-file only)
+    if let Some(ref path) = args.server_log_file {
+        parts.push("--log-file".to_string());
+        parts.push(path.clone());
+    }
+
+    // No-daemonize
+    if args.no_daemonize {
+        parts.push("-D".to_string());
+    }
+
+    // Command after -- separator
+    if !args.command.is_empty() {
+        parts.push("--".to_string());
+        parts.extend(args.command.clone());
+    }
+
+    let mut remote_cmd = parts.join(" ");
+
+    // Forward RUST_LOG to remote so server debug logs appear on stderr (with -D)
+    if let Ok(val) = std::env::var("RUST_LOG") {
+        remote_cmd = format!("RUST_LOG={val} {remote_cmd}");
     }
 
     // Build SSH command
