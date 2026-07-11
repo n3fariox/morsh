@@ -132,7 +132,7 @@ impl MoshTerminal {
                     while let Some(cell) = ci.next() {
                         let graphemes = cell
                             .graphemes()
-                            .map_err(|_| format!("Cell::graphemes failed"))?;
+                            .map_err(|_| "Cell::graphemes failed".to_string())?;
                         let text: String = graphemes.iter().collect();
 
                         let style = match cell.style() {
