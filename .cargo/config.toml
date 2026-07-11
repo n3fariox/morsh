@@ -1,0 +1,9 @@
+# Force libghostty-vt to build in a Release optimize mode.
+#
+# The default for `cargo test` (dev profile) builds the bundled ghostty
+# library in Zig `Debug` mode, which triggers a STATUS_ACCESS_VIOLATION
+# inside ghostty's VT parser when it first allocates screen content
+# (e.g. writing printable text). Building in a Release mode avoids the
+# broken Debug code path while keeping safety checks via ReleaseSafe.
+[env]
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseSafe"

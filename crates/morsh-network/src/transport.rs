@@ -512,16 +512,17 @@ mod tests {
     #[test]
     fn sender_build_instruction() {
         let mut sender = TransportSender::new(true);
-        sender.advance_state();
-        sender.advance_state();
 
         let inst = sender.build_instruction(b"hello".to_vec(), 3, 0);
         assert_eq!(inst.protocol_version, Some(2));
         assert_eq!(inst.old_num, Some(0));
-        assert_eq!(inst.new_num, Some(2));
+        assert_eq!(inst.new_num, Some(1));
         assert_eq!(inst.ack_num, Some(3));
         assert_eq!(inst.throwaway_num, Some(0));
         assert_eq!(inst.diff, Some(b"hello".to_vec()));
+
+        sender.advance_state();
+        assert_eq!(sender.state_num(), 1);
     }
 
     #[test]

@@ -1,2 +1,3 @@
 [tools]
 zig = "0.15"
+protoc = "29.3"
