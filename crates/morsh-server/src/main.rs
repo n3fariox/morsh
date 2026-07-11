@@ -135,8 +135,24 @@ fn main() {
     let mut no_daemonize = false;
     let mut log_file_path: Option<String> = None;
     let mut i = 1;
+
+    // Skip optional "new" subcommand (stock mosh compatibility)
+    if i < args.len() && args[i] == "new" {
+        i += 1;
+    }
+
+    let mut after_separator = false;
     while i < args.len() {
+        if after_separator {
+            command_args.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+
         match args[i].as_str() {
+            "--" => {
+                after_separator = true;
+            }
             "-p" => {
                 i += 1;
                 if i >= args.len() {
@@ -148,10 +164,10 @@ fn main() {
                     std::process::exit(1);
                 });
             }
-            "-a" => {
+            "-a" | "-i" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("morsh-server: -a requires an address argument");
+                    eprintln!("morsh-server: {} requires an address argument", args[i]);
                     std::process::exit(1);
                 }
                 bind_addr = Some(args[i].clone());
@@ -178,24 +194,28 @@ fn main() {
                 }
                 continue;
             }
+            "-c" => {
+                i += 1; // skip color count (ignored)
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: morsh-server [options] [command]");
+                eprintln!("Usage: morsh-server new [options] [-- command...]");
                 eprintln!();
                 eprintln!("Starts a morsh-server that listens for a morsh-client connection.");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -p PORT     Bind to this port (default: random)");
-                eprintln!("  -a ADDR     Bind to this address (default: 0.0.0.0)");
-                eprintln!("  -s          Use SSH_CONNECTION to determine bind IP (default)");
-                eprintln!("  -e CMD...   Execute command instead of shell");
-                eprintln!("  -D, --no-daemonize  Run in foreground (don't fork)");
-                eprintln!("  -l, --log-file FILE  Write logs to FILE (daemon mode)");
-                eprintln!("  -h, --help  Show this help message");
-                eprintln!("  -v, --version  Show version information");
+                eprintln!("  -p PORT[:PORT2]  Bind to this port/range (default: random)");
+                eprintln!("  -i, -a LOCALADDR  Bind to this address (default: 0.0.0.0)");
+                eprintln!("  -s              Use SSH_CONNECTION for bind IP");
+                eprintln!("  -e CMD...       Execute command instead of shell (morsh extension)");
+                eprintln!("  -D, --no-daemonize  Run in foreground (morsh extension)");
+                eprintln!("  -l, --log-file FILE  Write logs to FILE (morsh extension)");
+                eprintln!("  -c COLORS       Terminal color count (ignored)");
+                eprintln!("  -h, --help      Show this help message");
+                eprintln!("  -v, --version   Show version information");
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  MORSH_KEY    Encryption key (auto-generated if not set)");
-                eprintln!("  SHELL       Shell to run (default: /bin/sh)");
+                eprintln!("  SHELL        Shell to run (default: /bin/sh)");
                 eprintln!();
                 eprintln!("The server prints 'MOSH CONNECT <port> <key>' to stdout");
                 eprintln!("when ready, which is used by the morsh wrapper to start the client.");

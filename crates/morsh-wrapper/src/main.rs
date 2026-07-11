@@ -66,34 +66,32 @@ fn main() {
     };
 
     // Determine the command to run on remote
+    // Build in stock mosh-server style: mosh-server new [-i IP] [-s] [-p PORT] [-D] [-l FILE] [-- CMD...]
     let server_name = &args.server_path;
-    let remote_cmd = if args.command.is_empty() {
-        server_name.clone()
-    } else {
-        let cmd = args.command.join(" ");
-        format!("{server_name} -e {cmd}")
-    };
+    let mut remote_cmd = format!("{server_name} new");
 
     // Add bind-server flag to the remote command
-    let remote_cmd = if let Some(ref ip) = resolved_ip {
-        format!("{remote_cmd} -a {ip}")
+    if let Some(ref ip) = resolved_ip {
+        remote_cmd.push_str(&format!(" -i {ip}"));
     } else {
-        format!("{remote_cmd} -s")
-    };
+        remote_cmd.push_str(" -s");
+    }
 
     // Add server log file if specified
-    let remote_cmd = if let Some(ref path) = args.server_log_file {
-        format!("{remote_cmd} -l {path}")
-    } else {
-        remote_cmd
-    };
+    if let Some(ref path) = args.server_log_file {
+        remote_cmd.push_str(&format!(" -l {path}"));
+    }
 
     // Add no-daemonize flag if specified
-    let remote_cmd = if args.no_daemonize {
-        format!("{remote_cmd} -D")
-    } else {
-        remote_cmd
-    };
+    if args.no_daemonize {
+        remote_cmd.push_str(" -D");
+    }
+
+    // Add command after -- separator (stock mosh convention)
+    if !args.command.is_empty() {
+        remote_cmd.push_str(" -- ");
+        remote_cmd.push_str(&args.command.join(" "));
+    }
 
     // Forward RUST_LOG to remote so server debug logs appear on stderr (with -D)
     let remote_cmd = if let Ok(val) = std::env::var("RUST_LOG") {
