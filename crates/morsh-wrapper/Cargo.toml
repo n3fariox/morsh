@@ -2,6 +2,7 @@
 name = "morsh-wrapper"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Morsh wrapper binary (replaces mosh.pl) - SSH launch + connection"
 
 [[bin]]

@@ -4,11 +4,15 @@ use futures::StreamExt;
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, Transport};
 use morsh_prediction::{DisplayPreference, NotificationEngine, PredictionEngine};
+use morsh_proto::host::HostMessage;
 use morsh_statesync::{Complete, UserStream};
+use prost::Message;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+const ESCAPE_KEY: u8 = 0x1E; // Ctrl-^ (Ctrl-Shift-6) — stock mosh escape
 
 enum TermEvent {
     Key(Vec<u8>),
@@ -60,6 +64,32 @@ fn render_prediction_overlay(
     buf.push_str("\x1b[u");
     write!(stdout, "{buf}")?;
     stdout.flush()
+}
+
+/// Extract raw VT bytes and optional EchoAck from a server diff.
+/// Stock mosh-server wraps VT data in a `HostBuffers::HostMessage` protobuf.
+/// Our own morsh-server sends raw VT bytes directly.
+fn extract_host_message(data: &[u8]) -> (Vec<u8>, Option<u64>) {
+    if let Ok(msg) = HostMessage::decode(data) {
+        let mut vt_bytes = Vec::new();
+        let mut echo_ack = None;
+        for inst in &msg.instruction {
+            if let Some(ref hb) = inst.hostbytes {
+                if let Some(ref s) = hb.hoststring {
+                    vt_bytes.extend_from_slice(s);
+                }
+            }
+            if let Some(ref ea) = inst.echoack {
+                if ea.echo_ack_num.is_some() {
+                    echo_ack = echo_ack.max(ea.echo_ack_num);
+                }
+            }
+        }
+        if !vt_bytes.is_empty() || echo_ack.is_some() {
+            return (vt_bytes, echo_ack);
+        }
+    }
+    (data.to_vec(), None)
 }
 
 #[tokio::main]
@@ -132,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prediction.set_send_interval(transport.sender.send_interval_ms());
 
     let mut notifications = NotificationEngine::new();
-    notifications.set_escape_key_string("Ctrl-c .".to_string());
+    notifications.set_escape_key_string("Ctrl-^ .".to_string());
 
     user_stream.push_resize(cols as i32, rows as i32);
 
@@ -145,15 +175,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use spawn instead of spawn_local (no LocalSet available)
     let input_handle = tokio::spawn(async move {
         let mut events = EventStream::new();
+        let mut escape_started = false;
         while let Some(Ok(event)) = events.next().await {
+            let mut handle_bytes = |bytes: Vec<u8>| {
+                // Stock mosh escape sequence: Ctrl-^ (0x1E) then '.' to quit
+                if escape_started {
+                    if bytes.len() == 1 {
+                        match bytes[0] {
+                            b'.' => {
+                                let _ = term_tx.try_send(TermEvent::Quit);
+                                return;
+                            }
+                            0x1A => { /* suspend - not yet implemented */ }
+                            ESCAPE_KEY => {
+                                // Send literal escape key
+                                let _ = term_tx.try_send(TermEvent::Key(vec![ESCAPE_KEY]));
+                            }
+                            other => {
+                                // Send escape + the byte literally
+                                let mut both = vec![ESCAPE_KEY];
+                                both.push(other);
+                                let _ = term_tx.try_send(TermEvent::Key(both));
+                            }
+                        }
+                    } else {
+                        let mut both = vec![ESCAPE_KEY];
+                        both.extend(bytes);
+                        let _ = term_tx.try_send(TermEvent::Key(both));
+                    }
+                    escape_started = false;
+                    return;
+                }
+                // Check for escape key (Ctrl-^)
+                if bytes.len() == 1 && bytes[0] == ESCAPE_KEY {
+                    escape_started = true;
+                    return;
+                }
+                let _ = term_tx.try_send(TermEvent::Key(bytes));
+            };
             match event {
                 Event::Key(KeyEvent { code, modifiers, kind: crossterm::event::KeyEventKind::Press, .. }) => {
                     let mut bytes = Vec::new();
                     match code {
-                        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                            let _ = term_tx.send(TermEvent::Quit).await;
-                            return;
-                        }
                         KeyCode::Char(ch) => {
                             if modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii_lowercase() {
                                 bytes.push((ch as u8) - b'a' + 1);
@@ -198,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                     if !bytes.is_empty() {
-                        let _ = term_tx.send(TermEvent::Key(bytes)).await;
+                        handle_bytes(bytes);
                     }
                 }
                 Event::Resize(w, h) => {
@@ -254,7 +317,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let frame = transport.sender.state_num();
                         prediction.set_local_frame_sent(frame);
 
-                        // Render prediction overlay immediately for instant feedback
                         if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
                             log::debug!("Overlay render error: {e}");
                         }
@@ -267,12 +329,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let ack_num = transport.receiver.remote_state_num();
                                 let throwaway = transport.sender.throwaway_num();
                                 let bytes_to_send = diff.len();
+                                let state_before = transport.sender.state_num();
+                                log::debug!("SEND immediate: state={state_before} ack={ack_num} diff={diff:?}");
                                 if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                                     log::warn!("Send error: {e}");
                                 } else {
                                     sent_stream = user_stream.clone();
                                     transport.sender.advance_state();
-                                    log::debug!("Sent {bytes_to_send} bytes (immediate)");
+                                    log::debug!("Sent {bytes_to_send} bytes (immediate) state now={}", transport.sender.state_num());
                                 }
                             }
                         }
@@ -294,12 +358,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         notifications.clear_network_error();
                         notifications.server_heard(std::time::Instant::now());
 
-                        terminal_state.apply_string(&diff.diff);
+                        // Stock mosh-server sends HostMessage protobuf wrapper; our own server sends raw VT bytes.
+                        let (vt_bytes, echo_ack) = extract_host_message(&diff.diff);
+                        terminal_state.apply_string(&vt_bytes);
 
                         // Update prediction frame tracking from server acks
                         let acked = transport.sender.acked_state_num();
                         prediction.set_local_frame_acked(acked);
-                        prediction.set_local_frame_late_acked(diff.new_num);
+                        prediction.set_local_frame_late_acked(echo_ack.unwrap_or(diff.new_num));
 
                         // Validate predictions against new server state
                         let snap = terminal_state.snapshot();
@@ -311,9 +377,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             snap.cursor_x as usize,
                         );
 
-                        stdout.write_all(&diff.diff)?;
+                        log::debug!("RECV vt_bytes=[{:?}] raw_diff=[{:?}] new_num={} ack_num={}",
+                            String::from_utf8_lossy(&vt_bytes),
+                            String::from_utf8_lossy(&diff.diff),
+                            diff.new_num,
+                            diff.ack_num,
+                        );
+                        stdout.write_all(&vt_bytes)?;
                         stdout.flush()?;
-                        log::debug!("Applied diff: {} bytes", diff.diff.len());
 
                         // Check for server shutdown
                         if transport.receiver.shutdown_received() {
@@ -353,12 +424,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ack_num = transport.receiver.remote_state_num();
                         let throwaway = transport.sender.throwaway_num();
                         let bytes_to_send = diff.len();
+                        let state_before = transport.sender.state_num();
+                        log::debug!("SEND timer: state={state_before} ack={ack_num} diff={diff:?}");
                         if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
                             log::warn!("Send error: {e}");
                         } else {
                             sent_stream = user_stream.clone();
                             transport.sender.advance_state();
-                            log::debug!("Sent {bytes_to_send} bytes of user diff");
+                            log::debug!("Sent {bytes_to_send} bytes (timer) state now={}", transport.sender.state_num());
                         }
                     }
                 }
