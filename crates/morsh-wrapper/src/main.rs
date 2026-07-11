@@ -162,6 +162,10 @@ fn main() {
         }
     }
 
+    // Reap the SSH child so it doesn't become a zombie.
+    // The pipe was already closed when the reader was dropped (end of for loop).
+    let _ = ssh_child.wait();
+
     let info = match connect_info {
         Some(i) => i,
         None => {
