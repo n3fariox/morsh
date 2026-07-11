@@ -134,6 +134,7 @@ fn main() {
     let mut use_ssh_connection = false;
     let mut no_daemonize = false;
     let mut log_file_path: Option<String> = None;
+    let mut locale_vars: Vec<(String, String)> = Vec::new();
     let mut i = 1;
 
     // Skip optional "new" subcommand (stock mosh compatibility)
@@ -178,7 +179,20 @@ fn main() {
             "-D" | "--no-daemonize" => {
                 no_daemonize = true;
             }
-            "-l" | "--log-file" => {
+            "-l" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("morsh-server: -l requires a locale");
+                    std::process::exit(1);
+                }
+                let val = &args[i];
+                if let Some((name, value)) = val.split_once('=') {
+                    locale_vars.push((name.to_string(), value.to_string()));
+                } else {
+                    locale_vars.push(("LC_ALL".to_string(), val.clone()));
+                }
+            }
+            "--log-file" => {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("morsh-server: --log-file requires a file path");
@@ -198,8 +212,10 @@ fn main() {
                 eprintln!("  -p PORT[:PORT2]  Bind to this port/range (default: random)");
                 eprintln!("  -i LOCALADDR   Bind to this address (default: 0.0.0.0)");
                 eprintln!("  -s             Use SSH_CONNECTION for bind IP");
+                eprintln!("  -l NAME=VALUE  Set environment variable in shell");
+                eprintln!("  -l LOCALE      Shorthand for LC_ALL=LOCALE");
                 eprintln!("  -D, --no-daemonize  Run in foreground (morsh extension)");
-                eprintln!("  -l, --log-file FILE  Write logs to FILE (morsh extension)");
+                eprintln!("  --log-file FILE     Write logs to FILE (morsh extension)");
                 eprintln!("  -c COLORS       Terminal color count (ignored)");
                 eprintln!("  -h, --help      Show this help message");
                 eprintln!("  -v, --version   Show version information");
@@ -341,7 +357,7 @@ fn main() {
 
     // Create tokio runtime and run server
     let rt = tokio::runtime::Runtime::new().unwrap();
-    if let Err(e) = rt.block_on(run_server(port, desired_ip, key, shell, command_args)) {
+    if let Err(e) = rt.block_on(run_server(port, desired_ip, key, shell, command_args, locale_vars)) {
         log::error!("Server error: {e}");
         std::process::exit(1);
     }
@@ -353,6 +369,7 @@ async fn run_server(
     key: Base64Key,
     shell: String,
     command_args: Vec<String>,
+    locale_vars: Vec<(String, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("run_server entered: port={bind_port}, shell={shell}, ip={:?}, args.len={}", desired_ip, command_args.len());
     let session = Session::new(*key.data());
@@ -444,6 +461,9 @@ async fn run_server(
     cmd.env("TERM", "xterm-256color");
     cmd.env("LANG", "en_US.UTF-8");
     cmd.env("MORSH", env!("CARGO_PKG_VERSION"));
+    for (name, value) in &locale_vars {
+        cmd.env(name, value);
+    }
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system.openpty(pty_size)
