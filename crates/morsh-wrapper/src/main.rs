@@ -60,120 +60,41 @@ fn main() {
     // This IP is used both for telling the server where to bind and for
     // the client's connection target, so they always agree.
     let resolved_ip = match args.bind_server.as_str() {
-        "any" => None,  // server will bind to 0.0.0.0, client uses resolved hostname
+        "any" => None,
         "ssh" => Some(resolve_host(&args.host)),
         ip => Some(ip.to_string()),
     };
 
-    // Build remote command: server options before --, command after --
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(args.server_path.clone());
-    parts.push("new".to_string());
-
-    // Bind address
-    if let Some(ref ip) = resolved_ip {
-        parts.push("-i".to_string());
-        parts.push(ip.clone());
-    } else {
-        parts.push("-s".to_string());
+    // Try the configured server path first, then fall back to stock mosh-server.
+    let mut server_paths = vec![args.server_path.as_str()];
+    if args.server_path == "morsh-server" {
+        server_paths.push("mosh-server");
     }
 
-    // Locale vars from client (like stock mosh, before --)
-    let locale_vars = ["LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
-        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
-        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL"];
-    for var in &locale_vars {
-        if let Ok(val) = std::env::var(var) {
-            parts.push("-l".to_string());
-            parts.push(format!("{var}={val}"));
+    let mut info: Option<ConnectInfo> = None;
+    for (i, &path) in server_paths.iter().enumerate() {
+        if i > 0 {
+            eprintln!("morsh-server not found, trying {path}...");
+        }
+        info = try_launch_server(
+            &args.ssh_command,
+            &args.host,
+            path,
+            &resolved_ip,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+        );
+        if info.is_some() {
+            break;
         }
     }
 
-    // Log file (no short form, --log-file only)
-    if let Some(ref path) = args.server_log_file {
-        parts.push("--log-file".to_string());
-        parts.push(path.clone());
-    }
-
-    // No-daemonize
-    if args.no_daemonize {
-        parts.push("-D".to_string());
-    }
-
-    // Command after -- separator
-    if !args.command.is_empty() {
-        parts.push("--".to_string());
-        parts.extend(args.command.clone());
-    }
-
-    let mut remote_cmd = parts.join(" ");
-
-    // Forward RUST_LOG to remote so server debug logs appear on stderr (with -D)
-    if let Ok(val) = std::env::var("RUST_LOG") {
-        remote_cmd = format!("RUST_LOG={val} {remote_cmd}");
-    }
-
-    // Build SSH command
-    let mut ssh_args: Vec<String> = args.ssh_command.split_whitespace().map(String::from).collect();
-    ssh_args.push(args.host.clone());
-    ssh_args.push(remote_cmd);
-
-    log::info!("SSH: {} {}", args.ssh_command, args.host);
-    log::info!("Remote command: {}", ssh_args.last().unwrap());
-
-    // Spawn SSH process
-    let mut ssh_child = Command::new(&ssh_args[0])
-        .args(&ssh_args[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("Failed to start SSH. Is ssh installed?");
-
-    // Read stdout to find "MOSH CONNECT" line
-    let stdout = ssh_child.stdout.take().expect("Failed to capture SSH stdout");
-    let reader = BufReader::new(stdout);
-
-    let mut connect_info: Option<ConnectInfo> = None;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Error reading SSH output: {e}");
-                std::process::exit(1);
-            }
-        };
-
-        log::debug!("SSH stdout: {line}");
-
-        if line.starts_with("MOSH CONNECT") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // Stock mosh format: MOSH CONNECT port key
-            if parts.len() >= 4 {
-                if let Ok(port) = parts[2].parse::<u16>() {
-                    connect_info = Some(ConnectInfo {
-                        port,
-                        key: parts[3].to_string(),
-                    });
-                    break;
-                }
-            }
-        }
-    }
-
-    // Reap the SSH child so it doesn't become a zombie.
-    // The pipe was already closed when the reader was dropped (end of for loop).
-    let _ = ssh_child.wait();
-
-    let info = match connect_info {
-        Some(i) => i,
-        None => {
-            eprintln!("Failed to get MOSH CONNECT from remote server");
-            eprintln!("Make sure morsh-server is installed on the remote host");
-            std::process::exit(1);
-        }
-    };
+    let info = info.unwrap_or_else(|| {
+        eprintln!("Failed to get MOSH CONNECT from remote server");
+        eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
+        std::process::exit(1);
+    });
 
     // Use the resolved IP for the client connection (same IP the server bound to)
     let server_ip = resolved_ip.unwrap_or_else(|| resolve_host(&args.host));
@@ -192,6 +113,100 @@ fn main() {
         .expect("Failed to start morsh-client. Is it in PATH?");
 
     std::process::exit(exit_status.code().unwrap_or(1));
+}
+
+/// Try to launch a mosh server on the remote host via SSH and parse the MOSH CONNECT line.
+fn try_launch_server(
+    ssh_command: &str,
+    host: &str,
+    server_path: &str,
+    resolved_ip: &Option<String>,
+    server_log_file: &Option<String>,
+    no_daemonize: bool,
+    command: &[String],
+) -> Option<ConnectInfo> {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(server_path.to_string());
+    parts.push("new".to_string());
+
+    if let Some(ref ip) = resolved_ip {
+        parts.push("-i".to_string());
+        parts.push(ip.clone());
+    } else {
+        parts.push("-s".to_string());
+    }
+
+    // Locale vars from client (like stock mosh, before --)
+    let locale_vars = ["LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
+        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL"];
+    for var in &locale_vars {
+        if let Ok(val) = std::env::var(var) {
+            parts.push("-l".to_string());
+            parts.push(format!("{var}={val}"));
+        }
+    }
+
+    if let Some(ref path) = server_log_file {
+        parts.push("--log-file".to_string());
+        parts.push(path.clone());
+    }
+
+    if no_daemonize {
+        parts.push("-D".to_string());
+    }
+
+    if !command.is_empty() {
+        parts.push("--".to_string());
+        parts.extend(command.iter().cloned());
+    }
+
+    let mut remote_cmd = parts.join(" ");
+
+    if let Ok(val) = std::env::var("RUST_LOG") {
+        remote_cmd = format!("RUST_LOG={val} {remote_cmd}");
+    }
+
+    let mut ssh_args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
+    ssh_args.push(host.to_string());
+    ssh_args.push(remote_cmd);
+
+    log::info!("SSH: {ssh_command} {host}");
+    log::info!("Remote command: {}", ssh_args.last().unwrap());
+
+    let mut ssh_child = Command::new(&ssh_args[0])
+        .args(&ssh_args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let stdout = ssh_child.stdout.take()?;
+    let reader = BufReader::new(stdout);
+
+    let mut connect_info = None;
+
+    for line in reader.lines() {
+        let line = line.ok()?;
+        log::debug!("SSH stdout: {line}");
+
+        if line.starts_with("MOSH CONNECT") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                if let Ok(port) = parts[2].parse::<u16>() {
+                    connect_info = Some(ConnectInfo {
+                        port,
+                        key: parts[3].to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = ssh_child.wait();
+    connect_info
 }
 
 /// Resolve a hostname to an IP address via DNS.
