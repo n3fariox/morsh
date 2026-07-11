@@ -65,32 +65,17 @@ fn main() {
         ip => Some(ip.to_string()),
     };
 
-    // Try the configured server path first, then fall back to stock mosh-server.
-    let mut server_paths = vec![args.server_path.as_str()];
-    if args.server_path == "morsh-server" {
-        server_paths.push("mosh-server");
-    }
+    // Build a single remote command that tries morsh-server first,
+    // then falls back to mosh-server — all in one SSH connection.
+    let remote_cmd = if args.server_path == "morsh-server" {
+        let first = build_server_cmd("morsh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command);
+        let second = build_server_cmd("mosh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command);
+        format!("({first} 2>/dev/null) || {second}")
+    } else {
+        build_server_cmd(&args.server_path, &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command)
+    };
 
-    let mut info: Option<ConnectInfo> = None;
-    for (i, &path) in server_paths.iter().enumerate() {
-        if i > 0 {
-            eprintln!("morsh-server not found, trying {path}...");
-        }
-        info = try_launch_server(
-            &args.ssh_command,
-            &args.host,
-            path,
-            &resolved_ip,
-            &args.server_log_file,
-            args.no_daemonize,
-            &args.command,
-        );
-        if info.is_some() {
-            break;
-        }
-    }
-
-    let info = info.unwrap_or_else(|| {
+    let info = try_launch_server(&args.ssh_command, &args.host, &remote_cmd).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
@@ -115,16 +100,14 @@ fn main() {
     std::process::exit(exit_status.code().unwrap_or(1));
 }
 
-/// Try to launch a mosh server on the remote host via SSH and parse the MOSH CONNECT line.
-fn try_launch_server(
-    ssh_command: &str,
-    host: &str,
+/// Build the remote server command string with all arguments.
+fn build_server_cmd(
     server_path: &str,
     resolved_ip: &Option<String>,
     server_log_file: &Option<String>,
     no_daemonize: bool,
     command: &[String],
-) -> Option<ConnectInfo> {
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(server_path.to_string());
     parts.push("new".to_string());
@@ -136,7 +119,6 @@ fn try_launch_server(
         parts.push("-s".to_string());
     }
 
-    // Locale vars from client (like stock mosh, before --)
     let locale_vars = ["LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
         "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
         "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL"];
@@ -161,7 +143,16 @@ fn try_launch_server(
         parts.extend(command.iter().cloned());
     }
 
-    let mut remote_cmd = parts.join(" ");
+    parts.join(" ")
+}
+
+/// Run a remote command via SSH and extract MOSH CONNECT info from stdout.
+fn try_launch_server(
+    ssh_command: &str,
+    host: &str,
+    remote_cmd: &str,
+) -> Option<ConnectInfo> {
+    let mut remote_cmd = remote_cmd.to_string();
 
     if let Ok(val) = std::env::var("RUST_LOG") {
         remote_cmd = format!("RUST_LOG={val} {remote_cmd}");
