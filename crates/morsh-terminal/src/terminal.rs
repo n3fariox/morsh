@@ -111,7 +111,6 @@ impl MoshTerminal {
             libghostty_vt::render::RowIterator::new().map_err(|e| format!("RowIterator::new: {e:?}"))?;
         let mut cell_iter = libghostty_vt::render::CellIterator::new()
             .map_err(|e| format!("CellIterator::new: {e:?}"))?;
-        let mut buf = String::new();
 
         let row_iteration = row_iter
             .update(&snapshot)
@@ -131,13 +130,10 @@ impl MoshTerminal {
                 {
                     let mut ci = cell_iteration;
                     while let Some(cell) = ci.next() {
-                        buf.clear();
-                        let _ = cell.graphemes_utf8(&mut buf);
-                        let text = if buf.is_empty() {
-                            String::new()
-                        } else {
-                            buf.clone()
-                        };
+                        let graphemes = cell
+                            .graphemes()
+                            .map_err(|_| format!("Cell::graphemes failed"))?;
+                        let text: String = graphemes.iter().collect();
 
                         let style = match cell.style() {
                             Ok(s) => convert_style(&s),
