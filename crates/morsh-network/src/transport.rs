@@ -194,12 +194,14 @@ impl TransportSender {
         }
     }
 
-    /// Build a shutdown instruction (no diff).
+    /// Build a shutdown instruction (no diff, sentinel new_num = u64::MAX).
+    /// Stock mosh uses SHUTDOWN_NEW_NUM = uint64_t(-1) to distinguish
+    /// shutdown from empty keepalive ACKs.
     pub fn build_shutdown_instruction(&mut self, ack_num: u64) -> TransportInstruction {
         TransportInstruction {
             protocol_version: Some(MORSH_PROTOCOL_VERSION),
             old_num: Some(self.state_num),
-            new_num: Some(self.state_num),
+            new_num: Some(u64::MAX),
             ack_num: Some(ack_num),
             throwaway_num: Some(self.throwaway_num),
             diff: None,
@@ -384,8 +386,8 @@ impl Transport {
                 // Update our ack tracking
                 self.receiver.record_ack_sent(diff.ack_num);
 
-                // Check if this is a shutdown
-                if diff.diff.is_empty() && diff.old_num == diff.new_num {
+                // Check if this is a shutdown (sentinel new_num == u64::MAX, like stock mosh)
+                if diff.diff.is_empty() && diff.new_num == u64::MAX {
                     self.receiver.set_shutdown_received();
                 }
 
@@ -545,7 +547,7 @@ mod tests {
         let inst = sender.build_shutdown_instruction(1);
         assert!(inst.diff.is_none());
         assert_eq!(inst.old_num, Some(1));
-        assert_eq!(inst.new_num, Some(1));
+        assert_eq!(inst.new_num, Some(u64::MAX));
     }
 
     #[test]

@@ -548,6 +548,9 @@ async fn run_server(
                             let _ = transport.send_diff(diff, ack_num, throwaway).await;
                             transport.sender.advance_state();
                         }
+                        // Send shutdown marker so the client exits promptly
+                        let ack_num = transport.receiver.remote_state_num();
+                        let _ = transport.send_shutdown(ack_num).await;
                         break Ok(());
                     }
                 }
