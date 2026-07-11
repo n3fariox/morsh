@@ -22,6 +22,20 @@ pub struct Connection {
     last_heard: Instant,
     /// Send nonce sequence counter. Each send increments this.
     send_seq: u64,
+    /// Last received timestamp for RTT calculation (stock mosh compatible).
+    saved_timestamp: u16,
+    /// When the saved_timestamp was received.
+    saved_timestamp_received_at: Instant,
+}
+
+/// Current time in milliseconds as a 16-bit value (mod 65536), never 0xFFFF.
+fn timestamp16() -> u16 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let ts = (ms % 65536) as u16;
+    if ts == 0xFFFF { 0 } else { ts }
 }
 
 /// Create a UDP socket, set nonblocking, and apply ECN marking (ECT(0)).
@@ -59,6 +73,8 @@ impl Connection {
             has_remote_addr: false,
             last_heard: now,
             send_seq: 0,
+            saved_timestamp: 0,
+            saved_timestamp_received_at: now,
         })
     }
 
@@ -80,6 +96,8 @@ impl Connection {
             has_remote_addr: false,
             last_heard: now,
             send_seq: 0,
+            saved_timestamp: 0,
+            saved_timestamp_received_at: now,
         })
     }
 
@@ -132,28 +150,36 @@ impl Connection {
         let socket_count = self.sockets.len();
         for idx in 0..socket_count {
             let result = if self.server && !self.has_remote_addr {
-                // Server uses recv_from to learn client address
-                let (len, peer) = match self.sockets[idx].recv_from(&mut buf).await {
-                    Ok(r) => r,
-                    Err(e) => return Err(format!("Recv error: {e}")),
-                };
-                // Learn client address
-                self.remote_addr = Some(peer);
-                self.has_remote_addr = true;
-                log::info!("Learned client address: {peer}");
-                Ok(len)
+                self.sockets[idx].recv_from(&mut buf).await
+                    .map(|(len, peer)| (len, Some(peer)))
             } else {
-                self.sockets[idx].try_recv(&mut buf)
+                self.sockets[idx].recv_from(&mut buf).await
+                    .map(|(len, _)| (len, None))
             };
 
             match result {
-                Ok(len) => {
+                Ok((len, Some(peer))) if len > 0 => {
+                    if !self.has_remote_addr {
+                        self.remote_addr = Some(peer);
+                        self.has_remote_addr = true;
+                        log::info!("Learned client address: {peer}");
+                    }
+                    log::debug!("Received {} bytes from socket {}", len, idx);
                     let data = buf[..len].to_vec();
                     let frag = self.decrypt_fragment(&data)?;
                     self.last_heard = Instant::now();
                     self.last_roundtrip_success = Instant::now();
                     return self.assembler.add_fragment(frag);
                 }
+                Ok((len, _)) if len > 0 => {
+                    log::debug!("Received {} bytes from socket {}", len, idx);
+                    let data = buf[..len].to_vec();
+                    let frag = self.decrypt_fragment(&data)?;
+                    self.last_heard = Instant::now();
+                    self.last_roundtrip_success = Instant::now();
+                    return self.assembler.add_fragment(frag);
+                }
+                Ok(_) => continue,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(format!("Recv error: {e}")),
             }
@@ -199,13 +225,34 @@ impl Connection {
     }
 
     /// Encrypt a fragment (public for testing).
+    /// Stock mosh message format: [timestamp 2B BE] [timestamp_reply 2B BE] [fragment data]
     pub fn encrypt_fragment(&mut self, frag: &Fragment) -> Result<Vec<u8>, String> {
-        let plaintext = frag.to_bytes();
+        let frag_bytes = frag.to_bytes();
+        // Build timestamps (stock mosh compatible):
+        // timestamp = current ms mod 65536 (never 0xFFFF)
+        // timestamp_reply = 0xFFFF (no reply), or corrected echo of received timestamp
+        let ts = timestamp16();
+        let ts_reply = {
+            let elapsed = Instant::now().duration_since(self.saved_timestamp_received_at);
+            if elapsed.as_millis() < 1000 && self.saved_timestamp != 0 {
+                self.saved_timestamp.wrapping_add(elapsed.as_millis() as u16)
+            } else {
+                0xFFFF
+            }
+        };
+
+        let mut plaintext = Vec::with_capacity(4 + frag_bytes.len());
+        plaintext.extend_from_slice(&ts.to_be_bytes());
+        plaintext.extend_from_slice(&ts_reply.to_be_bytes());
+        plaintext.extend_from_slice(&frag_bytes);
+
         // Build nonce: direction bit (bit 63) + sequence number
+        // Stock mosh convention: TO_SERVER = 0, TO_CLIENT = 1 << 63
+        // Client→Server uses TO_SERVER (0), Server→Client uses TO_CLIENT (1<<63)
         let nonce_val = if self.server {
-            self.send_seq // Server sends without high bit
+            (1u64 << 63) | self.send_seq // Server→Client: TO_CLIENT
         } else {
-            (1u64 << 63) | self.send_seq // Client sends with high bit set
+            self.send_seq // Client→Server: TO_SERVER
         };
         let nonce = Nonce::from_val(nonce_val);
         self.send_seq += 1;
@@ -217,7 +264,40 @@ impl Connection {
     fn decrypt_fragment(&mut self, data: &[u8]) -> Result<Fragment, String> {
         let msg = self.session.decrypt(data)
             .map_err(|e| format!("Decryption error: {e}"))?;
-        Fragment::from_bytes(&msg.text)
+        log::debug!("Decrypted {} -> {} bytes", data.len(), msg.text.len());
+        // Stock mosh message format: [timestamp 2B BE] [timestamp_reply 2B BE] [fragment data]
+        if msg.text.len() < 4 {
+            return Err(format!("Message too short: {} bytes", msg.text.len()));
+        }
+        let timestamp = u16::from_be_bytes([msg.text[0], msg.text[1]]);
+        let timestamp_reply = u16::from_be_bytes([msg.text[2], msg.text[3]]);
+        log::debug!("Timestamps: ts={}, ts_reply={}", timestamp, timestamp_reply);
+
+        // Save received timestamp for echo reply (stock mosh compatible)
+        if timestamp != 0xFFFF {
+            self.saved_timestamp = timestamp;
+            self.saved_timestamp_received_at = Instant::now();
+        }
+
+        // Compute RTT from timestamp_reply (corrected echo of our sent timestamp)
+        if timestamp_reply != 0xFFFF {
+            let now = timestamp16();
+            let rtt = now.wrapping_sub(timestamp_reply) as i32;
+            if rtt > 0 && rtt < 5000 {
+                self.rtt.update(rtt as u64);
+                log::debug!("RTT measurement: {}ms", rtt);
+            }
+        }
+
+        let frag_bytes = &msg.text[4..];
+        if msg.text.len() >= 14 {
+            let hex: Vec<String> = frag_bytes.iter().take(30).map(|b| format!("{:02x}", b)).collect();
+            log::debug!("Fragment data first {} bytes: [{}]", hex.len(), hex.join(" "));
+        }
+        let frag = Fragment::from_bytes(frag_bytes)?;
+        log::debug!("Fragment: id={}, final={}, frag_num={}, payload_len={}",
+            frag.id, frag.final_flag, frag.fragment_num, frag.payload.len());
+        Ok(frag)
     }
 }
 

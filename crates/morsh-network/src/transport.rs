@@ -174,14 +174,16 @@ impl TransportSender {
     }
 
     /// Build a TransportInstruction for a state diff.
+    /// old_num = last sent state num, new_num = current state num.
+    /// Matches stock mosh: old_num = assumed_receiver_state->num, new_num = back()->num + 1
     pub fn build_instruction(
         &mut self,
         diff: Vec<u8>,
         ack_num: u64,
         throwaway_num: u64,
     ) -> TransportInstruction {
-        let old_num = self.acked_state_num;
-        let new_num = self.state_num;
+        let old_num = self.state_num;
+        let new_num = self.state_num + 1;
 
         TransportInstruction {
             protocol_version: Some(MORSH_PROTOCOL_VERSION),
@@ -377,6 +379,8 @@ impl Transport {
                 }
 
                 let diff = TransportReceiver::parse_instruction(&inst);
+                log::debug!("recv_diff: old={} new={} ack={} diff_len={}",
+                    diff.old_num, diff.new_num, diff.ack_num, diff.diff.len());
 
                 // Track the remote's state number for acks
                 if diff.new_num > self.receiver.remote_state_num {
@@ -385,6 +389,15 @@ impl Transport {
 
                 // Update our ack tracking
                 self.receiver.record_ack_sent(diff.ack_num);
+                // Record sender's ack of our states
+                self.sender.record_ack(diff.ack_num);
+
+                // Send immediate ACK to prevent server retransmission
+                // Stock mosh retransmits aggressively if not ACKed within ~8ms.
+                if !diff.diff.is_empty() {
+                    self.send_ack(diff.new_num).await?;
+                    log::debug!("Sent immediate ACK for server state {}", diff.new_num);
+                }
 
                 // Check if this is a shutdown (sentinel new_num == u64::MAX, like stock mosh)
                 if diff.diff.is_empty() && diff.new_num == u64::MAX {
@@ -393,7 +406,10 @@ impl Transport {
 
                 Ok(Some(diff))
             }
-            None => Ok(None),
+            None => {
+                log::trace!("recv_diff: no instruction ready");
+                Ok(None)
+            }
         }
     }
 
@@ -408,6 +424,7 @@ impl Transport {
     }
 
     /// Send an empty ACK (no diff). Used for delayed ACKs and periodic ACKs.
+    /// Advances state number just like a data send, to avoid new_num collision on the receiver.
     pub async fn send_ack(&mut self, ack_num: u64) -> Result<(), String> {
         let mut inst = self.sender.build_instruction(Vec::new(), ack_num, self.sender.throwaway_num);
         let chaff_byte = (self.sender.state_num() & 0xFF) as u8;
@@ -415,6 +432,7 @@ impl Transport {
         self.connection.send(&inst).await?;
         let now = Instant::now();
         self.sender.record_send(now);
+        self.sender.advance_state();
         self.receiver.ack_sent(now);
         Ok(())
     }

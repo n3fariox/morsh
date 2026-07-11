@@ -1,6 +1,4 @@
 use crate::constants::{CHAFF_MAX, FRAG_HEADER_LEN};
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use morsh_proto::transport::Instruction as TransportInstruction;
 use prost::Message;
@@ -20,7 +18,8 @@ impl Fragment {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(FRAG_HEADER_LEN + self.payload.len());
         buf.extend_from_slice(&self.id.to_be_bytes());
-        let combined = ((self.final_flag as u16) << 15) | (self.fragment_num & 0x7FFF);
+        // Stock mosh convention: bit 15 = final_flag (1 = final/only fragment, 0 = more fragments follow)
+        let combined = (self.final_flag as u16) << 15 | (self.fragment_num & 0x7FFF);
         buf.extend_from_slice(&combined.to_be_bytes());
         buf.extend_from_slice(&self.payload);
         buf
@@ -33,6 +32,7 @@ impl Fragment {
         }
         let id = u64::from_be_bytes(data[0..8].try_into().unwrap());
         let combined = u16::from_be_bytes(data[8..10].try_into().unwrap());
+        // Stock mosh: bit 15 = final_flag (1 = final/only fragment, 0 = more fragments follow)
         let final_flag = (combined >> 15) & 1 == 1;
         let fragment_num = combined & 0x7FFF;
         let payload = data[FRAG_HEADER_LEN..].to_vec();
@@ -53,6 +53,7 @@ impl Default for Fragmenter {
 
 impl Fragmenter {
     pub fn new() -> Self {
+        log::info!("Using raw deflate compression (stock mosh compatible)");
         Self { next_id: 1 }
     }
 
@@ -144,6 +145,9 @@ impl FragmentAssembly {
 
     /// Add a fragment. Returns a complete Instruction if all fragments have arrived.
     pub fn add_fragment(&mut self, frag: Fragment) -> Result<Option<TransportInstruction>, String> {
+        log::debug!("add_fragment: id={}, frag_num={}, final={}, payload_len={}",
+            frag.id, frag.fragment_num, frag.final_flag, frag.payload.len());
+
         if frag.final_flag {
             self.final_flags.insert(frag.id, frag.fragment_num);
         }
@@ -161,11 +165,19 @@ impl FragmentAssembly {
                 }
                 self.pending.remove(&frag.id);
                 self.final_flags.remove(&frag.id);
+                log::debug!("Assembled {} fragments, {} compressed bytes", expected_count, data.len());
                 let decompressed = decompress(&data)?;
+                log::debug!("Decompressed to {} bytes, decoding protobuf", decompressed.len());
                 let inst = TransportInstruction::decode(decompressed.as_slice())
                     .map_err(|e| format!("Protobuf decode error: {e}"))?;
+                log::debug!("Decoded TransportInstruction: old={:?} new={:?} ack={:?} diff_len={:?}",
+                    inst.old_num, inst.new_num, inst.ack_num, inst.diff.as_ref().map(|d| d.len()));
                 return Ok(Some(inst));
+            } else {
+                log::debug!("Waiting for more fragments: have {}, need {}", entry.len(), expected_count);
             }
+        } else {
+            log::debug!("No final flag yet for id={}", frag.id);
         }
 
         Ok(None)
@@ -184,16 +196,46 @@ fn encode_instruction(inst: &TransportInstruction) -> Vec<u8> {
     buf
 }
 
+/// Stock mosh payload format: [2-byte new_num BE] [2-byte flags] [zlib compressed data]
+/// The 4-byte header is plaintext; the rest is zlib-compressed TransportInstruction.
 fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data).map_err(|e| format!("Compression error: {e}"))?;
-    encoder.finish().map_err(|e| format!("Compression finish error: {e}"))
+    let compressed = encoder.finish().map_err(|e| format!("Compression finish error: {e}"))?;
+    log::debug!("Compressed {} -> {} bytes (zlib)", data.len(), compressed.len());
+    Ok(compressed)
 }
 
 fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut decoder = ZlibDecoder::new(data);
+    // Skip 4-byte plaintext prefix if present: [new_num BE] [flags]
+    // Stock mosh prepends this before the zlib stream.
+    let zlib_start = if data.len() >= 4 {
+        // Check if first 4 bytes look like a stock mosh prefix (state+flags) rather than deflate
+        // A raw deflate first byte can be 0x00-0x03 (stored), 0x48-0x4B (fixed Huffman), etc.
+        // If bytes 0-1 look like a small BE u16 (state num), it's probably a prefix.
+        let maybe_state = u16::from_be_bytes([data[0], data[1]]);
+        let maybe_flags = u16::from_be_bytes([data[2], data[3]]);
+        if maybe_flags == 0x8000 && maybe_state < 1024 {
+            log::debug!("Detected 4-byte stock mosh prefix: state={}, flags=0x{:04x}", maybe_state, maybe_flags);
+            4
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let compressed = &data[zlib_start..];
+    if !data.is_empty() {
+        let first_bytes: Vec<String> = compressed.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        log::debug!("Compressed data first {} bytes: [{}]", first_bytes.len(), first_bytes.join(" "));
+    }
+
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
     let mut output = Vec::new();
-    decoder.read_to_end(&mut output).map_err(|e| format!("Decompression error: {e}"))?;
+    decoder.read_to_end(&mut output)
+        .map_err(|e| format!("Zlib decompression error: {e} (data_len={}, header_skip={})", data.len(), zlib_start))?;
+    log::debug!("Decompressed {} -> {} bytes (zlib, skip={} header)", data.len(), output.len(), zlib_start);
     Ok(output)
 }
 
