@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+const ESCAPE_KEY: u8 = 0x1E; // Ctrl-^ (Ctrl-Shift-6) — stock mosh escape
+
 enum TermEvent {
     Key(Vec<u8>),
     Resize(i32, i32),
@@ -160,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prediction.set_send_interval(transport.sender.send_interval_ms());
 
     let mut notifications = NotificationEngine::new();
-    notifications.set_escape_key_string("Ctrl-c .".to_string());
+    notifications.set_escape_key_string("Ctrl-^ .".to_string());
 
     user_stream.push_resize(cols as i32, rows as i32);
 
@@ -173,15 +175,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use spawn instead of spawn_local (no LocalSet available)
     let input_handle = tokio::spawn(async move {
         let mut events = EventStream::new();
+        let mut escape_started = false;
         while let Some(Ok(event)) = events.next().await {
+            let mut handle_bytes = |bytes: Vec<u8>| {
+                // Stock mosh escape sequence: Ctrl-^ (0x1E) then '.' to quit
+                if escape_started {
+                    if bytes.len() == 1 {
+                        match bytes[0] {
+                            b'.' => {
+                                let _ = term_tx.try_send(TermEvent::Quit);
+                                return;
+                            }
+                            0x1A => { /* suspend - not yet implemented */ }
+                            ESCAPE_KEY => {
+                                // Send literal escape key
+                                let _ = term_tx.try_send(TermEvent::Key(vec![ESCAPE_KEY]));
+                            }
+                            other => {
+                                // Send escape + the byte literally
+                                let mut both = vec![ESCAPE_KEY];
+                                both.push(other);
+                                let _ = term_tx.try_send(TermEvent::Key(both));
+                            }
+                        }
+                    } else {
+                        let mut both = vec![ESCAPE_KEY];
+                        both.extend(bytes);
+                        let _ = term_tx.try_send(TermEvent::Key(both));
+                    }
+                    escape_started = false;
+                    return;
+                }
+                // Check for escape key (Ctrl-^)
+                if bytes.len() == 1 && bytes[0] == ESCAPE_KEY {
+                    escape_started = true;
+                    return;
+                }
+                let _ = term_tx.try_send(TermEvent::Key(bytes));
+            };
             match event {
                 Event::Key(KeyEvent { code, modifiers, kind: crossterm::event::KeyEventKind::Press, .. }) => {
                     let mut bytes = Vec::new();
                     match code {
-                        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                            let _ = term_tx.send(TermEvent::Quit).await;
-                            return;
-                        }
                         KeyCode::Char(ch) => {
                             if modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii_lowercase() {
                                 bytes.push((ch as u8) - b'a' + 1);
@@ -226,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                     if !bytes.is_empty() {
-                        let _ = term_tx.send(TermEvent::Key(bytes)).await;
+                        handle_bytes(bytes);
                     }
                 }
                 Event::Resize(w, h) => {
@@ -282,11 +317,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let frame = transport.sender.state_num();
                         prediction.set_local_frame_sent(frame);
 
-                        // DISABLED: overlay writes at predicted positions that may not match
-                        // server echo, causing visible character duplication.
-                        // if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
-                        //     log::debug!("Overlay render error: {e}");
-                        // }
+                        if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
+                            log::debug!("Overlay render error: {e}");
+                        }
 
                         // Send keystroke immediately if enough time has passed since last send
                         let now = std::time::Instant::now();
@@ -360,10 +393,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Render prediction overlay (underlined characters for pending predictions)
-                        // DISABLED: conflicts with server echo causing character duplication
-                        // if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
-                        //     log::debug!("Overlay render error: {e}");
-                        // }
+                        if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
+                            log::debug!("Overlay render error: {e}");
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {
