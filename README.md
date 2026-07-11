@@ -52,6 +52,10 @@ The `morsh` wrapper SSHes to the remote host, starts `morsh-server`, parses the 
 - **Escape sequence** — Ctrl-^ (`0x1E`) then `.` to quit; Ctrl-^ twice sends literal `0x1E`
 - **Cross-platform** — Linux, macOS, Windows
 
+## Disclaimer
+
+This codebase was heavily AI-generated (by [opencode](https://opencode.ai) / Claude) and is not audited for correctness or security. Use at your own risk.
+
 ## License
 
 GNU General Public License v3.0 or later — see [LICENSE](LICENSE).
