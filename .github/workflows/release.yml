@@ -8,7 +8,6 @@ on:
 env:
   ZIG_VERSION: "0.15.2"
   PROTOC_VERSION: "29.3"
-  GHOSTTY_COMMIT: "fdbf9ff3a31d7531b691cb49c98fc465a1a503a0"
 
 permissions:
   contents: write
@@ -30,8 +29,10 @@ jobs:
             zig_ext: zip
 
     steps:
-      - name: Checkout
+      - name: Checkout submodules
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -75,23 +76,6 @@ jobs:
           path: ~/.cache/zig
           key: zig-${{ env.ZIG_VERSION }}-${{ matrix.os }}
 
-      - name: Clone ghostty
-        shell: bash
-        run: |
-          GHOSTTY_SRC="${{ runner.temp }}/ghostty"
-          if [ ! -d "$GHOSTTY_SRC" ] || [ ! -f "$GHOSTTY_SRC/.ghostty-commit" ] || [ "$(cat "$GHOSTTY_SRC/.ghostty-commit")" != "${{ env.GHOSTTY_COMMIT }}" ]; then
-            rm -rf "$GHOSTTY_SRC"
-            git clone --filter=blob:none https://github.com/ghostty-org/ghostty.git "$GHOSTTY_SRC"
-            git -C "$GHOSTTY_SRC" checkout ${{ env.GHOSTTY_COMMIT }}
-            echo "${{ env.GHOSTTY_COMMIT }}" > "$GHOSTTY_SRC/.ghostty-commit"
-          fi
-
-      - name: Cache ghostty source
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/ghostty
-          key: ghostty-${{ env.GHOSTTY_COMMIT }}
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
@@ -100,7 +84,7 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
+          GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
           CC: zig
           CFLAGS: "-target x86_64-linux-musl"
@@ -111,7 +95,7 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          GHOSTTY_SOURCE_DIR: ${{ runner.temp }}/ghostty
+          GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
       - name: Package (Linux)
