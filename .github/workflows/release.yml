@@ -86,7 +86,7 @@ jobs:
         env:
           GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
-          CC: zig
+          CC: zig cc
           CFLAGS: "-target x86_64-linux-musl"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zig
 
