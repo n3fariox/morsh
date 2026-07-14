@@ -287,6 +287,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut send_timer = tokio::time::interval(send_interval);
     send_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Handshake: wait for server response with timeout and retry
+    let mut handshake_retries = 0;
+    const MAX_HANDSHAKE_RETRIES: u32 = 10;
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+    let mut handshake_deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+
     log::info!("Entering event loop");
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
@@ -410,8 +416,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prediction.set_send_interval(rtt_ms);
             }
             _ = send_timer.tick() => {
-                // Check for connection loss (no data from server for 15s)
                 let now = std::time::Instant::now();
+
+                // Handshake timeout: retransmit initial diff if no server response yet
+                if handshake_retries < MAX_HANDSHAKE_RETRIES && now >= handshake_deadline {
+                    handshake_retries += 1;
+                    handshake_deadline = now + HANDSHAKE_TIMEOUT;
+                    log::warn!("Handshake timeout ({}/{}), retransmitting initial diff", handshake_retries, MAX_HANDSHAKE_RETRIES);
+                    let init_diff = user_stream.diff_from(&UserStream::new());
+                    if !init_diff.is_empty() {
+                        let ack_num = transport.receiver.remote_state_num();
+                        let throwaway = transport.sender.throwaway_num();
+                        if let Err(e) = transport.send_diff(init_diff, ack_num, throwaway).await {
+                            log::warn!("Handshake retransmit failed: {e}");
+                        }
+                    }
+                } else if handshake_retries > 0 {
+                    // Handshake succeeded (we got a response)
+                    handshake_retries = 0;
+                }
+
+                // Check for connection loss (no data from server for 15s)
                 if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(15) {
                     log::info!("Connection lost (no server response for 15s)");
                     break Ok(());

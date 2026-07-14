@@ -33,9 +33,9 @@ fn get_ssh_connection_ip() -> Option<String> {
     None
 }
 
-/// Fork and create a new session (Unix) or detach from console (Windows).
+/// Fork and create a new session (Unix) or spawn a breakaway process (Windows).
 /// Returns true in the child process, false in the parent.
-fn fork_and_detach() -> bool {
+fn fork_and_detach(_port: u16) -> bool {
     #[cfg(unix)]
     {
         log::info!("Forking to daemonize...");
@@ -61,15 +61,82 @@ fn fork_and_detach() -> bool {
     }
     #[cfg(windows)]
     {
-        // Windows: detach from the SSH console
-        extern "system" {
-            fn FreeConsole() -> i32;
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, STARTUPINFOW, PROCESS_INFORMATION, DETACHED_PROCESS,
+            CREATE_BREAKAWAY_FROM_JOB,
+        };
+
+        log::info!("Spawning detached child process via CreateProcess");
+
+        let exe = std::env::current_exe().expect("morsh-server: failed to get executable path");
+
+        // Reconstruct command line from current args
+        let args: Vec<String> = std::env::args().collect();
+        let mut cmd_line = exe.display().to_string();
+        if cmd_line.contains(' ') {
+            cmd_line = format!("\"{}\"", cmd_line);
         }
-        unsafe { FreeConsole(); }
-        true
+        for arg in &args[1..] {
+            cmd_line.push(' ');
+            if arg.contains(' ') {
+                cmd_line.push_str(&format!("\"{}\"", arg));
+            } else {
+                cmd_line.push_str(arg);
+            }
+        }
+        let mut cmd_wide: Vec<u16> =
+            OsStr::new(&cmd_line).encode_wide().chain(Some(0)).collect();
+
+        let exe_wide: Vec<u16> =
+            OsStr::new(exe.as_os_str()).encode_wide().chain(Some(0)).collect();
+
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // Use parent's environment (MORSH_DAEMON_CHILD and MORSH_DAEMON_PORT
+        // are already set by the caller).
+        let result = unsafe {
+            CreateProcessW(
+                exe_wide.as_ptr(),
+                cmd_wide.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // bInheritHandles = false (don't pass SSH pipes to child)
+                DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                std::ptr::null(), // inherit parent's environment
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+
+        if result == 0 {
+            let err = unsafe { GetLastError() };
+            eprintln!(
+                "morsh-server: WARNING failed to spawn daemon child (error {}), \
+                 falling back to in-process mode (will exit when SSH disconnects)",
+                err
+            );
+            // Fall through — keep running in the parent process so the
+            // server still starts. The wrapper already has the MOSH CONNECT line.
+            return false;
+        }
+
+        // Close process/thread handles — child runs independently
+        unsafe {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+
+        std::process::exit(0);
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = _port;
         true
     }
 }
@@ -124,7 +191,6 @@ fn redirect_stdio() {
 }
 
 fn main() {
-    env_logger::init();
 
     let args: Vec<String> = env::args().collect();
 
@@ -238,6 +304,15 @@ fn main() {
         }
         i += 1;
     }
+    let is_daemon_child = env::var("MORSH_DAEMON_CHILD").is_ok();
+    if is_daemon_child {
+        if let Ok(port_str) = env::var("MORSH_DAEMON_PORT") {
+            if let Ok(port_val) = port_str.parse::<u16>() {
+                bind_port = port_val;
+            }
+        }
+    }
+ 
 
     let shell = if command_args.is_empty() {
         env::var("SHELL").unwrap_or_else(|_| {
@@ -295,17 +370,33 @@ fn main() {
     drop(sock); // Release the port; tokio will rebind
 
     // Print MORSH CONNECT before forking so the wrapper can read it
-    println!("MOSH CONNECT {} {}", port, key.printable_key());
-    println!("MOSH CONNECTION ID: 1");
-    std::io::stdout().flush().unwrap();
+    if !is_daemon_child {
+        println!("MOSH CONNECT {} {}", port, key.printable_key());
+        println!("MOSH CONNECTION ID: 1");
+        std::io::stdout().flush().unwrap();
+        log::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
+    }
 
-    log::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
-
-    if no_daemonize {
-        log::info!("No-daemonize mode, skipping fork and stdio redirect");
+    if no_daemonize || is_daemon_child {
+        if is_daemon_child {
+            // Daemon child (detached process): redirect stdio to NUL
+            redirect_stdio();
+        }
+        env_logger::init();
+        if is_daemon_child {
+            log::info!("Daemon child mode, stdio redirected to NUL");
+        } else {
+            log::info!("No-daemonize mode, skipping fork and stdio redirect");
+        }
     } else {
+        // Store port and mark as daemon child for the spawned process
+        env::set_var("MORSH_DAEMON_CHILD", "1");
+        env::set_var("MORSH_DAEMON_PORT", port.to_string());
+
+        log::info!("Preparing to daemonize (port {port})");
+
         // Fork: parent exits, child detaches and runs the server
-        if !fork_and_detach() {
+        if !fork_and_detach(port) {
             // Parent already exited via fork_and_detach
             unreachable!();
         }
@@ -349,6 +440,9 @@ fn main() {
                 }
             }
         }
+
+        // Initialize env_logger AFTER fork and log file redirection
+        env_logger::init();
 
         log::info!("Stdio redirected to /dev/null");
     }
@@ -451,9 +545,15 @@ async fn run_server(
         // Interactive shell mode — spawn shell directly
         CommandBuilder::new(&shell)
     } else {
-        // Command mode (-e CMD...) — run through sh -c like stock mosh
+        // Command mode (-e CMD...) — run through shell -c like stock mosh
         let full_cmd = command_args.join(" ");
+        #[cfg(windows)]
+        let mut c = CommandBuilder::new("cmd.exe");
+        #[cfg(not(windows))]
         let mut c = CommandBuilder::new("/bin/sh");
+        #[cfg(windows)]
+        c.arg("/c");
+        #[cfg(not(windows))]
         c.arg("-c");
         c.arg(full_cmd);
         c
