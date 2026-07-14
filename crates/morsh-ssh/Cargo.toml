@@ -7,7 +7,7 @@ description = "Pure-Rust SSH connectivity using russh. Replaces system ssh(1) de
 
 [dependencies]
 log = "0.4"
-russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "rsa"] }
+russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
 russh-keys = "0.49"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
