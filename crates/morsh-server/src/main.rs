@@ -380,11 +380,55 @@ fn main() {
     if no_daemonize || is_daemon_child {
         if is_daemon_child {
             // Daemon child (detached process): redirect stdio to NUL
+            // and route logging to a file.
             redirect_stdio();
+
+            // Determine log file path: user-specified --log-file, or a default
+            // in the temp directory.
+            let log_path = log_file_path.clone().unwrap_or_else(|| {
+                let dir = std::env::temp_dir();
+                dir.join(format!("morsh-server-{}.log", std::process::id()))
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(file) => {
+                    // Before env_logger init, redirect stderr to the log file
+                    // handle so all env_logger output lands there.
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::io::AsRawHandle;
+                        unsafe {
+                            windows_sys::Win32::System::Console::SetStdHandle(
+                                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+                                file.as_raw_handle(),
+                            );
+                        }
+                        // SetStdHandle stores the raw handle value; prevent
+                        // the File from closing it when dropped.
+                        std::mem::forget(file);
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        unsafe { libc::dup2(file.as_raw_fd(), 2); }
+                    }
+                }
+                Err(e) => {
+                    // Stderr is NUL at this point — this message is invisible
+                    // but the process continues without file logging.
+                    let _ = e;
+                }
+            }
         }
         env_logger::init();
         if is_daemon_child {
-            log::info!("Daemon child mode, stdio redirected to NUL");
+            log::info!("Daemon child mode, stdio redirected to NUL, logging to file");
         } else {
             log::info!("No-daemonize mode, skipping fork and stdio redirect");
         }
@@ -392,6 +436,8 @@ fn main() {
         // Store port and mark as daemon child for the spawned process
         env::set_var("MORSH_DAEMON_CHILD", "1");
         env::set_var("MORSH_DAEMON_PORT", port.to_string());
+        // Pass the encryption key so the child can decrypt client data
+        env::set_var("MORSH_KEY", key.printable_key());
 
         log::info!("Preparing to daemonize (port {port})");
 
@@ -403,8 +449,8 @@ fn main() {
 
         log::info!("Child process continuing after fork, detaching from SSH");
 
-        // Open log file BEFORE redirecting stdio, so errors are visible on stderr
-        let log_file = log_file_path.as_ref().and_then(|path| {
+        // Open log file BEFORE redirecting stdio so errors are visible on stderr
+        let mut log_file = if let Some(ref path) = log_file_path {
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -419,16 +465,20 @@ fn main() {
                     None
                 }
             }
-        });
+        } else {
+            None
+        };
 
         // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
         redirect_stdio();
 
-        // After redirect, dup log file onto stderr so env_logger output lands there
-        if let Some(file) = log_file {
+        // After redirect, dup log file onto stderr so env_logger output lands there.
+        if let Some(ref file) = log_file {
             #[cfg(unix)] {
                 use std::os::unix::io::AsRawFd;
                 unsafe { libc::dup2(file.as_raw_fd(), 2); }
+                // Since dup2 created a new fd reference, the original can be safely
+                // dropped — but we let log_file live to end of main() anyway.
             }
             #[cfg(windows)] {
                 use std::os::windows::io::AsRawHandle;
@@ -438,6 +488,9 @@ fn main() {
                         file.as_raw_handle(),
                     );
                 }
+                // SetStdHandle stores the raw handle; prevent the File from
+                // closing it when dropped.  The handle lives until process exit.
+                std::mem::forget(log_file.take().unwrap());
             }
         }
 
