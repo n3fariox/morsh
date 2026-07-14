@@ -244,7 +244,7 @@ fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
 
 #[cfg(not(unix))]
 fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
-    use std::io::{BufRead, Write};
+    use std::io::Write;
     let prompt = format!("Enter passphrase for {}: ", path.display());
     print!("{}", prompt);
     std::io::stdout().flush().ok();
