@@ -771,6 +771,25 @@ async fn run_server(
                 if !transport.connection().has_remote() {
                     continue;
                 }
+
+                // Check if the shell child process has exited.  On Windows
+                // ConPty the PTY reader may never return EOF, so we detect
+                // exit via the child process handle instead.
+                if let Ok(Some(status)) = child.try_wait() {
+                    log::info!("Child process exited with status {}", status.exit_code());
+                    let diff = terminal_state.diff_from(&client_assumed_state);
+                    if !diff.is_empty() {
+                        let ack_num = transport.receiver.remote_state_num();
+                        let throwaway = transport.sender.throwaway_num();
+                        let _ = transport.send_diff(diff, ack_num, throwaway).await;
+                        transport.sender.advance_state();
+                    }
+                    let ack_num = transport.receiver.remote_state_num();
+                    let _ = transport.send_shutdown(ack_num).await;
+                    break Ok(());
+                }
+
+                // Keepalive: send empty ACK if idle
                 let now = std::time::Instant::now();
                 if now.duration_since(transport.sender.last_send_time()).as_millis() > 2000 {
                     let ack_num = transport.receiver.remote_state_num();
