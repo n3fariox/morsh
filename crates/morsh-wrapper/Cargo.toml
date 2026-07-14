@@ -9,7 +9,12 @@ description = "Morsh wrapper binary (replaces mosh.pl) - SSH launch + connection
 name = "morsh"
 path = "src/main.rs"
 
+[features]
+default = ["russh"]
+russh = ["dep:morsh-ssh"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
+morsh-ssh = { path = "../morsh-ssh", optional = true }

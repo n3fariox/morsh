@@ -1,0 +1,14 @@
+[package]
+name = "morsh-ssh"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Pure-Rust SSH connectivity using russh. Replaces system ssh(1) dependency."
+
+[dependencies]
+log = "0.4"
+russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "rsa"] }
+russh-keys = "0.49"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+libc = "0.2"

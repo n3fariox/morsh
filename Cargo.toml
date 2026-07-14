@@ -11,4 +11,5 @@ members = [
     "crates/morsh-server",
     "crates/morsh-wrapper",
     "crates/morsh-prediction",
+    "crates/morsh-ssh",
 ]
