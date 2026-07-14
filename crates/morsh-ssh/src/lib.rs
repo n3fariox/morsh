@@ -1,5 +1,3 @@
-use std::io::{BufRead, Write};
-use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -201,7 +199,11 @@ fn load_key_with_passphrase_prompt(path: &std::path::Path) -> Result<PrivateKey>
     load_secret_key(path, Some(&passphrase)).context("Failed to decrypt key with provided passphrase; is the passphrase correct?")
 }
 
+#[cfg(unix)]
 fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
+    use std::io::{BufRead, Write};
+    use std::os::fd::FromRawFd;
+
     let tty_fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR) };
     if tty_fd < 0 {
         bail!("Cannot open /dev/tty to prompt for SSH key passphrase");
@@ -237,6 +239,17 @@ fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
     }
 
     writeln!(std::io::stderr()).ok();
+    Ok(passphrase.trim_end_matches('\n').to_string())
+}
+
+#[cfg(not(unix))]
+fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
+    use std::io::{BufRead, Write};
+    let prompt = format!("Enter passphrase for {}: ", path.display());
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+    let mut passphrase = String::new();
+    std::io::stdin().read_line(&mut passphrase).ok();
     Ok(passphrase.trim_end_matches('\n').to_string())
 }
 
