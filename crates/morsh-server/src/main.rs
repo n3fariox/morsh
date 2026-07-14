@@ -426,7 +426,9 @@ fn main() {
                 }
             }
         }
-        env_logger::init();
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        ).init();
         if is_daemon_child {
             log::info!("Daemon child mode, stdio redirected to NUL, logging to file");
         } else {
@@ -495,7 +497,9 @@ fn main() {
         }
 
         // Initialize env_logger AFTER fork and log file redirection
-        env_logger::init();
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        ).init();
 
         log::info!("Stdio redirected to /dev/null");
     }

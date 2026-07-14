@@ -361,6 +361,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv_diff() => {
                 match result {
                     Ok(Some(diff)) => {
+                        // Handshake complete — stop retransmitting full state
+                        handshake_retries = 0;
+                        handshake_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(86400 * 365);
                         notifications.clear_network_error();
                         notifications.server_heard(std::time::Instant::now());
 
