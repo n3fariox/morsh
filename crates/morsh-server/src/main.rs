@@ -383,8 +383,10 @@ fn main() {
             // and route logging to a file.
             redirect_stdio();
 
-            // Determine log file path: user-specified --log-file, or a default
-            // in the temp directory.
+            // Determine log file path: user-specified --log-file, or a
+            // default in the temp directory.  On the remote machine this
+            // will be something like:
+            //   C:\Users\USER\AppData\Local\Temp\morsh-server-<PID>.log
             let log_path = log_file_path.clone().unwrap_or_else(|| {
                 let dir = std::env::temp_dir();
                 dir.join(format!("morsh-server-{}.log", std::process::id()))
@@ -398,37 +400,23 @@ fn main() {
                 .open(&log_path)
             {
                 Ok(file) => {
-                    // Before env_logger init, redirect stderr to the log file
-                    // handle so all env_logger output lands there.
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::io::AsRawHandle;
-                        unsafe {
-                            windows_sys::Win32::System::Console::SetStdHandle(
-                                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
-                                file.as_raw_handle(),
-                            );
-                        }
-                        // SetStdHandle stores the raw handle value; prevent
-                        // the File from closing it when dropped.
-                        std::mem::forget(file);
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::io::AsRawFd;
-                        unsafe { libc::dup2(file.as_raw_fd(), 2); }
-                    }
+                    env_logger::Builder::from_env(
+                        env_logger::Env::default().default_filter_or("info"),
+                    )
+                    .target(env_logger::Target::Pipe(Box::new(file)))
+                    .init();
                 }
-                Err(e) => {
-                    // Stderr is NUL at this point — this message is invisible
-                    // but the process continues without file logging.
-                    let _ = e;
+                Err(_) => {
+                    env_logger::Builder::from_env(
+                        env_logger::Env::default().default_filter_or("info"),
+                    ).init();
                 }
             }
+        } else {
+            env_logger::Builder::from_env(
+                env_logger::Env::default().default_filter_or("info"),
+            ).init();
         }
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        ).init();
         if is_daemon_child {
             log::info!("Daemon child mode, stdio redirected to NUL, logging to file");
         } else {
@@ -443,65 +431,56 @@ fn main() {
 
         log::info!("Preparing to daemonize (port {port})");
 
-        // Fork: parent exits, child detaches and runs the server
-        if !fork_and_detach(port) {
-            // Parent already exited via fork_and_detach
-            unreachable!();
-        }
+        if fork_and_detach(port) {
+            // Child process continues after fork / CreateProcessW
+            log::info!("Child process continuing after fork, detaching from SSH");
 
-        log::info!("Child process continuing after fork, detaching from SSH");
+            // Open log file (with default path in temp dir if --log-file
+            // not specified), before redirecting stdio so errors are visible.
+            let log_path = log_file_path.clone().unwrap_or_else(|| {
+                let dir = std::env::temp_dir();
+                dir.join(format!("morsh-server-{}.log", std::process::id()))
+                    .to_string_lossy()
+                    .to_string()
+            });
 
-        // Open log file BEFORE redirecting stdio so errors are visible on stderr
-        let mut log_file = if let Some(ref path) = log_file_path {
-            match std::fs::OpenOptions::new()
+            let log_file = match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
+                .open(&log_path)
             {
                 Ok(file) => {
-                    eprintln!("morsh-server: logging to {path}");
+                    eprintln!("morsh-server: logging to {log_path}");
                     Some(file)
                 }
                 Err(e) => {
-                    eprintln!("morsh-server: failed to open log file {path}: {e}");
+                    eprintln!("morsh-server: failed to open log file {log_path}: {e}");
                     None
                 }
-            }
-        } else {
-            None
-        };
+            };
 
-        // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
-        redirect_stdio();
+            // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
+            redirect_stdio();
 
-        // After redirect, dup log file onto stderr so env_logger output lands there.
-        if let Some(ref file) = log_file {
-            #[cfg(unix)] {
-                use std::os::unix::io::AsRawFd;
-                unsafe { libc::dup2(file.as_raw_fd(), 2); }
-                // Since dup2 created a new fd reference, the original can be safely
-                // dropped — but we let log_file live to end of main() anyway.
+            // Initialize env_logger, piping to the log file if available
+            if let Some(file) = log_file {
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("info"),
+                )
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .init();
+            } else {
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("info"),
+                ).init();
             }
-            #[cfg(windows)] {
-                use std::os::windows::io::AsRawHandle;
-                unsafe {
-                    windows_sys::Win32::System::Console::SetStdHandle(
-                        windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
-                        file.as_raw_handle(),
-                    );
-                }
-                // SetStdHandle stores the raw handle; prevent the File from
-                // closing it when dropped.  The handle lives until process exit.
-                std::mem::forget(log_file.take().unwrap());
-            }
+
+            log::info!("Stdio redirected to /dev/null");
         }
-
-        // Initialize env_logger AFTER fork and log file redirection
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        ).init();
-
-        log::info!("Stdio redirected to /dev/null");
+        // If fork_and_detach returned false (Unix fork error or Windows
+        // CreateProcessW fallback), the parent process continues below —
+        // no daemonization, server stays in the foreground with the
+        // SSH connection.
     }
 
     log::info!("Server starting on port {port} (PID: {})", std::process::id());
