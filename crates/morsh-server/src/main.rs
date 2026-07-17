@@ -33,9 +33,9 @@ fn get_ssh_connection_ip() -> Option<String> {
     None
 }
 
-/// Fork and create a new session (Unix) or detach from console (Windows).
+/// Fork and create a new session (Unix) or spawn a breakaway process (Windows).
 /// Returns true in the child process, false in the parent.
-fn fork_and_detach() -> bool {
+fn fork_and_detach(_port: u16) -> bool {
     #[cfg(unix)]
     {
         log::info!("Forking to daemonize...");
@@ -61,15 +61,82 @@ fn fork_and_detach() -> bool {
     }
     #[cfg(windows)]
     {
-        // Windows: detach from the SSH console
-        extern "system" {
-            fn FreeConsole() -> i32;
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, STARTUPINFOW, PROCESS_INFORMATION, DETACHED_PROCESS,
+            CREATE_BREAKAWAY_FROM_JOB,
+        };
+
+        log::info!("Spawning detached child process via CreateProcess");
+
+        let exe = std::env::current_exe().expect("morsh-server: failed to get executable path");
+
+        // Reconstruct command line from current args
+        let args: Vec<String> = std::env::args().collect();
+        let mut cmd_line = exe.display().to_string();
+        if cmd_line.contains(' ') {
+            cmd_line = format!("\"{}\"", cmd_line);
         }
-        unsafe { FreeConsole(); }
-        true
+        for arg in &args[1..] {
+            cmd_line.push(' ');
+            if arg.contains(' ') {
+                cmd_line.push_str(&format!("\"{}\"", arg));
+            } else {
+                cmd_line.push_str(arg);
+            }
+        }
+        let mut cmd_wide: Vec<u16> =
+            OsStr::new(&cmd_line).encode_wide().chain(Some(0)).collect();
+
+        let exe_wide: Vec<u16> =
+            OsStr::new(exe.as_os_str()).encode_wide().chain(Some(0)).collect();
+
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // Use parent's environment (MORSH_DAEMON_CHILD and MORSH_DAEMON_PORT
+        // are already set by the caller).
+        let result = unsafe {
+            CreateProcessW(
+                exe_wide.as_ptr(),
+                cmd_wide.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // bInheritHandles = false (don't pass SSH pipes to child)
+                DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+                std::ptr::null(), // inherit parent's environment
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+
+        if result == 0 {
+            let err = unsafe { GetLastError() };
+            eprintln!(
+                "morsh-server: WARNING failed to spawn daemon child (error {}), \
+                 falling back to in-process mode (will exit when SSH disconnects)",
+                err
+            );
+            // Fall through — keep running in the parent process so the
+            // server still starts. The wrapper already has the MOSH CONNECT line.
+            return false;
+        }
+
+        // Close process/thread handles — child runs independently
+        unsafe {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+
+        std::process::exit(0);
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = _port;
         true
     }
 }
@@ -124,7 +191,6 @@ fn redirect_stdio() {
 }
 
 fn main() {
-    env_logger::init();
 
     let args: Vec<String> = env::args().collect();
 
@@ -238,6 +304,15 @@ fn main() {
         }
         i += 1;
     }
+    let is_daemon_child = env::var("MORSH_DAEMON_CHILD").is_ok();
+    if is_daemon_child {
+        if let Ok(port_str) = env::var("MORSH_DAEMON_PORT") {
+            if let Ok(port_val) = port_str.parse::<u16>() {
+                bind_port = port_val;
+            }
+        }
+    }
+ 
 
     let shell = if command_args.is_empty() {
         env::var("SHELL").unwrap_or_else(|_| {
@@ -295,62 +370,117 @@ fn main() {
     drop(sock); // Release the port; tokio will rebind
 
     // Print MORSH CONNECT before forking so the wrapper can read it
-    println!("MOSH CONNECT {} {}", port, key.printable_key());
-    println!("MOSH CONNECTION ID: 1");
-    std::io::stdout().flush().unwrap();
+    if !is_daemon_child {
+        println!("MOSH CONNECT {} {}", port, key.printable_key());
+        println!("MOSH CONNECTION ID: 1");
+        std::io::stdout().flush().unwrap();
+        log::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
+    }
 
-    log::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
+    if no_daemonize || is_daemon_child {
+        if is_daemon_child {
+            // Daemon child (detached process): redirect stdio to NUL
+            // and route logging to a file.
+            redirect_stdio();
 
-    if no_daemonize {
-        log::info!("No-daemonize mode, skipping fork and stdio redirect");
-    } else {
-        // Fork: parent exits, child detaches and runs the server
-        if !fork_and_detach() {
-            // Parent already exited via fork_and_detach
-            unreachable!();
-        }
+            // Determine log file path: user-specified --log-file, or a
+            // default in the temp directory.  On the remote machine this
+            // will be something like:
+            //   C:\Users\USER\AppData\Local\Temp\morsh-server-<PID>.log
+            let log_path = log_file_path.clone().unwrap_or_else(|| {
+                let dir = std::env::temp_dir();
+                dir.join(format!("morsh-server-{}.log", std::process::id()))
+                    .to_string_lossy()
+                    .to_string()
+            });
 
-        log::info!("Child process continuing after fork, detaching from SSH");
-
-        // Open log file BEFORE redirecting stdio, so errors are visible on stderr
-        let log_file = log_file_path.as_ref().and_then(|path| {
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
+                .open(&log_path)
             {
                 Ok(file) => {
-                    eprintln!("morsh-server: logging to {path}");
+                    env_logger::Builder::from_env(
+                        env_logger::Env::default().default_filter_or("info"),
+                    )
+                    .target(env_logger::Target::Pipe(Box::new(file)))
+                    .init();
+                }
+                Err(_) => {
+                    env_logger::Builder::from_env(
+                        env_logger::Env::default().default_filter_or("info"),
+                    ).init();
+                }
+            }
+        } else {
+            env_logger::Builder::from_env(
+                env_logger::Env::default().default_filter_or("info"),
+            ).init();
+        }
+        if is_daemon_child {
+            log::info!("Daemon child mode, stdio redirected to NUL, logging to file");
+        } else {
+            log::info!("No-daemonize mode, skipping fork and stdio redirect");
+        }
+    } else {
+        // Store port and mark as daemon child for the spawned process
+        env::set_var("MORSH_DAEMON_CHILD", "1");
+        env::set_var("MORSH_DAEMON_PORT", port.to_string());
+        // Pass the encryption key so the child can decrypt client data
+        env::set_var("MORSH_KEY", key.printable_key());
+
+        log::info!("Preparing to daemonize (port {port})");
+
+        if fork_and_detach(port) {
+            // Child process continues after fork / CreateProcessW
+            log::info!("Child process continuing after fork, detaching from SSH");
+
+            // Open log file (with default path in temp dir if --log-file
+            // not specified), before redirecting stdio so errors are visible.
+            let log_path = log_file_path.clone().unwrap_or_else(|| {
+                let dir = std::env::temp_dir();
+                dir.join(format!("morsh-server-{}.log", std::process::id()))
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+            let log_file = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(file) => {
+                    eprintln!("morsh-server: logging to {log_path}");
                     Some(file)
                 }
                 Err(e) => {
-                    eprintln!("morsh-server: failed to open log file {path}: {e}");
+                    eprintln!("morsh-server: failed to open log file {log_path}: {e}");
                     None
                 }
-            }
-        });
+            };
 
-        // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
-        redirect_stdio();
+            // Child: redirect stdio to /dev/null (Unix) or NUL (Windows)
+            redirect_stdio();
 
-        // After redirect, dup log file onto stderr so env_logger output lands there
-        if let Some(file) = log_file {
-            #[cfg(unix)] {
-                use std::os::unix::io::AsRawFd;
-                unsafe { libc::dup2(file.as_raw_fd(), 2); }
+            // Initialize env_logger, piping to the log file if available
+            if let Some(file) = log_file {
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("info"),
+                )
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .init();
+            } else {
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("info"),
+                ).init();
             }
-            #[cfg(windows)] {
-                use std::os::windows::io::AsRawHandle;
-                unsafe {
-                    windows_sys::Win32::System::Console::SetStdHandle(
-                        windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
-                        file.as_raw_handle(),
-                    );
-                }
-            }
+
+            log::info!("Stdio redirected to /dev/null");
         }
-
-        log::info!("Stdio redirected to /dev/null");
+        // If fork_and_detach returned false (Unix fork error or Windows
+        // CreateProcessW fallback), the parent process continues below —
+        // no daemonization, server stays in the foreground with the
+        // SSH connection.
     }
 
     log::info!("Server starting on port {port} (PID: {})", std::process::id());
@@ -451,9 +581,15 @@ async fn run_server(
         // Interactive shell mode — spawn shell directly
         CommandBuilder::new(&shell)
     } else {
-        // Command mode (-e CMD...) — run through sh -c like stock mosh
+        // Command mode (-e CMD...) — run through shell -c like stock mosh
         let full_cmd = command_args.join(" ");
+        #[cfg(windows)]
+        let mut c = CommandBuilder::new("cmd.exe");
+        #[cfg(not(windows))]
         let mut c = CommandBuilder::new("/bin/sh");
+        #[cfg(windows)]
+        c.arg("/c");
+        #[cfg(not(windows))]
         c.arg("-c");
         c.arg(full_cmd);
         c
@@ -614,6 +750,25 @@ async fn run_server(
                 if !transport.connection().has_remote() {
                     continue;
                 }
+
+                // Check if the shell child process has exited.  On Windows
+                // ConPty the PTY reader may never return EOF, so we detect
+                // exit via the child process handle instead.
+                if let Ok(Some(status)) = child.try_wait() {
+                    log::info!("Child process exited with status {}", status.exit_code());
+                    let diff = terminal_state.diff_from(&client_assumed_state);
+                    if !diff.is_empty() {
+                        let ack_num = transport.receiver.remote_state_num();
+                        let throwaway = transport.sender.throwaway_num();
+                        let _ = transport.send_diff(diff, ack_num, throwaway).await;
+                        transport.sender.advance_state();
+                    }
+                    let ack_num = transport.receiver.remote_state_num();
+                    let _ = transport.send_shutdown(ack_num).await;
+                    break Ok(());
+                }
+
+                // Keepalive: send empty ACK if idle
                 let now = std::time::Instant::now();
                 if now.duration_since(transport.sender.last_send_time()).as_millis() > 2000 {
                     let ack_num = transport.receiver.remote_state_num();

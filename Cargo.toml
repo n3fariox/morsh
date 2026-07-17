@@ -12,3 +12,10 @@ members = [
     "crates/morsh-wrapper",
     "crates/morsh-prediction",
 ]
+
+# Patch libghostty-vt-sys: its static-link mode emits `rustc-link-lib=static=ghostty-vt`,
+# which MSVC resolves to the 43 KB DLL import library (ghostty-vt.lib) instead of the real
+# static archive (ghostty-vt-static.lib). That produces a runtime dependency on ghostty-vt.dll.
+# This local copy links the self-contained static archive on Windows so the binaries need no DLL.
+[patch.crates-io]
+libghostty-vt-sys = { path = "third_party/libghostty-vt-sys" }
