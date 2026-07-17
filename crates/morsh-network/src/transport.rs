@@ -354,6 +354,36 @@ impl Transport {
         Ok(())
     }
 
+
+    /// Send the initial handshake message with state 0→1 (always).
+    ///
+    /// This is used for retransmitting the initial handshake when the
+    /// server hasn't responded. It always uses old_num=0, new_num=1
+    /// regardless of the current sender state, because the server's
+    /// state number must start from 0 on the first message.
+    pub async fn send_handshake_message(
+        &mut self,
+        diff: Vec<u8>,
+        ack_num: u64,
+        throwaway_num: u64,
+    ) -> Result<(), String> {
+        let mut inst = TransportInstruction {
+            protocol_version: Some(MORSH_PROTOCOL_VERSION),
+            old_num: Some(0),
+            new_num: Some(1),
+            ack_num: Some(ack_num),
+            throwaway_num: Some(throwaway_num),
+            diff: Some(diff),
+            chaff: None,
+        };
+        let chaff_byte = (self.sender.state_num() & 0xFF) as u8;
+        add_chaff(&mut inst, chaff_byte);
+        self.connection.send(&inst).await?;
+        let now = Instant::now();
+        self.sender.record_send(now);
+        self.receiver.ack_sent(now);
+        Ok(())
+    }
     /// Send a shutdown marker.
     pub async fn send_shutdown(&mut self, ack_num: u64) -> Result<(), String> {
         let inst = self.sender.build_shutdown_instruction(ack_num);

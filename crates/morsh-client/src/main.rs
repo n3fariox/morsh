@@ -278,6 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ack_num = transport.receiver.remote_state_num();
         let throwaway = transport.sender.throwaway_num();
         transport.send_diff(init_diff.clone(), ack_num, throwaway).await?;
+        log::debug!("Sent initial diff ({} bytes) state=0>1", init_diff.len());
         sent_stream = user_stream.clone();
         transport.sender.advance_state();
     }
@@ -427,11 +428,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     handshake_retries += 1;
                     handshake_deadline = now + HANDSHAKE_TIMEOUT;
                     log::warn!("Handshake timeout ({}/{}), retransmitting initial diff", handshake_retries, MAX_HANDSHAKE_RETRIES);
+                    // Use send_handshake_message so the state numbers are always
+                    // old=0, new=1, even if the sender's state_num has advanced.
                     let init_diff = user_stream.diff_from(&UserStream::new());
                     if !init_diff.is_empty() {
                         let ack_num = transport.receiver.remote_state_num();
                         let throwaway = transport.sender.throwaway_num();
-                        if let Err(e) = transport.send_diff(init_diff, ack_num, throwaway).await {
+                        if let Err(e) = transport.send_handshake_message(init_diff, ack_num, throwaway).await {
                             log::warn!("Handshake retransmit failed: {e}");
                         }
                     }

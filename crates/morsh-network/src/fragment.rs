@@ -65,41 +65,31 @@ impl Fragmenter {
         inst: &TransportInstruction,
         max_payload: usize,
     ) -> Result<Vec<Fragment>, String> {
-        let new_num = inst.new_num.unwrap_or(0);
         let inst_bytes = encode_instruction(inst);
         let compressed = compress(&inst_bytes)?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        // Stock mosh prepends a 4-byte header: [new_num BE 2B] [flags BE 2B].
-        // Single-fragment messages use flags=0x0000 (complete).
-        // Multi-fragment first fragment uses flags=0x8000 (no_complete)
-        // so the receiver waits for more fragments.
-        if 4 + compressed.len() <= max_payload {
-            let payload = add_stock_mosh_header(compressed, new_num, false);
+        if compressed.len() <= max_payload {
             return Ok(vec![Fragment {
                 id,
                 final_flag: true,
                 fragment_num: 0,
-                payload,
+                payload: compressed,
             }]);
         }
 
-        // Doesn't fit in one fragment — add header with no_complete flag
-        // and split into chunks.
-        let payload = add_stock_mosh_header(compressed, new_num, true);
         let mut fragments = Vec::new();
-        for (i, chunk) in payload.chunks(max_payload).enumerate() {
+        for (i, chunk) in compressed.chunks(max_payload).enumerate() {
             fragments.push(Fragment {
                 id,
-                final_flag: i == (payload.len() - 1) / max_payload,
+                final_flag: i == (compressed.len() - 1) / max_payload,
                 fragment_num: i as u16,
                 payload: chunk.to_vec(),
             });
         }
         Ok(fragments)
     }
-
     /// Same as `make_fragments` but reuses the same ID for identical instructions.
     /// This allows the receiver to deduplicate retransmissions.
     pub fn make_fragments_with_id(
@@ -108,24 +98,21 @@ impl Fragmenter {
         max_payload: usize,
         id: u64,
     ) -> Result<Vec<Fragment>, String> {
-        let new_num = inst.new_num.unwrap_or(0);
         let inst_bytes = encode_instruction(inst);
         let compressed = compress(&inst_bytes)?;
 
-        if 4 + compressed.len() <= max_payload {
-            let payload = add_stock_mosh_header(compressed, new_num, false);
+        if compressed.len() <= max_payload {
             return Ok(vec![Fragment {
                 id,
                 final_flag: true,
                 fragment_num: 0,
-                payload,
+                payload: compressed,
             }]);
         }
 
-        let payload = add_stock_mosh_header(compressed, new_num, true);
-        let total = payload.len().div_ceil(max_payload);
+        let total = compressed.len().div_ceil(max_payload);
         let mut fragments = Vec::new();
-        for (i, chunk) in payload.chunks(max_payload).enumerate() {
+        for (i, chunk) in compressed.chunks(max_payload).enumerate() {
             fragments.push(Fragment {
                 id,
                 final_flag: i == total - 1,
@@ -220,57 +207,18 @@ fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    // Stock mosh prepends a 4-byte prefix before the zlib stream:
-    //   [new_num 2B BE] [flags 2B BE] [zlib compressed protobuf]
-    // Our own old format has no prefix.
-    //
-    // Detect the prefix: zlib always starts with 0x78 (deflate, level 1-9),
-    // so if byte at offset 4 is 0x78, there's a 4-byte header.
-    // For data < 5 bytes there can't be a header.
-    let zlib_start = if data.len() >= 5 && data[4] == 0x78 {
-        let state = u16::from_be_bytes([data[0], data[1]]);
-        let flags = u16::from_be_bytes([data[2], data[3]]);
-        log::debug!("Detected 4-byte stock mosh prefix: new_num={}, flags=0x{:04x}", state, flags);
-        4
-    } else if data.len() >= 4 {
-        // Fallback: also check old heuristic (flags high bit) for edge cases
-        let maybe_state = u16::from_be_bytes([data[0], data[1]]);
-        let maybe_flags = u16::from_be_bytes([data[2], data[3]]);
-        if maybe_flags == 0x8000 && maybe_state < 1024 {
-            log::debug!("Detected 4-byte stock mosh prefix via fallback heuristic");
-            4
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    let compressed = &data[zlib_start..];
+    // Fragment payload is raw zlib-compressed protobuf (stock mosh format).
+    // No extra header prefix.
     if !data.is_empty() {
-        let first_bytes: Vec<String> = compressed.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        let first_bytes: Vec<String> = data.iter().take(8).map(|b| format!("{:02x}", b)).collect();
         log::debug!("Compressed data first {} bytes: [{}]", first_bytes.len(), first_bytes.join(" "));
     }
-
-    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut decoder = flate2::read::ZlibDecoder::new(data);
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)
-        .map_err(|e| format!("Zlib decompression error: {e} (data_len={}, header_skip={})", data.len(), zlib_start))?;
-    log::debug!("Decompressed {} -> {} bytes (zlib, skip={} header)", data.len(), output.len(), zlib_start);
+        .map_err(|e| format!("Zlib decompression error: {e} (data_len={})", data.len()))?;
+    log::debug!("Decompressed {} -> {} bytes (zlib)", data.len(), output.len());
     Ok(output)
-}
-
-/// Add stock mosh 4-byte header prefix: [new_num 2B BE] [flags 2B BE].
-/// `no_complete` sets the INST_HEADER_NO_COMPLETE flag (bit 15),
-/// indicating more fragments follow for the same instruction.
-/// Single-fragment (complete) messages use `no_complete = false` → flags = 0x0000.
-fn add_stock_mosh_header(payload: Vec<u8>, new_num: u64, no_complete: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + payload.len());
-    out.extend_from_slice(&(new_num as u16).to_be_bytes());
-    let flags: u16 = if no_complete { 0x8000 } else { 0x0000 };
-    out.extend_from_slice(&flags.to_be_bytes());
-    out.extend_from_slice(&payload);
-    out
 }
 
 /// Add random chaff bytes to an Instruction's chaff field.

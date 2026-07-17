@@ -1,4 +1,4 @@
-pub const MORSH_PROTOCOL_VERSION: u32 = 1;
+pub const MORSH_PROTOCOL_VERSION: u32 = 2;
 
 pub const ADDED_BYTES: usize = 12; // 8 nonce + 4 timestamps
 pub const SESSION_ADDED_BYTES: usize = 16; // OCB tag
