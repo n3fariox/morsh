@@ -514,7 +514,7 @@ mod tests {
         let mut sender = TransportSender::new(true);
 
         let inst = sender.build_instruction(b"hello".to_vec(), 3, 0);
-        assert_eq!(inst.protocol_version, Some(2));
+        assert_eq!(inst.protocol_version, Some(MORSH_PROTOCOL_VERSION));
         assert_eq!(inst.old_num, Some(0));
         assert_eq!(inst.new_num, Some(1));
         assert_eq!(inst.ack_num, Some(3));
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn receiver_parse_instruction() {
         let inst = TransportInstruction {
-            protocol_version: Some(2),
+            protocol_version: Some(MORSH_PROTOCOL_VERSION),
             old_num: Some(5),
             new_num: Some(6),
             ack_num: Some(3),

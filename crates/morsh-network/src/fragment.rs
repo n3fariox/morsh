@@ -56,33 +56,43 @@ impl Fragmenter {
         log::info!("Using raw deflate compression (stock mosh compatible)");
         Self { next_id: 1 }
     }
-
     /// Compress and fragment an Instruction, returning the fragments.
     ///
-    /// `max_payload` is the maximum uncompressed protobuf size per fragment.
+    /// `max_payload` is the maximum fragment payload size (after the 8-byte
+    /// fragment header).
     pub fn make_fragments(
         &mut self,
         inst: &TransportInstruction,
         max_payload: usize,
     ) -> Result<Vec<Fragment>, String> {
-        let compressed = compress(&encode_instruction(inst))?;
+        let new_num = inst.new_num.unwrap_or(0);
+        let inst_bytes = encode_instruction(inst);
+        let compressed = compress(&inst_bytes)?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        if compressed.len() <= max_payload {
+        // Stock mosh prepends a 4-byte header: [new_num BE 2B] [flags BE 2B].
+        // Single-fragment messages use flags=0x0000 (complete).
+        // Multi-fragment first fragment uses flags=0x8000 (no_complete)
+        // so the receiver waits for more fragments.
+        if 4 + compressed.len() <= max_payload {
+            let payload = add_stock_mosh_header(compressed, new_num, false);
             return Ok(vec![Fragment {
                 id,
                 final_flag: true,
                 fragment_num: 0,
-                payload: compressed,
+                payload,
             }]);
         }
 
+        // Doesn't fit in one fragment — add header with no_complete flag
+        // and split into chunks.
+        let payload = add_stock_mosh_header(compressed, new_num, true);
         let mut fragments = Vec::new();
-        for (i, chunk) in compressed.chunks(max_payload).enumerate() {
+        for (i, chunk) in payload.chunks(max_payload).enumerate() {
             fragments.push(Fragment {
                 id,
-                final_flag: i == (compressed.len() - 1) / max_payload,
+                final_flag: i == (payload.len() - 1) / max_payload,
                 fragment_num: i as u16,
                 payload: chunk.to_vec(),
             });
@@ -98,20 +108,24 @@ impl Fragmenter {
         max_payload: usize,
         id: u64,
     ) -> Result<Vec<Fragment>, String> {
-        let compressed = compress(&encode_instruction(inst))?;
+        let new_num = inst.new_num.unwrap_or(0);
+        let inst_bytes = encode_instruction(inst);
+        let compressed = compress(&inst_bytes)?;
 
-        if compressed.len() <= max_payload {
+        if 4 + compressed.len() <= max_payload {
+            let payload = add_stock_mosh_header(compressed, new_num, false);
             return Ok(vec![Fragment {
                 id,
                 final_flag: true,
                 fragment_num: 0,
-                payload: compressed,
+                payload,
             }]);
         }
 
+        let payload = add_stock_mosh_header(compressed, new_num, true);
+        let total = payload.len().div_ceil(max_payload);
         let mut fragments = Vec::new();
-        let total = compressed.len().div_ceil(max_payload);
-        for (i, chunk) in compressed.chunks(max_payload).enumerate() {
+        for (i, chunk) in payload.chunks(max_payload).enumerate() {
             fragments.push(Fragment {
                 id,
                 final_flag: i == total - 1,
@@ -122,7 +136,6 @@ impl Fragmenter {
         Ok(fragments)
     }
 }
-
 /// Reassembles fragments into a complete Instruction.
 pub struct FragmentAssembly {
     pending: std::collections::HashMap<u64, std::collections::HashMap<u16, Vec<u8>>>,
@@ -207,16 +220,24 @@ fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    // Skip 4-byte plaintext prefix if present: [new_num BE] [flags]
-    // Stock mosh prepends this before the zlib stream.
-    let zlib_start = if data.len() >= 4 {
-        // Check if first 4 bytes look like a stock mosh prefix (state+flags) rather than deflate
-        // A raw deflate first byte can be 0x00-0x03 (stored), 0x48-0x4B (fixed Huffman), etc.
-        // If bytes 0-1 look like a small BE u16 (state num), it's probably a prefix.
+    // Stock mosh prepends a 4-byte prefix before the zlib stream:
+    //   [new_num 2B BE] [flags 2B BE] [zlib compressed protobuf]
+    // Our own old format has no prefix.
+    //
+    // Detect the prefix: zlib always starts with 0x78 (deflate, level 1-9),
+    // so if byte at offset 4 is 0x78, there's a 4-byte header.
+    // For data < 5 bytes there can't be a header.
+    let zlib_start = if data.len() >= 5 && data[4] == 0x78 {
+        let state = u16::from_be_bytes([data[0], data[1]]);
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        log::debug!("Detected 4-byte stock mosh prefix: new_num={}, flags=0x{:04x}", state, flags);
+        4
+    } else if data.len() >= 4 {
+        // Fallback: also check old heuristic (flags high bit) for edge cases
         let maybe_state = u16::from_be_bytes([data[0], data[1]]);
         let maybe_flags = u16::from_be_bytes([data[2], data[3]]);
         if maybe_flags == 0x8000 && maybe_state < 1024 {
-            log::debug!("Detected 4-byte stock mosh prefix: state={}, flags=0x{:04x}", maybe_state, maybe_flags);
+            log::debug!("Detected 4-byte stock mosh prefix via fallback heuristic");
             4
         } else {
             0
@@ -239,6 +260,19 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Add stock mosh 4-byte header prefix: [new_num 2B BE] [flags 2B BE].
+/// `no_complete` sets the INST_HEADER_NO_COMPLETE flag (bit 15),
+/// indicating more fragments follow for the same instruction.
+/// Single-fragment (complete) messages use `no_complete = false` → flags = 0x0000.
+fn add_stock_mosh_header(payload: Vec<u8>, new_num: u64, no_complete: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&(new_num as u16).to_be_bytes());
+    let flags: u16 = if no_complete { 0x8000 } else { 0x0000 };
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
 /// Add random chaff bytes to an Instruction's chaff field.
 pub fn add_chaff(inst: &mut TransportInstruction, prng_byte: u8) {
     let chaff_len = (prng_byte as usize) % (CHAFF_MAX + 1);
@@ -256,6 +290,7 @@ pub fn add_chaff(inst: &mut TransportInstruction, prng_byte: u8) {
 mod tests {
     use super::*;
     use morsh_proto::transport::Instruction as TI;
+    use crate::constants::MORSH_PROTOCOL_VERSION;
 
     #[test]
     fn fragment_roundtrip() {
@@ -288,7 +323,7 @@ mod tests {
     fn fragmenter_single_fragment() {
         let mut fragger = Fragmenter::new();
         let inst = TI {
-            protocol_version: Some(2),
+            protocol_version: Some(MORSH_PROTOCOL_VERSION),
             old_num: Some(0),
             new_num: Some(1),
             ack_num: Some(0),
@@ -300,14 +335,13 @@ mod tests {
         assert_eq!(frags.len(), 1);
         assert!(frags[0].final_flag);
     }
-
     #[test]
     fn fragmenter_multi_fragment() {
+        // 2000 bytes of variably incrementing data to force fragmentation
+        let big_diff: Vec<u8> = (0..2000).map(|i| (i % 200) as u8).collect();
         let mut fragger = Fragmenter::new();
-        // Use random-like data that won't compress well
-        let big_diff: Vec<u8> = (0..2000).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
         let inst = TI {
-            protocol_version: Some(2),
+            protocol_version: Some(MORSH_PROTOCOL_VERSION),
             old_num: Some(0),
             new_num: Some(1),
             ack_num: Some(0),
@@ -315,7 +349,6 @@ mod tests {
             diff: Some(big_diff),
             chaff: None,
         };
-        // Use very small payload to force fragmentation
         let frags = fragger.make_fragments(&inst, 100).unwrap();
         assert!(frags.len() > 1, "Expected >1 fragments, got {}", frags.len());
         assert!(!frags[0].final_flag);
@@ -326,7 +359,7 @@ mod tests {
     fn assembly_roundtrip() {
         let mut fragger = Fragmenter::new();
         let inst = TI {
-            protocol_version: Some(2),
+            protocol_version: Some(MORSH_PROTOCOL_VERSION),
             old_num: Some(10),
             new_num: Some(20),
             ack_num: Some(5),
@@ -340,7 +373,7 @@ mod tests {
         for frag in frags {
             let result = assembler.add_fragment(frag).unwrap();
             if let Some(reassembled) = result {
-                assert_eq!(reassembled.protocol_version, Some(2));
+                assert_eq!(reassembled.protocol_version, Some(MORSH_PROTOCOL_VERSION));
                 assert_eq!(reassembled.old_num, Some(10));
                 assert_eq!(reassembled.new_num, Some(20));
                 assert_eq!(reassembled.diff, Some(b"hello world".to_vec()));
