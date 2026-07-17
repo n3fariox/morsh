@@ -215,13 +215,24 @@ fn render_remote_command(
     match shell {
         RemoteShell::Posix => {
             let first = first.join(" ");
-            let base = match second {
-                Some(second) => format!("({first} 2>/dev/null) || {}", second.join(" ")),
-                None => first,
-            };
-            match rust_log {
-                Some(v) => format!("RUST_LOG={v} {base}"),
-                None => base,
+            match second {
+                Some(second) => {
+                    let second = second.join(" ");
+                    if let Some(v) = &rust_log {
+                        // env is a simple command so RUST_LOG=val syntax works
+                        // (unlike a (...) subshell).
+                        format!("(env RUST_LOG={v} {first} 2>/dev/null) || {second}")
+                    } else {
+                        format!("({first} 2>/dev/null) || {second}")
+                    }
+                }
+                None => {
+                    if let Some(v) = &rust_log {
+                        format!("env RUST_LOG={v} {first}")
+                    } else {
+                        first
+                    }
+                }
             }
         }
         RemoteShell::Cmd => {
