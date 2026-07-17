@@ -92,12 +92,14 @@ enum RemoteShell {
     PowerShell,
 }
 
-fn resolve_remote_shell(value: &str, ssh_command: &str, host: &str) -> RemoteShell {
+/// Resolve the shell value specified via `--remote-shell`.
+/// `None` means "auto" — let the SSH backend detect it.
+fn resolve_remote_shell_value(value: &str) -> Option<RemoteShell> {
     match value {
-        "auto" => detect_remote_shell(ssh_command, host),
-        "posix" | "sh" | "bash" => RemoteShell::Posix,
-        "cmd" | "cmd.exe" => RemoteShell::Cmd,
-        "powershell" | "pwsh" => RemoteShell::PowerShell,
+        "auto" => None,
+        "posix" | "sh" | "bash" => Some(RemoteShell::Posix),
+        "cmd" | "cmd.exe" => Some(RemoteShell::Cmd),
+        "powershell" | "pwsh" => Some(RemoteShell::PowerShell),
         other => {
             eprintln!(
                 "error: unknown --remote-shell '{other}' (expected auto, posix, cmd, or powershell)"
@@ -107,15 +109,7 @@ fn resolve_remote_shell(value: &str, ssh_command: &str, host: &str) -> RemoteShe
     }
 }
 
-/// Detect the remote shell with a cheap probe.
-///
-/// `uname` exists on every Unix-like remote but not on Windows, so we use it
-/// to distinguish POSIX from Windows. OpenSSH for Windows defaults its shell
-/// to cmd.exe, so a detected Windows remote is rendered as Cmd (pass
-/// `--remote-shell powershell` explicitly if the remote's default shell is
-/// PowerShell). If the probe itself fails we fall back to Posix, since that is
-/// the most common remote.
-fn detect_remote_shell(ssh_command: &str, host: &str) -> RemoteShell {
+fn resolve_remote_shell_system(ssh_command: &str, host: &str) -> RemoteShell {
     let mut args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
     args.push(host.to_string());
     args.push("uname -s".to_string());
@@ -143,33 +137,21 @@ fn main() {
         ip => Some(ip.to_string()),
     };
 
-    // The launch command is interpreted by the *remote* shell, which may be
-    // POSIX sh/bash on Linux, or cmd.exe / PowerShell on a Windows OpenSSH host.
-    // Build the command in the syntax that matches the remote shell.
-    let shell = resolve_remote_shell(&args.remote_shell, &args.ssh_command, &args.host);
-    let rust_log = std::env::var("RUST_LOG").ok();
-    let locale_vars = collect_locale_vars();
-
-    // Build a single remote command that tries morsh-server first,
-    // then falls back to mosh-server — all in one SSH connection.
-    let remote_cmd = if args.server_path == "morsh-server" {
-        let first = build_server_args("morsh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, &locale_vars);
-        let second = build_server_args("mosh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, &locale_vars);
-        render_remote_command(shell, first, Some(second), rust_log, &locale_vars)
-    } else {
-        let only = build_server_args(&args.server_path, &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, &locale_vars);
-        render_remote_command(shell, only, None, rust_log, &locale_vars)
-    };
-
     #[cfg(feature = "russh")]
-    let info = try_launch_ssh(&args, &remote_cmd).unwrap_or_else(|| {
+    let info = try_launch_ssh(&args, &resolved_ip).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
     });
 
     #[cfg(not(feature = "russh"))]
-    let info = try_launch_server(&args.ssh_command, &args.host, &remote_cmd).unwrap_or_else(|| {
+    let info = try_launch_server(&args.ssh_command, &args.host, &{
+        let locale_vars = collect_locale_vars();
+        let rust_log = std::env::var("RUST_LOG").ok();
+        let shell = resolve_remote_shell_value(&args.remote_shell)
+            .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
+        build_remote_cmd(&args, &resolved_ip, shell, rust_log, &locale_vars)
+    }).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
@@ -210,6 +192,23 @@ fn collect_locale_vars() -> Vec<(String, String)> {
     }
     vars
 }
+fn build_remote_cmd(
+    args: &Args,
+    resolved_ip: &Option<String>,
+    shell: RemoteShell,
+    rust_log: Option<String>,
+    locale_vars: &[(String, String)],
+) -> String {
+    if args.server_path == "morsh-server" {
+        let first = build_server_args("morsh-server", resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let second = build_server_args("mosh-server", resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        render_remote_command(shell, first, Some(second), rust_log, locale_vars)
+    } else {
+        let only = build_server_args(&args.server_path, resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        render_remote_command(shell, only, None, rust_log, locale_vars)
+    }
+}
+
 /// Build the argv for a single server invocation (no shell quoting yet).
 fn build_server_args(
     server_path: &str,
@@ -429,13 +428,13 @@ fn resolve_host(host: &str) -> String {
 // ── russh (pure-Rust) backend ──────────────────────────────────────────────────
 
 #[cfg(feature = "russh")]
-fn try_launch_ssh(args: &Args, remote_cmd: &str) -> Option<ConnectInfo> {
+fn try_launch_ssh(args: &Args, resolved_ip: &Option<String>) -> Option<ConnectInfo> {
     let mode = args.ssh_mode;
 
     if mode == SshMode::Russh || mode == SshMode::Auto {
         if let Some(ref key_path) = find_default_key() {
             log::info!("Connecting via russh (key: {})", key_path.display());
-            match try_launch_russh(&args.host, remote_cmd, key_path) {
+            match try_launch_russh(args, resolved_ip, key_path) {
                 Some(info) => return Some(info),
                 None if mode == SshMode::Russh => return None,
                 None => log::info!("russh connection failed, falling back to system ssh"),
@@ -449,14 +448,19 @@ fn try_launch_ssh(args: &Args, remote_cmd: &str) -> Option<ConnectInfo> {
     }
 
     log::info!("using system ssh");
-    try_launch_server(&args.ssh_command, &args.host, remote_cmd)
+    let locale_vars = collect_locale_vars();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let shell = resolve_remote_shell_value(&args.remote_shell)
+        .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
+    let remote_cmd = build_remote_cmd(args, resolved_ip, shell, rust_log, &locale_vars);
+    try_launch_server(&args.ssh_command, &args.host, &remote_cmd)
 }
 
 #[cfg(feature = "russh")]
-fn try_launch_russh(host: &str, remote_cmd: &str, key_path: &std::path::Path) -> Option<ConnectInfo> {
+fn try_launch_russh(args: &Args, resolved_ip: &Option<String>, key_path: &std::path::Path) -> Option<ConnectInfo> {
     use morsh_ssh::SshSession;
 
-    let (user, hostname) = parse_user_host(host);
+    let (user, hostname) = parse_user_host(&args.host);
 
     let port = hostname
         .rsplit_once(':')
@@ -467,19 +471,31 @@ fn try_launch_russh(host: &str, remote_cmd: &str, key_path: &std::path::Path) ->
 
     log::info!("russh: connecting to {addr} as {user}");
 
-    let mut modified_cmd = remote_cmd.to_string();
-    if let Ok(val) = std::env::var("RUST_LOG") {
-        modified_cmd = format!("RUST_LOG={val} {modified_cmd}");
-    }
-
     let mut session = SshSession::connect(addr, user, key_path).ok()?;
+
+    // Probe the remote shell using the same session.
+    let shell = match resolve_remote_shell_value(&args.remote_shell) {
+        Some(s) => s,
+        None => {
+            let (exit_code, probe_out) = session.exec_raw("uname -s").ok()?;
+            if exit_code == 0 && !probe_out.is_empty() {
+                RemoteShell::Posix
+            } else {
+                RemoteShell::Cmd
+            }
+        }
+    };
+
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let locale_vars = collect_locale_vars();
+    let remote_cmd = build_remote_cmd(args, resolved_ip, shell, rust_log, &locale_vars);
 
     let connect_info = std::sync::Arc::new(std::sync::Mutex::new(None::<ConnectInfo>));
     let connect_info_clone = connect_info.clone();
 
     let exit_code = session
         .exec_with_handler(
-            &modified_cmd,
+            &remote_cmd,
             move |line: String| {
                 log::debug!("russh stdout: {line}");
                 if line.starts_with("MOSH CONNECT") {
