@@ -278,6 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ack_num = transport.receiver.remote_state_num();
         let throwaway = transport.sender.throwaway_num();
         transport.send_diff(init_diff.clone(), ack_num, throwaway).await?;
+        log::debug!("Sent initial diff ({} bytes) state=0>1", init_diff.len());
         sent_stream = user_stream.clone();
         transport.sender.advance_state();
     }
@@ -286,6 +287,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let send_interval = Duration::from_millis(transport.sender.send_interval_ms());
     let mut send_timer = tokio::time::interval(send_interval);
     send_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Handshake: wait for server response with timeout and retry
+    let mut handshake_retries = 0;
+    const MAX_HANDSHAKE_RETRIES: u32 = 10;
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+    let mut handshake_deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
     log::info!("Entering event loop");
 
@@ -355,6 +362,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv_diff() => {
                 match result {
                     Ok(Some(diff)) => {
+                        // Handshake complete — stop retransmitting full state
+                        handshake_retries = 0;
+                        handshake_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(86400 * 365);
                         notifications.clear_network_error();
                         notifications.server_heard(std::time::Instant::now());
 
@@ -410,8 +421,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prediction.set_send_interval(rtt_ms);
             }
             _ = send_timer.tick() => {
-                // Check for connection loss (no data from server for 15s)
                 let now = std::time::Instant::now();
+
+                // Handshake timeout: retransmit initial diff if no server response yet
+                if handshake_retries < MAX_HANDSHAKE_RETRIES && now >= handshake_deadline {
+                    handshake_retries += 1;
+                    handshake_deadline = now + HANDSHAKE_TIMEOUT;
+                    log::warn!("Handshake timeout ({}/{}), retransmitting initial diff", handshake_retries, MAX_HANDSHAKE_RETRIES);
+                    // Use send_handshake_message so the state numbers are always
+                    // old=0, new=1, even if the sender's state_num has advanced.
+                    let init_diff = user_stream.diff_from(&UserStream::new());
+                    if !init_diff.is_empty() {
+                        let ack_num = transport.receiver.remote_state_num();
+                        let throwaway = transport.sender.throwaway_num();
+                        if let Err(e) = transport.send_handshake_message(init_diff, ack_num, throwaway).await {
+                            log::warn!("Handshake retransmit failed: {e}");
+                        }
+                    }
+                } else if handshake_retries > 0 {
+                    // Handshake succeeded (we got a response)
+                    handshake_retries = 0;
+                }
+
+                // Check for connection loss (no data from server for 15s)
                 if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(15) {
                     log::info!("Connection lost (no server response for 15s)");
                     break Ok(());

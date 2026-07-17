@@ -40,6 +40,8 @@ fn timestamp16() -> u16 {
 
 /// Create a UDP socket, set nonblocking, and apply ECN marking (ECT(0)).
 /// Cross-platform: uses IP_TOS on both Unix and Windows (Win10 1903+).
+/// On Windows, also disables SIO_UDP_CONNRESET so ICMP Port Unreachable
+/// doesn't poison subsequent recvfrom calls with WSAECONNRESET.
 fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
     let std_socket = std::net::UdpSocket::bind(addr)
         .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
@@ -50,8 +52,55 @@ fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
     let sock_ref = socket2::SockRef::from(&std_socket);
     let _ = sock_ref.set_tos(0x02);
 
+    #[cfg(windows)]
+    disable_udp_connreset(&std_socket);
+
     tokio::net::UdpSocket::from_std(std_socket)
         .map_err(|e| format!("Failed to create tokio socket: {e}"))
+}
+
+/// On Windows, disable SIO_UDP_CONNRESET so that receiving an ICMP Port
+/// Unreachable message does not cause the next recvfrom to fail with
+/// WSAECONNRESET. This is the default behavior of the Windows TCP/IP stack
+/// and breaks UDP robustness; stock mosh disables it too.
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &std::net::UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+
+    // SIO_UDP_CONNRESET = 0x58000001
+    const SIO_UDP_CONNRESET: u32 = 0x58000001;
+
+    extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dwIoControlCode: u32,
+            lpvInBuffer: *const std::ffi::c_void,
+            cbInBuffer: u32,
+            lpvOutBuffer: *mut std::ffi::c_void,
+            cbOutBuffer: u32,
+            lpcbBytesReturned: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+            lpCompletionRoutine: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let sock = socket.as_raw_socket() as usize;
+    let value: u32 = 0; // FALSE — disable the error
+    let mut bytes_returned: u32 = 0;
+
+    unsafe {
+        WSAIoctl(
+            sock,
+            SIO_UDP_CONNRESET,
+            &value as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
 }
 
 impl Connection {
@@ -163,6 +212,10 @@ impl Connection {
                         self.remote_addr = Some(peer);
                         self.has_remote_addr = true;
                         log::info!("Learned client address: {peer}");
+                    } else if self.remote_addr != Some(peer) {
+                        // Client hopped to a new port - update our record
+                        log::info!("Client hopped to new port: {peer} (was {:?})", self.remote_addr);
+                        self.remote_addr = Some(peer);
                     }
                     log::debug!("Received {} bytes from socket {}", len, idx);
                     let data = buf[..len].to_vec();
