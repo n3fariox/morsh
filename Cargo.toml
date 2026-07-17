@@ -11,6 +11,7 @@ members = [
     "crates/morsh-server",
     "crates/morsh-wrapper",
     "crates/morsh-prediction",
+    "crates/morsh-ssh",
 ]
 
 # Patch libghostty-vt-sys: its static-link mode emits `rustc-link-lib=static=ghostty-vt`,

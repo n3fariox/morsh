@@ -79,11 +79,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install musl-gcc (Linux musl)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
       - name: Build (Linux musl)
         if: runner.os == 'Linux'
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
         env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
           GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
