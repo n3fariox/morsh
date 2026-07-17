@@ -118,16 +118,17 @@ fn main() {
     // Build the command in the syntax that matches the remote shell.
     let shell = resolve_remote_shell(&args.remote_shell, &args.ssh_command, &args.host);
     let rust_log = std::env::var("RUST_LOG").ok();
+    let locale_vars = collect_locale_vars();
 
     // Build a single remote command that tries morsh-server first,
     // then falls back to mosh-server — all in one SSH connection.
     let remote_cmd = if args.server_path == "morsh-server" {
-        let first = build_server_args("morsh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command);
-        let second = build_server_args("mosh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command);
-        render_remote_command(shell, first, Some(second), rust_log)
+        let first = build_server_args("morsh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, &locale_vars);
+        let second = build_server_args("mosh-server", &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, &locale_vars);
+        render_remote_command(shell, first, Some(second), rust_log, &locale_vars)
     } else {
-        let only = build_server_args(&args.server_path, &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command);
-        render_remote_command(shell, only, None, rust_log)
+        let only = build_server_args(&args.server_path, &resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, &locale_vars);
+        render_remote_command(shell, only, None, rust_log, &locale_vars)
     };
 
     let info = try_launch_server(&args.ssh_command, &args.host, &remote_cmd).unwrap_or_else(|| {
@@ -155,6 +156,23 @@ fn main() {
     std::process::exit(exit_status.code().unwrap_or(1));
 }
 
+/// Collect locale environment variables (LANG, LC_*) from the local process.
+/// These are used both as -l arguments to morsh-server and as export
+/// statements for stock mosh-server on Posix remotes.
+fn collect_locale_vars() -> Vec<(String, String)> {
+    let names = [
+        "LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
+        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL",
+    ];
+    let mut vars = Vec::new();
+    for name in &names {
+        if let Ok(val) = std::env::var(name) {
+            vars.push((name.to_string(), val));
+        }
+    }
+    vars
+}
 /// Build the argv for a single server invocation (no shell quoting yet).
 fn build_server_args(
     server_path: &str,
@@ -162,6 +180,7 @@ fn build_server_args(
     server_log_file: &Option<String>,
     no_daemonize: bool,
     command: &[String],
+    locale_vars: &[(String, String)],
 ) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     parts.push(server_path.to_string());
@@ -174,14 +193,9 @@ fn build_server_args(
         parts.push("-s".to_string());
     }
 
-    let locale_vars = ["LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
-        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
-        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL"];
-    for var in &locale_vars {
-        if let Ok(val) = std::env::var(var) {
-            parts.push("-l".to_string());
-            parts.push(format!("{var}={val}"));
-        }
+    for (name, val) in locale_vars {
+        parts.push("-l".to_string());
+        parts.push(format!("{name}={val}"));
     }
 
     if let Some(ref path) = server_log_file {
@@ -194,7 +208,7 @@ fn build_server_args(
     }
 
     if !command.is_empty() {
-        parts.push("--".to_string());
+        parts.push("-e".to_string());
         parts.extend(command.iter().cloned());
     }
 
@@ -204,23 +218,37 @@ fn build_server_args(
 /// Render the full remote launch command for the given remote shell.
 ///
 /// `first` is always run; when `second` is provided it is used as a
-/// fallback if `first` exits non-zero. `rust_log`, if present, sets the
-/// RUST_LOG environment variable for the server process.
+/// `locale_vars` is a list of (name, value) pairs for locale settings
+/// (LANG, LC_*) that are exported on Posix remotes.
 fn render_remote_command(
     shell: RemoteShell,
     first: Vec<String>,
     second: Option<Vec<String>>,
     rust_log: Option<String>,
+    locale_vars: &[(String, String)],
 ) -> String {
     match shell {
         RemoteShell::Posix => {
+            // Build locale export prefix.  stock mosh-server requires a
+            // UTF-8 locale and gets confused when SSH doesn't forward any.
+            let locale_export = if locale_vars.is_empty() {
+                // No locale info from the local environment — C.UTF-8 is
+                // available on glibc ≥ 2.37 (Debian 12+, Ubuntu 22.04+,
+                // Fedora 34+, and most modern distros).
+                "export LC_ALL=C.UTF-8".to_string()
+            } else {
+                let exports: Vec<String> = locale_vars.iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(n, v)| format!("{n}={v}"))
+                    .collect();
+                format!("export {}", exports.join(" "))
+            };
+
             let first = first.join(" ");
-            match second {
+            let base = match second {
                 Some(second) => {
                     let second = second.join(" ");
                     if let Some(v) = &rust_log {
-                        // env is a simple command so RUST_LOG=val syntax works
-                        // (unlike a (...) subshell).
                         format!("(env RUST_LOG={v} {first} 2>/dev/null) || {second}")
                     } else {
                         format!("({first} 2>/dev/null) || {second}")
@@ -233,7 +261,8 @@ fn render_remote_command(
                         first
                     }
                 }
-            }
+            };
+            format!("{locale_export}; {base}")
         }
         RemoteShell::Cmd => {
             let first = first.iter().map(|s| cmd_quote(s)).collect::<Vec<_>>().join(" ");
