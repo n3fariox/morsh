@@ -442,8 +442,12 @@ impl Transport {
                     log::debug!("Sent immediate ACK for server state {}", diff.new_num);
                 }
 
-                // Check if this is a shutdown (sentinel new_num == u64::MAX, like stock mosh)
-                if diff.diff.is_empty() && diff.new_num == u64::MAX {
+                // Check if this is a shutdown (sentinel new_num == u64::MAX, like stock mosh).
+                // Stock mosh-server packs final VT output in the same packet as the
+                // shutdown marker, so diff may not be empty here.  u64::MAX can never
+                // be a valid state number, making it the authoritative shutdown signal.
+                if diff.new_num == u64::MAX {
+                    log::info!("Received shutdown marker from server (state={})", diff.old_num);
                     self.receiver.set_shutdown_received();
                 }
 
