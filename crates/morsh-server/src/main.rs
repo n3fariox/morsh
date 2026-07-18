@@ -619,11 +619,38 @@ async fn run_server(
     let mut pty_reader = pair.master.try_clone_reader()
         .map_err(|e| format!("Failed to clone PTY reader: {e}"))?;
 
+    let mut pty_writer = pair.master.take_writer()
+        .map_err(|e| format!("Failed to get PTY writer: {e}"))?;
+
+    // On Unix, dup the master FD for resize ioctls then drop pair.master
+    // so the cloned reader holds the sole original master FD.  Without
+    // this the original FD prevents the reader from seeing EOF/EIO when
+    // the slave closes (child exit).  Stock mosh uses a single-threaded
+    // select() loop on one master FD, achieving the same effect naturally.
+    //
+    // On Windows, keep pair.master alive — ConPTY resize goes through
+    // the MasterPty trait method, not an ioctl.
+    #[cfg(unix)]
+    let master_fd = {
+        let fd = unsafe {
+            libc::dup(pair.master.as_raw_fd()
+                .ok_or("Failed to get master PTY fd")?)
+        };
+        if fd < 0 {
+            return Err("Failed to dup master PTY fd".into());
+        }
+        drop(pair.master);
+        fd
+    };
+    #[cfg(windows)]
+    let _master_fd: () = ();
+
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match pty_reader.read(&mut buf) {
                 Ok(0) => {
+                    log::info!("PTY reader: EOF");
                     let _ = pty_tx.blocking_send(PtyEvent::Exited(
                         ExitStatus::with_exit_code(0)
                     ));
@@ -635,13 +662,19 @@ async fn run_server(
                         break;
                     }
                 }
-                Err(_) => break,
+                // On Linux, reading from the master after the slave closes
+                // can return EIO instead of EOF (see mosh #264).  Treat
+                // any read error as child exit, like stock mosh does.
+                Err(e) => {
+                    log::info!("PTY reader: read error (likely slave closed): {e}");
+                    let _ = pty_tx.blocking_send(PtyEvent::Exited(
+                        ExitStatus::with_exit_code(0)
+                    ));
+                    break;
+                }
             }
         }
     });
-
-    let mut pty_writer = pair.master.take_writer()
-        .map_err(|e| format!("Failed to get PTY writer: {e}"))?;
 
     let mut client_assumed_state: ScreenSnapshot = Complete::new(80, 24)?.snapshot();
 
@@ -712,12 +745,31 @@ async fn run_server(
                                         if let Some(ref resize) = inst.resize {
                                             let w = resize.width.unwrap_or(80) as u16;
                                             let h = resize.height.unwrap_or(24) as u16;
-                                            let _ = pair.master.resize(portable_pty::PtySize {
-                                                rows: h,
-                                                cols: w,
-                                                pixel_width: 0,
-                                                pixel_height: 0,
-                                            });
+                                            #[cfg(unix)]
+                                            {
+                                                let winsize = libc::winsize {
+                                                    ws_row: h,
+                                                    ws_col: w,
+                                                    ws_xpixel: 0,
+                                                    ws_ypixel: 0,
+                                                };
+                                                unsafe {
+                                                    libc::ioctl(
+                                                        master_fd,
+                                                        libc::TIOCSWINSZ,
+                                                        &winsize,
+                                                    );
+                                                }
+                                            }
+                                            #[cfg(not(unix))]
+                                            {
+                                                let _ = pair.master.resize(portable_pty::PtySize {
+                                                    rows: h,
+                                                    cols: w,
+                                                    pixel_width: 0,
+                                                    pixel_height: 0,
+                                                });
+                                            }
                                             terminal_state = Complete::new(w, h)?;
                                             log::info!("Client resize: {w}x{h}");
                                         }
