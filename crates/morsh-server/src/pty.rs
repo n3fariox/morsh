@@ -7,7 +7,7 @@ pub enum PtyEvent {
     Exited(ExitStatus),
 }
 
-pub struct PtySetup {
+pub struct MorshPty {
     pub rx: mpsc::Receiver<PtyEvent>,
     pub child: Box<dyn portable_pty::Child + Send>,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
@@ -19,7 +19,7 @@ pub fn spawn_pty(
     shell: &str,
     command_args: &[String],
     locale_vars: &[(String, String)],
-) -> Result<PtySetup, Box<dyn std::error::Error>> {
+) -> Result<MorshPty, Box<dyn std::error::Error>> {
     let mut cmd = if command_args.is_empty() {
         CommandBuilder::new(shell)
     } else {
@@ -88,7 +88,7 @@ pub fn spawn_pty(
         .take_writer()
         .map_err(|e| format!("Failed to get PTY writer: {e}"))?;
 
-    Ok(PtySetup {
+    Ok(MorshPty {
         rx: pty_rx,
         child,
         master: pair.master,
