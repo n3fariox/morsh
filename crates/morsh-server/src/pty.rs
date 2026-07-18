@@ -56,6 +56,10 @@ pub fn spawn_pty(
     log::info!("Spawned shell: {shell}");
 
     let (pty_tx, pty_rx) = mpsc::channel::<PtyEvent>(64);
+    // Clone pty_tx so the Windows exit-watcher thread can send
+    // PtyEvent::Exited through the same channel as the reader thread.
+    #[cfg(windows)]
+    let pty_tx_exit = pty_tx.clone();
 
     let mut pty_reader = pair
         .master
@@ -82,6 +86,48 @@ pub fn spawn_pty(
             }
         }
     });
+    // On Windows, the ConPTY output pipe write end never closes (the
+    // HPCON inside pair.master stays alive for resize), so the reader
+    // thread can't detect child exit via EOF/error.  Wait on the child
+    // process handle directly and send PtyEvent::Exited when it signals.
+    #[cfg(windows)]
+    if let Some(handle) = child.as_raw_handle() {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        };
+        let mut dup: HANDLE = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                GetCurrentProcess(),
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok != 0 {
+            // HANDLE = *mut c_void which is !Send; cast through usize.
+            let dup_raw = dup as usize;
+            std::thread::spawn(move || {
+                let dup = dup_raw as HANDLE;
+                unsafe { WaitForSingleObject(dup, INFINITE); }
+                let mut exit_code: u32 = 0;
+                unsafe { GetExitCodeProcess(dup, &mut exit_code); }
+                if exit_code == STILL_ACTIVE as u32 {
+                    exit_code = 0;
+                }
+                let _ = pty_tx_exit.blocking_send(PtyEvent::Exited(
+                    ExitStatus::with_exit_code(exit_code),
+                ));
+                unsafe { CloseHandle(dup); }
+            });
+        }
+    }
 
     let writer = pair
         .master
