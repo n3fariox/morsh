@@ -71,6 +71,7 @@ pub fn spawn_pty(
         loop {
             match pty_reader.read(&mut buf) {
                 Ok(0) => {
+                    log::info!("PTY reader: EOF");
                     let _ = pty_tx.blocking_send(PtyEvent::Exited(
                         ExitStatus::with_exit_code(0),
                     ));
@@ -82,7 +83,13 @@ pub fn spawn_pty(
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    log::info!("PTY reader: read error (likely slave closed): {e}");
+                    let _ = pty_tx.blocking_send(PtyEvent::Exited(
+                        ExitStatus::with_exit_code(0),
+                    ));
+                    break;
+                }
             }
         }
     });
@@ -91,41 +98,55 @@ pub fn spawn_pty(
     // thread can't detect child exit via EOF/error.  Wait on the child
     // process handle directly and send PtyEvent::Exited when it signals.
     #[cfg(windows)]
-    if let Some(handle) = child.as_raw_handle() {
-        use windows_sys::Win32::Foundation::{
-            CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, STILL_ACTIVE,
-        };
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, GetExitCodeProcess, WaitForSingleObject, INFINITE,
-        };
-        let mut dup: HANDLE = unsafe { std::mem::zeroed() };
-        let ok = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                handle,
-                GetCurrentProcess(),
-                &mut dup,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if ok != 0 {
-            // HANDLE = *mut c_void which is !Send; cast through usize.
-            let dup_raw = dup as usize;
-            std::thread::spawn(move || {
-                let dup = dup_raw as HANDLE;
-                unsafe { WaitForSingleObject(dup, INFINITE); }
-                let mut exit_code: u32 = 0;
-                unsafe { GetExitCodeProcess(dup, &mut exit_code); }
-                if exit_code == STILL_ACTIVE as u32 {
-                    exit_code = 0;
+    {
+        match child.as_raw_handle() {
+            Some(handle) => {
+                log::info!("Exit watcher: got child process handle");
+                use windows_sys::Win32::Foundation::{
+                    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, STILL_ACTIVE,
+                };
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentProcess, GetExitCodeProcess, WaitForSingleObject, INFINITE,
+                };
+                let mut dup: HANDLE = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        handle,
+                        GetCurrentProcess(),
+                        &mut dup,
+                        0,
+                        0,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                if ok != 0 {
+                    log::info!("Exit watcher: DuplicateHandle succeeded, spawning watcher thread");
+                    // HANDLE = *mut c_void which is !Send; cast through usize.
+                    let dup_raw = dup as usize;
+                    std::thread::spawn(move || {
+                        let dup = dup_raw as HANDLE;
+                        log::info!("Exit watcher: waiting on child process handle");
+                        unsafe { WaitForSingleObject(dup, INFINITE); }
+                        log::info!("Exit watcher: child process handle signaled");
+                        let mut exit_code: u32 = 0;
+                        unsafe { GetExitCodeProcess(dup, &mut exit_code); }
+                        if exit_code == STILL_ACTIVE as u32 {
+                            exit_code = 0;
+                        }
+                        log::info!("Exit watcher: sending PtyEvent::Exited (code={})", exit_code);
+                        let _ = pty_tx_exit.blocking_send(PtyEvent::Exited(
+                            ExitStatus::with_exit_code(exit_code),
+                        ));
+                        unsafe { CloseHandle(dup); }
+                    });
+                } else {
+                    log::info!("Exit watcher: DuplicateHandle failed, relying on keepalive timer");
                 }
-                let _ = pty_tx_exit.blocking_send(PtyEvent::Exited(
-                    ExitStatus::with_exit_code(exit_code),
-                ));
-                unsafe { CloseHandle(dup); }
-            });
+            }
+            None => {
+                log::info!("Exit watcher: child.as_raw_handle() returned None");
+            }
         }
     }
 
