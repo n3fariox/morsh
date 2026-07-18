@@ -27,6 +27,14 @@ jobs:
             os: windows-latest
             zig_arch: x86_64-windows
             zig_ext: zip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zig_arch: aarch64-macos
+            zig_ext: tar.xz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            zig_arch: x86_64-macos
+            zig_ext: tar.xz
 
     steps:
       - name: Checkout submodules
@@ -42,11 +50,11 @@ jobs:
       - name: Install protoc
         shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            PROTOC_ARCH="win64"
-          else
-            PROTOC_ARCH="linux-x86_64"
-          fi
+          case "${{ runner.os }}" in
+            Windows) PROTOC_ARCH="win64" ;;
+            macOS)   PROTOC_ARCH="osx-x86_64" ;;
+            *)       PROTOC_ARCH="linux-x86_64" ;;
+          esac
           PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
           echo "Downloading protoc from $PROTOC_URL"
           curl -fsSL "$PROTOC_URL" -o "$RUNNER_TEMP/protoc.zip"
@@ -129,14 +137,60 @@ jobs:
           7z a "${STAGING}.zip" "$STAGING"
           echo "ASSET=${STAGING}.zip" >> "$GITHUB_ENV"
 
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          STAGING="morsh-${TAG}-${{ matrix.target }}"
+          mkdir -p "$STAGING"
+          cp target/${{ matrix.target }}/release/morsh \
+             target/${{ matrix.target }}/release/morsh-client \
+             target/${{ matrix.target }}/release/morsh-server \
+             "$STAGING/"
+          tar czf "${STAGING}.tar.gz" "$STAGING"
+          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: morsh-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
-  release:
+  universal-macos:
     needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create universal binaries
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          STAGING="morsh-${TAG}-universal-apple-darwin"
+          mkdir -p "$STAGING"
+
+          for bin in morsh morsh-client morsh-server; do
+            lipo -create \
+              "artifacts/morsh-${TAG}-aarch64-apple-darwin/morsh-${TAG}-aarch64-apple-darwin/${bin}" \
+              "artifacts/morsh-${TAG}-x86_64-apple-darwin/morsh-${TAG}-x86_64-apple-darwin/${bin}" \
+              -output "$STAGING/${bin}"
+            lipo -info "$STAGING/${bin}"
+          done
+
+          tar czf "${STAGING}.tar.gz" "$STAGING"
+          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: morsh-universal-apple-darwin
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: [build, universal-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
