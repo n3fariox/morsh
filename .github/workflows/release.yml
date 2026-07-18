@@ -92,6 +92,11 @@ jobs:
         shell: bash
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
 
+      - name: Set macOS SDK path
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
       - name: Build (Linux musl)
         if: runner.os == 'Linux'
         shell: bash
@@ -103,6 +108,14 @@ jobs:
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
         env:
