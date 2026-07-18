@@ -376,7 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Update prediction frame tracking from server acks
                         let acked = transport.sender.acked_state_num();
                         prediction.set_local_frame_acked(acked);
-                        prediction.set_local_frame_late_acked(echo_ack.unwrap_or(diff.new_num));
+                        prediction.set_local_frame_late_acked(echo_ack.unwrap_or(acked));
 
                         // Validate predictions against new server state
                         let snap = terminal_state.snapshot();
