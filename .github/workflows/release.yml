@@ -28,11 +28,11 @@ jobs:
             zig_arch: x86_64-windows
             zig_ext: zip
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             zig_arch: aarch64-macos
             zig_ext: tar.xz
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15
             zig_arch: x86_64-macos
             zig_ext: tar.xz
 
@@ -92,10 +92,17 @@ jobs:
         shell: bash
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
 
-      - name: Set macOS SDK path
+      - name: Workaround zig 0.15.2 + macOS 26 SDK linker failure
         if: runner.os == 'macOS'
         shell: bash
-        run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+        run: |
+          # zig 0.15.2 cannot link against the macOS 26 SDK: every libc symbol
+          # (_abort, _malloc_size, __availability_version_check, dispatch/*)
+          # comes back undefined. The Command Line Tools SDK still links fine,
+          # so steer zig at it via DEVELOPER_DIR.
+          if [ -d /Library/Developer/CommandLineTools ]; then
+            echo "DEVELOPER_DIR=/Library/Developer/CommandLineTools" >> "$GITHUB_ENV"
+          fi
 
       - name: Build (Linux musl)
         if: runner.os == 'Linux'
@@ -172,7 +179,7 @@ jobs:
 
   universal-macos:
     needs: build
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
