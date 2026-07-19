@@ -27,6 +27,14 @@ jobs:
             os: windows-latest
             zig_arch: x86_64-windows
             zig_ext: zip
+          - target: aarch64-apple-darwin
+            os: macos-15
+            zig_arch: aarch64-macos
+            zig_ext: tar.xz
+          - target: x86_64-apple-darwin
+            os: macos-15
+            zig_arch: x86_64-macos
+            zig_ext: tar.xz
 
     steps:
       - name: Checkout submodules
@@ -42,11 +50,11 @@ jobs:
       - name: Install protoc
         shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            PROTOC_ARCH="win64"
-          else
-            PROTOC_ARCH="linux-x86_64"
-          fi
+          case "${{ runner.os }}" in
+            Windows) PROTOC_ARCH="win64" ;;
+            macOS)   PROTOC_ARCH="osx-x86_64" ;;
+            *)       PROTOC_ARCH="linux-x86_64" ;;
+          esac
           PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
           echo "Downloading protoc from $PROTOC_URL"
           curl -fsSL "$PROTOC_URL" -o "$RUNNER_TEMP/protoc.zip"
@@ -84,6 +92,18 @@ jobs:
         shell: bash
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
 
+      - name: Workaround zig 0.15.2 + macOS 26 SDK linker failure
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # zig 0.15.2 cannot link against the macOS 26 SDK: every libc symbol
+          # (_abort, _malloc_size, __availability_version_check, dispatch/*)
+          # comes back undefined. The Command Line Tools SDK still links fine,
+          # so steer zig at it via DEVELOPER_DIR.
+          if [ -d /Library/Developer/CommandLineTools ]; then
+            echo "DEVELOPER_DIR=/Library/Developer/CommandLineTools" >> "$GITHUB_ENV"
+          fi
+
       - name: Build (Linux musl)
         if: runner.os == 'Linux'
         shell: bash
@@ -95,6 +115,14 @@ jobs:
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
         env:
@@ -129,14 +157,60 @@ jobs:
           7z a "${STAGING}.zip" "$STAGING"
           echo "ASSET=${STAGING}.zip" >> "$GITHUB_ENV"
 
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          STAGING="morsh-${TAG}-${{ matrix.target }}"
+          mkdir -p "$STAGING"
+          cp target/${{ matrix.target }}/release/morsh \
+             target/${{ matrix.target }}/release/morsh-client \
+             target/${{ matrix.target }}/release/morsh-server \
+             "$STAGING/"
+          tar czf "${STAGING}.tar.gz" "$STAGING"
+          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: morsh-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
-  release:
+  universal-macos:
     needs: build
+    runs-on: macos-15
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create universal binaries
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          STAGING="morsh-${TAG}-universal-apple-darwin"
+          mkdir -p "$STAGING"
+
+          for bin in morsh morsh-client morsh-server; do
+            lipo -create \
+              "artifacts/morsh-${TAG}-aarch64-apple-darwin/morsh-${TAG}-aarch64-apple-darwin/${bin}" \
+              "artifacts/morsh-${TAG}-x86_64-apple-darwin/morsh-${TAG}-x86_64-apple-darwin/${bin}" \
+              -output "$STAGING/${bin}"
+            lipo -info "$STAGING/${bin}"
+          done
+
+          tar czf "${STAGING}.tar.gz" "$STAGING"
+          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: morsh-universal-apple-darwin
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: [build, universal-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
