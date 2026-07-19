@@ -448,14 +448,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     handshake_retries = 0;
                 }
 
-                // Check for connection loss (no data from server for 5s).
-                // Server sends keepalive ACKs every 3s, so 5s gives one
-                // missed tick as buffer.  The shutdown marker is a single
-                // UDP packet that can be dropped — this timeout catches
-                // that case so the client exits promptly even when the
-                // server's shutdown marker is lost.
-                if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(5) {
-                    log::info!("Connection lost (no server response for 5s)");
+                // Check for connection loss (no data from server for 15s)
+                if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(15) {
+                    log::info!("Connection lost (no server response for 15s)");
                     break Ok(());
                 }
 

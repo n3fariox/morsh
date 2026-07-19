@@ -325,16 +325,8 @@ impl Handler {
     }
 
     async fn shutdown(&mut self) {
-        // Send shutdown marker to client, retrying to handle UDP packet loss.
-        // The shutdown marker is a single UDP packet — retry ensures the client
-        // receives at least one copy even under moderate packet loss.
-        log::info!("Sending shutdown marker (with retries)");
-        for i in 0..5 {
-            if let Err(e) = self.transport.send_shutdown().await {
-                log::warn!("Failed to send shutdown (attempt {}): {e}", i + 1);
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        log::info!("Sending shutdown marker");
+        let _ = self.transport.send_shutdown().await;
         log::info!("Shutting down");
         let _ = self.pty.child.kill();
     }
