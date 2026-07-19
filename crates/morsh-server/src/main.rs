@@ -718,8 +718,7 @@ async fn run_server(
                             transport.sender.advance_state();
                         }
                         // Send shutdown marker so the client exits promptly
-                        let ack_num = transport.receiver.remote_state_num();
-                        let _ = transport.send_shutdown(ack_num).await;
+                        let _ = transport.send_shutdown().await;
                         break Ok(());
                     }
                 }
@@ -809,14 +808,13 @@ async fn run_server(
                 if let Ok(Some(status)) = child.try_wait() {
                     log::info!("Child process exited with status {}", status.exit_code());
                     let diff = terminal_state.diff_from(&client_assumed_state);
+                    let ack_num = transport.receiver.remote_state_num();
                     if !diff.is_empty() {
-                        let ack_num = transport.receiver.remote_state_num();
                         let throwaway = transport.sender.throwaway_num();
                         let _ = transport.send_diff(diff, ack_num, throwaway).await;
                         transport.sender.advance_state();
                     }
-                    let ack_num = transport.receiver.remote_state_num();
-                    let _ = transport.send_shutdown(ack_num).await;
+                    let _ = transport.send_shutdown().await;
                     break Ok(());
                 }
 
@@ -834,8 +832,7 @@ async fn run_server(
 
     // Send shutdown marker to client
     log::info!("Sending shutdown marker");
-    let ack_num = transport.receiver.remote_state_num();
-    let _ = transport.send_shutdown(ack_num).await;
+    let _ = transport.send_shutdown().await;
 
     log::info!("Shutting down");
     let _ = child.kill();

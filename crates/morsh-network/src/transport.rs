@@ -384,9 +384,22 @@ impl Transport {
         self.receiver.ack_sent(now);
         Ok(())
     }
-    /// Send a shutdown marker.
-    pub async fn send_shutdown(&mut self, ack_num: u64) -> Result<(), String> {
+    /// Send a shutdown marker (acknowledges peer's latest state).
+    pub async fn send_shutdown(&mut self) -> Result<(), String> {
+        let ack_num = self.receiver.remote_state_num();
         let inst = self.sender.build_shutdown_instruction(ack_num);
+        self.connection.send(&inst).await?;
+        let now = Instant::now();
+        self.sender.record_send(now);
+        self.sender.shutdown_retries += 1;
+        self.receiver.ack_sent(now);
+        Ok(())
+    }
+
+    /// Send a shutdown ACK (ack_num = u64::MAX) in response to peer's shutdown.
+    /// This acknowledges the peer's shutdown state using the sentinel value.
+    pub async fn send_shutdown_ack(&mut self) -> Result<(), String> {
+        let inst = self.sender.build_shutdown_instruction(u64::MAX);
         self.connection.send(&inst).await?;
         let now = Instant::now();
         self.sender.record_send(now);

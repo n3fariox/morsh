@@ -400,6 +400,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Check for server shutdown
                         if transport.receiver.shutdown_received() {
                             log::info!("Server sent shutdown");
+                            // ACK the server's shutdown packet with ack_num = u64::MAX
+                            // so the server knows we received it and can exit cleanly
+                            if let Err(e) = transport.send_shutdown_ack().await {
+                                log::warn!("Failed to send shutdown ACK: {e}");
+                            }
                             break Ok(());
                         }
 
@@ -443,9 +448,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     handshake_retries = 0;
                 }
 
-                // Check for connection loss (no data from server for 15s)
-                if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(15) {
-                    log::info!("Connection lost (no server response for 15s)");
+                // Check for connection loss (no data from server for 5s)
+                if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(5) {
+                    log::info!("Connection lost (no server response for 5s)");
                     break Ok(());
                 }
 
@@ -489,8 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send shutdown marker to server
     log::info!("Sending shutdown marker");
-    let ack_num = transport.receiver.remote_state_num();
-    if let Err(e) = transport.send_shutdown(ack_num).await {
+    if let Err(e) = transport.send_shutdown().await {
         log::warn!("Failed to send shutdown: {e}");
     }
 
