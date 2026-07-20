@@ -494,6 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send shutdown marker to server
     log::info!("Sending shutdown marker");
+    println!("morsh is exiting.");
     if let Err(e) = transport.send_shutdown().await {
         log::warn!("Failed to send shutdown: {e}");
     }
