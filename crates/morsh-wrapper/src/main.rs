@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
@@ -361,12 +361,13 @@ fn try_launch_server(
     let mut ssh_child = Command::new(&ssh_args[0])
         .args(&ssh_args[1..])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
         .ok()?;
 
     let stdout = ssh_child.stdout.take()?;
+    let stderr = ssh_child.stderr.take()?;
     let reader = BufReader::new(stdout);
 
     let mut connect_info = None;
@@ -390,6 +391,16 @@ fn try_launch_server(
     }
 
     let _ = ssh_child.wait();
+
+    // If we never found the MOSH CONNECT line, the SSH command likely
+    // failed. Surface its stderr so the user can see what went wrong.
+    if connect_info.is_none() {
+        let mut err = String::new();
+        if BufReader::new(stderr).read_to_string(&mut err).is_ok() && !err.trim().is_empty() {
+            eprint!("{err}");
+        }
+    }
+
     connect_info
 }
 

@@ -400,6 +400,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Check for server shutdown
                         if transport.receiver.shutdown_received() {
                             log::info!("Server sent shutdown");
+                            // ACK the server's shutdown packet with ack_num = u64::MAX
+                            // so the server knows we received it and can exit cleanly
+                            if let Err(e) = transport.send_shutdown_ack().await {
+                                log::warn!("Failed to send shutdown ACK: {e}");
+                            }
                             break Ok(());
                         }
 
@@ -489,8 +494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send shutdown marker to server
     log::info!("Sending shutdown marker");
-    let ack_num = transport.receiver.remote_state_num();
-    if let Err(e) = transport.send_shutdown(ack_num).await {
+    println!("morsh is exiting.");
+    if let Err(e) = transport.send_shutdown().await {
         log::warn!("Failed to send shutdown: {e}");
     }
 

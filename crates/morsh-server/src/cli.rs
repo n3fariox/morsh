@@ -13,10 +13,6 @@ pub struct Cli {
     #[arg(short = 'p', value_name = "PORT[:PORT2]")]
     pub port: Option<u16>,
 
-    /// Bind to this address (default: 0.0.0.0)
-    #[arg(short = 'i', value_name = "LOCALADDR")]
-    pub bind_addr: Option<String>,
-
     /// Use SSH_CONNECTION for bind IP
     #[arg(short = 's')]
     pub use_ssh_connection: bool,
@@ -45,7 +41,12 @@ pub struct Cli {
 #[derive(Parser, Debug)]
 pub enum NewSubcommand {
     /// Start a new server (stock mosh compatibility)
-    New,
+    #[command(name = "new")]
+    New {
+        /// Bind to this address (default: 0.0.0.0)
+        #[arg(short = 'i', value_name = "LOCALADDR")]
+        bind_addr: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -62,6 +63,11 @@ pub struct CliOptions {
 pub fn parse() -> CliOptions {
     let cli = Cli::parse();
 
+    let subcommand_bind_addr = match &cli.command {
+        Some(NewSubcommand::New { bind_addr }) => bind_addr.clone(),
+        None => None,
+    };
+
     let locale_vars: Vec<(String, String)> = cli
         .locale_vars
         .iter()
@@ -76,7 +82,7 @@ pub fn parse() -> CliOptions {
 
     CliOptions {
         port: cli.port.unwrap_or(0),
-        bind_addr: cli.bind_addr,
+        bind_addr: subcommand_bind_addr,
         use_ssh_connection: cli.use_ssh_connection,
         no_daemonize: cli.no_daemonize,
         log_file: cli.log_file,

@@ -326,8 +326,7 @@ impl Handler {
 
     async fn shutdown(&mut self) {
         log::info!("Sending shutdown marker");
-        let ack_num = self.transport.receiver.remote_state_num();
-        let _ = self.transport.send_shutdown(ack_num).await;
+        let _ = self.transport.send_shutdown().await;
         log::info!("Shutting down");
         let _ = self.pty.child.kill();
     }
