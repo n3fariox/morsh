@@ -50,12 +50,13 @@ fn render_prediction_overlay(
                 continue;
             }
             let pending = late_acked < cell.expiration_frame;
+            let flagged = pending && prediction.is_flagging();
             write!(buf, "\x1b[{};{}H\x1b[0m", row.row_num + 1, cell.col + 1).unwrap();
-            if pending {
+            if flagged {
                 buf.push_str("\x1b[4m");
             }
             buf.push(if cell.unknown { ' ' } else { cell.replacement });
-            if pending {
+            if flagged {
                 buf.push_str("\x1b[0m");
             }
         }
