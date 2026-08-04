@@ -87,102 +87,47 @@ fn main() {
         println!("MOSH CONNECT {} {}", port, key.printable_key());
         println!("MOSH CONNECTION ID: 1");
         std::io::stdout().flush().unwrap();
-        log::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
+        tracing::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
     }
 
     if opts.no_daemonize || is_daemon_child {
         if is_daemon_child {
             daemon::redirect_stdio();
-
-            let log_path = opts.log_file.clone().unwrap_or_else(|| {
-                let dir = std::env::temp_dir();
-                dir.join(format!("morsh-server-{}.log", std::process::id()))
-                    .to_string_lossy()
-                    .to_string()
-            });
-
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                Ok(file) => {
-                    env_logger::Builder::from_env(
-                        env_logger::Env::default().default_filter_or("info"),
-                    )
-                    .target(env_logger::Target::Pipe(Box::new(file)))
-                    .init();
-                }
-                Err(_) => {
-                    env_logger::Builder::from_env(
-                        env_logger::Env::default().default_filter_or("info"),
-                    )
-                    .init();
-                }
-            }
-        } else {
-            env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or("info"),
-            )
-            .init();
         }
+
+        let _guard = match &opts.log_file {
+            Some(path) => morsh_log::init_at("morsh-server", &std::path::PathBuf::from(path)),
+            None => morsh_log::init("morsh-server"),
+        };
+
         if is_daemon_child {
-            log::info!("Daemon child mode, stdio redirected to NUL, logging to file");
+            tracing::info!("Daemon child mode, stdio redirected to NUL, logging to file");
         } else {
-            log::info!("No-daemonize mode, skipping fork and stdio redirect");
+            tracing::info!("No-daemonize mode, skipping fork and stdio redirect");
         }
     } else {
         env::set_var("MORSH_DAEMON_CHILD", "1");
         env::set_var("MORSH_DAEMON_PORT", port.to_string());
         env::set_var("MORSH_KEY", key.printable_key());
 
-        log::info!("Preparing to daemonize (port {port})");
+        tracing::info!("Preparing to daemonize (port {port})");
 
         if daemon::fork_and_detach(port) {
-            log::info!("Child process continuing after fork, detaching from SSH");
+            tracing::info!("Child process continuing after fork, detaching from SSH");
 
-            let log_path = opts.log_file.clone().unwrap_or_else(|| {
-                let dir = std::env::temp_dir();
-                dir.join(format!("morsh-server-{}.log", std::process::id()))
-                    .to_string_lossy()
-                    .to_string()
-            });
-
-            let log_file = match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                Ok(file) => {
-                    eprintln!("morsh-server: logging to {log_path}");
-                    Some(file)
-                }
-                Err(e) => {
-                    eprintln!("morsh-server: failed to open log file {log_path}: {e}");
-                    None
-                }
+            let _guard = match &opts.log_file {
+                Some(path) => morsh_log::init_at("morsh-server", &std::path::PathBuf::from(path)),
+                None => morsh_log::init("morsh-server"),
             };
 
+            eprintln!("morsh-server: logging to ~/.morsh/logs/morsh-server.log");
             daemon::redirect_stdio();
-
-            if let Some(file) = log_file {
-                env_logger::Builder::from_env(
-                    env_logger::Env::default().default_filter_or("info"),
-                )
-                .target(env_logger::Target::Pipe(Box::new(file)))
-                .init();
-            } else {
-                env_logger::Builder::from_env(
-                    env_logger::Env::default().default_filter_or("info"),
-                )
-                .init();
-            }
-
-            log::info!("Stdio redirected to /dev/null");
+            tracing::info!("Stdio redirected to /dev/null");
         }
     }
 
-    log::info!("Server starting on port {port} (PID: {})", std::process::id());
+    tracing::info!("Server starting on port {port} (PID: {})", std::process::id());
+
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     if let Err(e) = rt.block_on(server::run_server(
@@ -193,7 +138,7 @@ fn main() {
         opts.command_args,
         opts.locale_vars,
     )) {
-        log::error!("Server error: {e}");
+        tracing::error!("Server error: {e}");
         std::process::exit(1);
     }
 }

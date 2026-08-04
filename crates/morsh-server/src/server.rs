@@ -27,22 +27,18 @@ pub async fn run_server(
     command_args: Vec<String>,
     locale_vars: Vec<(String, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!(
-        "run_server entered: port={bind_port}, shell={shell}, ip={:?}, args.len={}",
-        desired_ip,
-        command_args.len()
-    );
+    tracing::info!("run_server entered: port={bind_port}, shell={shell}, ip={:?}, args.len={}",
+    desired_ip,
+    command_args.len());
 
     let mut transport = bind_transport(bind_port, desired_ip, &key).await?;
     transport.sender.set_state(SendState::Active);
-    log::info!("UDP transport ready, waiting for client on port {bind_port}");
+    tracing::info!("UDP transport ready, waiting for client on port {bind_port}");
 
     let (terminal_state, pty_size) = wait_for_client(&mut transport).await?;
 
-    log::info!(
-        "Client connected, spawning shell (remote_state_num={})",
-        transport.receiver.remote_state_num()
-    );
+    tracing::info!("Client connected, spawning shell (remote_state_num={})",
+    transport.receiver.remote_state_num());
 
     let pty_setup = pty::spawn_pty(pty_size, &shell, &command_args, &locale_vars)?;
     let client_assumed_state: ScreenSnapshot = Complete::new(80, 24)?.snapshot();
@@ -73,7 +69,7 @@ async fn bind_transport(
         match Connection::new_server(addr, session).await {
             Ok(conn) => conn,
             Err(e) => {
-                log::warn!("Failed to bind to {}: {}, trying 0.0.0.0", ip, e);
+                tracing::warn!("Failed to bind to {}: {}, trying 0.0.0.0", ip, e);
                 let fallback: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
                 Connection::new_server(fallback, Session::new(*key.data()))
                     .await
@@ -104,18 +100,14 @@ async fn wait_for_client(
     loop {
         match transport.recv_diff().await {
             Ok(Some(diff)) => {
-                log::info!(
-                    "Wait loop received diff: {} bytes (old={}, new={})",
-                    diff.diff.len(),
-                    diff.old_num,
-                    diff.new_num
-                );
+                tracing::info!("Wait loop received diff: {} bytes (old={}, new={})",
+                diff.diff.len(),
+                diff.old_num,
+                diff.new_num);
                 if !diff.diff.is_empty() {
                     if let Ok(msg) = UserMessage::decode(diff.diff.as_slice()) {
-                        log::info!(
-                            "Decoded UserMessage with {} instructions",
-                            msg.instruction.len()
-                        );
+                        tracing::info!("Decoded UserMessage with {} instructions",
+                        msg.instruction.len());
                         for inst in &msg.instruction {
                             if let Some(ref resize) = inst.resize {
                                 pty_size = PtySize {
@@ -126,21 +118,19 @@ async fn wait_for_client(
                                 };
                                 terminal_state =
                                     Complete::new(pty_size.cols, pty_size.rows)?;
-                                log::info!(
-                                    "Client initial resize: {}x{}",
-                                    pty_size.cols,
-                                    pty_size.rows
-                                );
+                                tracing::info!("Client initial resize: {}x{}",
+                                pty_size.cols,
+                                pty_size.rows);
                             }
                         }
                     }
                 }
-                log::info!("Wait loop breaking, proceeding to spawn PTY");
+                tracing::info!("Wait loop breaking, proceeding to spawn PTY");
                 break;
             }
             Ok(None) => continue,
             Err(e) => {
-                log::warn!("Error waiting for client: {e}");
+                tracing::warn!("Error waiting for client: {e}");
                 continue;
             }
         }
@@ -151,7 +141,7 @@ async fn wait_for_client(
 
 impl Handler {
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        log::info!("Entering serve loop");
+        tracing::info!("Entering serve loop");
 
         let mut keepalive_timer = tokio::time::interval(Duration::from_millis(3000));
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -186,37 +176,33 @@ impl Handler {
     async fn handle_pty_event(&mut self, event: PtyEvent) -> ControlFlow<()> {
         match event {
             PtyEvent::Output(data) => {
-                log::info!("PTY output: {} bytes", data.len());
+                tracing::info!("PTY output: {} bytes", data.len());
                 self.terminal_state.apply_string(&data);
 
                 let diff = self.terminal_state.diff_from(&self.client_assumed_state);
-                log::info!(
-                    "Diff from state: {} bytes, state_num={}",
-                    diff.len(),
-                    self.transport.sender.state_num()
-                );
+                tracing::info!("Diff from state: {} bytes, state_num={}",
+                diff.len(),
+                self.transport.sender.state_num());
                 if diff.is_empty() {
                     return ControlFlow::Continue(());
                 }
 
                 let ack_num = self.transport.receiver.remote_state_num();
                 let throwaway = self.transport.sender.throwaway_num();
-                log::info!("Sending diff: ack_num={}, throwaway={}", ack_num, throwaway);
+                tracing::info!("Sending diff: ack_num={}, throwaway={}", ack_num, throwaway);
 
                 if let Err(e) = self.transport.send_diff(diff, ack_num, throwaway).await {
-                    log::warn!("Send error: {e}");
+                    tracing::warn!("Send error: {e}");
                 } else {
                     self.client_assumed_state = self.terminal_state.snapshot();
                     self.transport.sender.advance_state();
-                    log::info!(
-                        "Sent diff OK, state_num now={}",
-                        self.transport.sender.state_num()
-                    );
+                    tracing::info!("Sent diff OK, state_num now={}",
+                    self.transport.sender.state_num());
                 }
                 ControlFlow::Continue(())
             }
             PtyEvent::Exited(status) => {
-                log::info!("Shell exited with status: {}", status.exit_code());
+                tracing::info!("Shell exited with status: {}", status.exit_code());
                 self.send_remaining_diff().await;
                 ControlFlow::Break(())
             }
@@ -233,22 +219,22 @@ impl Handler {
                     if let Ok(user_msg) = UserMessage::decode(diff.diff.as_slice()) {
                         self.apply_client_instructions(&user_msg);
                     } else {
-                        log::warn!("Failed to decode UserMessage");
+                        tracing::warn!("Failed to decode UserMessage");
                     }
                 }
 
                 if self.transport.receiver.shutdown_received() {
-                    log::info!("Client sent shutdown");
+                    tracing::info!("Client sent shutdown");
                     return ControlFlow::Break(());
                 }
 
                 if let Err(e) = self.pty.writer.flush() {
-                    log::warn!("PTY flush error: {e}");
+                    tracing::warn!("PTY flush error: {e}");
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                log::warn!("Recv error: {e}");
+                tracing::warn!("Recv error: {e}");
             }
         }
         ControlFlow::Continue(())
@@ -271,7 +257,7 @@ impl Handler {
         };
         for &byte in keys {
             if let Err(e) = self.pty.writer.write_all(&[byte]) {
-                log::warn!("PTY write error: {e}");
+                tracing::warn!("PTY write error: {e}");
             }
         }
     }
@@ -287,14 +273,14 @@ impl Handler {
         });
         match Complete::new(w, h) {
             Ok(new_state) => self.terminal_state = new_state,
-            Err(e) => log::warn!("Failed to create terminal state: {e}"),
+            Err(e) => tracing::warn!("Failed to create terminal state: {e}"),
         }
-        log::info!("Client resize: {w}x{h}");
+        tracing::info!("Client resize: {w}x{h}");
     }
 
     async fn handle_keepalive(&mut self) -> ControlFlow<()> {
         if let Ok(Some(status)) = self.pty.child.try_wait() {
-            log::info!("Child process exited with status {}", status.exit_code());
+            tracing::info!("Child process exited with status {}", status.exit_code());
             self.send_remaining_diff().await;
             return ControlFlow::Break(());
         }
@@ -307,7 +293,7 @@ impl Handler {
         {
             let ack_num = self.transport.receiver.remote_state_num();
             if let Err(e) = self.transport.send_ack(ack_num).await {
-                log::debug!("Keepalive ACK error: {e}");
+                tracing::debug!("Keepalive ACK error: {e}");
             }
         }
 
@@ -325,9 +311,9 @@ impl Handler {
     }
 
     async fn shutdown(&mut self) {
-        log::info!("Sending shutdown marker");
+        tracing::info!("Sending shutdown marker");
         let _ = self.transport.send_shutdown().await;
-        log::info!("Shutting down");
+        tracing::info!("Shutting down");
         let _ = self.pty.child.kill();
     }
 }

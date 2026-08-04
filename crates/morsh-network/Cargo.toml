@@ -11,7 +11,7 @@ morsh-crypto = { path = "../morsh-crypto" }
 morsh-proto = { path = "../morsh-proto" }
 prost = "0.14"
 flate2 = "1"
-log = "0.4"
+tracing = "0.1"
 socket2 = "0.5"
 
 [dev-dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "morsh-log"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "File-based logging for morsh binaries"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+dirs = "6"

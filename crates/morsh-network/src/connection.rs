@@ -211,13 +211,13 @@ impl Connection {
                     if !self.has_remote_addr {
                         self.remote_addr = Some(peer);
                         self.has_remote_addr = true;
-                        log::info!("Learned client address: {peer}");
+                        tracing::info!("Learned client address: {peer}");
                     } else if self.remote_addr != Some(peer) {
                         // Client hopped to a new port - update our record
-                        log::info!("Client hopped to new port: {peer} (was {:?})", self.remote_addr);
+                        tracing::info!("Client hopped to new port: {peer} (was {:?})", self.remote_addr);
                         self.remote_addr = Some(peer);
                     }
-                    log::debug!("Received {} bytes from socket {}", len, idx);
+                    tracing::debug!("Received {} bytes from socket {}", len, idx);
                     let data = buf[..len].to_vec();
                     let frag = self.decrypt_fragment(&data)?;
                     self.last_heard = Instant::now();
@@ -225,7 +225,7 @@ impl Connection {
                     return self.assembler.add_fragment(frag);
                 }
                 Ok((len, _)) if len > 0 => {
-                    log::debug!("Received {} bytes from socket {}", len, idx);
+                    tracing::debug!("Received {} bytes from socket {}", len, idx);
                     let data = buf[..len].to_vec();
                     let frag = self.decrypt_fragment(&data)?;
                     self.last_heard = Instant::now();
@@ -317,14 +317,14 @@ impl Connection {
     fn decrypt_fragment(&mut self, data: &[u8]) -> Result<Fragment, String> {
         let msg = self.session.decrypt(data)
             .map_err(|e| format!("Decryption error: {e}"))?;
-        log::debug!("Decrypted {} -> {} bytes", data.len(), msg.text.len());
+        tracing::debug!("Decrypted {} -> {} bytes", data.len(), msg.text.len());
         // Stock mosh message format: [timestamp 2B BE] [timestamp_reply 2B BE] [fragment data]
         if msg.text.len() < 4 {
             return Err(format!("Message too short: {} bytes", msg.text.len()));
         }
         let timestamp = u16::from_be_bytes([msg.text[0], msg.text[1]]);
         let timestamp_reply = u16::from_be_bytes([msg.text[2], msg.text[3]]);
-        log::debug!("Timestamps: ts={}, ts_reply={}", timestamp, timestamp_reply);
+        tracing::debug!("Timestamps: ts={}, ts_reply={}", timestamp, timestamp_reply);
 
         // Save received timestamp for echo reply (stock mosh compatible)
         if timestamp != 0xFFFF {
@@ -338,17 +338,17 @@ impl Connection {
             let rtt = now.wrapping_sub(timestamp_reply) as i32;
             if rtt > 0 && rtt < 5000 {
                 self.rtt.update(rtt as u64);
-                log::debug!("RTT measurement: {}ms", rtt);
+                tracing::debug!("RTT measurement: {}ms", rtt);
             }
         }
 
         let frag_bytes = &msg.text[4..];
         if msg.text.len() >= 14 {
             let hex: Vec<String> = frag_bytes.iter().take(30).map(|b| format!("{:02x}", b)).collect();
-            log::debug!("Fragment data first {} bytes: [{}]", hex.len(), hex.join(" "));
+            tracing::debug!("Fragment data first {} bytes: [{}]", hex.len(), hex.join(" "));
         }
         let frag = Fragment::from_bytes(frag_bytes)?;
-        log::debug!("Fragment: id={}, final={}, frag_num={}, payload_len={}",
+        tracing::debug!("Fragment: id={}, final={}, frag_num={}, payload_len={}",
             frag.id, frag.final_flag, frag.fragment_num, frag.payload.len());
         Ok(frag)
     }

@@ -422,7 +422,7 @@ impl Transport {
                 }
 
                 let diff = TransportReceiver::parse_instruction(&inst);
-                log::debug!("recv_diff: old={} new={} ack={} diff_len={}",
+                tracing::debug!("recv_diff: old={} new={} ack={} diff_len={}",
                     diff.old_num, diff.new_num, diff.ack_num, diff.diff.len());
 
                 // Track the remote's state number for acks
@@ -439,7 +439,7 @@ impl Transport {
                 // Stock mosh retransmits aggressively if not ACKed within ~8ms.
                 if !diff.diff.is_empty() {
                     self.send_ack(diff.new_num).await?;
-                    log::debug!("Sent immediate ACK for server state {}", diff.new_num);
+                    tracing::debug!("Sent immediate ACK for server state {}", diff.new_num);
                 }
 
                 // Check if this is a shutdown (sentinel new_num == u64::MAX, like stock mosh).
@@ -447,14 +447,14 @@ impl Transport {
                 // shutdown marker, so diff may not be empty here.  u64::MAX can never
                 // be a valid state number, making it the authoritative shutdown signal.
                 if diff.new_num == u64::MAX {
-                    log::info!("Received shutdown marker from server (state={})", diff.old_num);
+                    tracing::info!("Received shutdown marker from server (state={})", diff.old_num);
                     self.receiver.set_shutdown_received();
                 }
 
                 Ok(Some(diff))
             }
             None => {
-                log::trace!("recv_diff: no instruction ready");
+                tracing::trace!("recv_diff: no instruction ready");
                 Ok(None)
             }
         }
