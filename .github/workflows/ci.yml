@@ -118,6 +118,16 @@ jobs:
           GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
+      - name: Upload macOS debug binaries
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: morsh-debug-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/debug/morsh
+            target/${{ matrix.target }}/debug/morsh-client
+            target/${{ matrix.target }}/debug/morsh-server
+
       - name: Test
         shell: bash
         run: cargo test --workspace --target ${{ matrix.target }}
@@ -133,3 +143,43 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+
+  universal-smoke:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download macOS debug binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Smoke test universal packaging (release code path)
+        run: |
+          TAG="ci-smoke"
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            staging="morsh-${TAG}-${target}"
+            mkdir -p "$staging" "artifacts/morsh-${target}"
+            for bin in $(bash scripts/make-universal.sh bins); do
+              cp "artifacts/morsh-debug-${target}/${bin}" "$staging/"
+            done
+            tar czf "artifacts/morsh-${target}/morsh-${TAG}-${target}.tar.gz" "$staging"
+          done
+
+          ASSET="$(bash scripts/make-universal.sh make "$TAG" artifacts)"
+          for bin in $(bash scripts/make-universal.sh bins); do
+            fat="morsh-${TAG}-universal-apple-darwin/${bin}"
+            archs="$(lipo -archs "$fat")"
+            if [[ "$archs" != *arm64* || "$archs" != *x86_64* ]]; then
+              echo "FAIL: ${bin} is not universal (archs: ${archs})" >&2
+              exit 1
+            fi
+            count="$(tar tzf "$ASSET" | grep -c "morsh-${TAG}-universal-apple-darwin/${bin}$" || true)"
+            if [ "$count" -eq 0 ]; then
+              echo "FAIL: ${bin} missing from ${ASSET}" >&2
+              exit 1
+            fi
+          done
+          echo "universal smoke OK"
