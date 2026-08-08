@@ -94,7 +94,7 @@ fn extract_host_message(data: &[u8]) -> (Vec<u8>, Option<u64>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    let _guard = morsh_log::init("morsh-client");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = Base64Key::from_printable(&key_str)
         .map_err(|e| format!("Invalid MORSH_KEY: {e}"))?;
 
-    log::info!("Connecting to {server_addr}");
+    tracing::info!("Connecting to {server_addr}");
 
     let session = Session::new(*key.data());
 
@@ -278,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ack_num = transport.receiver.remote_state_num();
         let throwaway = transport.sender.throwaway_num();
         transport.send_diff(init_diff.clone(), ack_num, throwaway).await?;
-        log::debug!("Sent initial diff ({} bytes) state=0>1", init_diff.len());
+        tracing::debug!("Sent initial diff ({} bytes) state=0>1", init_diff.len());
         sent_stream = user_stream.clone();
         transport.sender.advance_state();
     }
@@ -294,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
     let mut handshake_deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
-    log::info!("Entering event loop");
+    tracing::info!("Entering event loop");
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
@@ -325,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         prediction.set_local_frame_sent(frame);
 
                         if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
-                            log::debug!("Overlay render error: {e}");
+                            tracing::debug!("Overlay render error: {e}");
                         }
 
                         // Send keystroke immediately if enough time has passed since last send
@@ -337,13 +337,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let throwaway = transport.sender.throwaway_num();
                                 let bytes_to_send = diff.len();
                                 let state_before = transport.sender.state_num();
-                                log::debug!("SEND immediate: state={state_before} ack={ack_num} diff={diff:?}");
+                                tracing::debug!("SEND immediate: state={state_before} ack={ack_num} diff={diff:?}");
                                 if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
-                                    log::warn!("Send error: {e}");
+                                    tracing::warn!("Send error: {e}");
                                 } else {
                                     sent_stream = user_stream.clone();
                                     transport.sender.advance_state();
-                                    log::debug!("Sent {bytes_to_send} bytes (immediate) state now={}", transport.sender.state_num());
+                                    tracing::debug!("Sent {bytes_to_send} bytes (immediate) state now={}", transport.sender.state_num());
                                 }
                             }
                         }
@@ -352,7 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         user_stream.push_resize(w, h);
                         terminal_state = Complete::new(w as u16, h as u16)?;
                         prediction.reset();
-                        log::info!("Resize: {w}x{h}");
+                        tracing::info!("Resize: {w}x{h}");
                     }
                     TermEvent::Quit => {
                         break Ok(());
@@ -388,7 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             snap.cursor_x as usize,
                         );
 
-                        log::debug!("RECV vt_bytes=[{:?}] raw_diff=[{:?}] new_num={} ack_num={}",
+                        tracing::debug!("RECV vt_bytes=[{:?}] raw_diff=[{:?}] new_num={} ack_num={}",
                             String::from_utf8_lossy(&vt_bytes),
                             String::from_utf8_lossy(&diff.diff),
                             diff.new_num,
@@ -399,23 +399,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Check for server shutdown
                         if transport.receiver.shutdown_received() {
-                            log::info!("Server sent shutdown");
+                            tracing::info!("Server sent shutdown");
                             // ACK the server's shutdown packet with ack_num = u64::MAX
                             // so the server knows we received it and can exit cleanly
                             if let Err(e) = transport.send_shutdown_ack().await {
-                                log::warn!("Failed to send shutdown ACK: {e}");
+                                tracing::warn!("Failed to send shutdown ACK: {e}");
                             }
                             break Ok(());
                         }
 
                         // Render prediction overlay (underlined characters for pending predictions)
                         if let Err(e) = render_prediction_overlay(&prediction, &mut stdout) {
-                            log::debug!("Overlay render error: {e}");
+                            tracing::debug!("Overlay render error: {e}");
                         }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        log::warn!("Recv error: {e}");
+                        tracing::warn!("Recv error: {e}");
                         notifications.set_network_error(e.to_string());
                     }
                 }
@@ -432,7 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if handshake_retries < MAX_HANDSHAKE_RETRIES && now >= handshake_deadline {
                     handshake_retries += 1;
                     handshake_deadline = now + HANDSHAKE_TIMEOUT;
-                    log::warn!("Handshake timeout ({}/{}), retransmitting initial diff", handshake_retries, MAX_HANDSHAKE_RETRIES);
+                    tracing::warn!("Handshake timeout ({}/{}), retransmitting initial diff", handshake_retries, MAX_HANDSHAKE_RETRIES);
                     // Use send_handshake_message so the state numbers are always
                     // old=0, new=1, even if the sender's state_num has advanced.
                     let init_diff = user_stream.diff_from(&UserStream::new());
@@ -440,7 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ack_num = transport.receiver.remote_state_num();
                         let throwaway = transport.sender.throwaway_num();
                         if let Err(e) = transport.send_handshake_message(init_diff, ack_num, throwaway).await {
-                            log::warn!("Handshake retransmit failed: {e}");
+                            tracing::warn!("Handshake retransmit failed: {e}");
                         }
                     }
                 } else if handshake_retries > 0 {
@@ -450,7 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Check for connection loss (no data from server for 15s)
                 if transport.connection().time_since_last_heard(now) > std::time::Duration::from_secs(15) {
-                    log::info!("Connection lost (no server response for 15s)");
+                    tracing::info!("Connection lost (no server response for 15s)");
                     break Ok(());
                 }
 
@@ -462,13 +462,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let throwaway = transport.sender.throwaway_num();
                         let bytes_to_send = diff.len();
                         let state_before = transport.sender.state_num();
-                        log::debug!("SEND timer: state={state_before} ack={ack_num} diff={diff:?}");
+                        tracing::debug!("SEND timer: state={state_before} ack={ack_num} diff={diff:?}");
                         if let Err(e) = transport.send_diff(diff, ack_num, throwaway).await {
-                            log::warn!("Send error: {e}");
+                            tracing::warn!("Send error: {e}");
                         } else {
                             sent_stream = user_stream.clone();
                             transport.sender.advance_state();
-                            log::debug!("Sent {bytes_to_send} bytes (timer) state now={}", transport.sender.state_num());
+                            tracing::debug!("Sent {bytes_to_send} bytes (timer) state now={}", transport.sender.state_num());
                         }
                     }
                 }
@@ -478,14 +478,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if transport.should_send_ack(now) {
                     let ack_num = transport.receiver.remote_state_num();
                     if let Err(e) = transport.send_ack(ack_num).await {
-                        log::warn!("ACK send error: {e}");
+                        tracing::warn!("ACK send error: {e}");
                     }
                 }
 
                 // Check for port hopping
                 if transport.should_hop_port(now) {
                     if let Err(e) = transport.hop_port().await {
-                        log::warn!("Port hop failed: {e}");
+                        tracing::warn!("Port hop failed: {e}");
                     }
                 }
             }
@@ -493,10 +493,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Send shutdown marker to server
-    log::info!("Sending shutdown marker");
+    tracing::info!("Sending shutdown marker");
     println!("morsh is exiting.");
     if let Err(e) = transport.send_shutdown().await {
-        log::warn!("Failed to send shutdown: {e}");
+        tracing::warn!("Failed to send shutdown: {e}");
     }
 
     // Cleanup

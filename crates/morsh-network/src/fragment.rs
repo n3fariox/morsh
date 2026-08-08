@@ -53,7 +53,7 @@ impl Default for Fragmenter {
 
 impl Fragmenter {
     pub fn new() -> Self {
-        log::info!("Using raw deflate compression (stock mosh compatible)");
+        tracing::info!("Using raw deflate compression (stock mosh compatible)");
         Self { next_id: 1 }
     }
     /// Compress and fragment an Instruction, returning the fragments.
@@ -145,7 +145,7 @@ impl FragmentAssembly {
 
     /// Add a fragment. Returns a complete Instruction if all fragments have arrived.
     pub fn add_fragment(&mut self, frag: Fragment) -> Result<Option<TransportInstruction>, String> {
-        log::debug!("add_fragment: id={}, frag_num={}, final={}, payload_len={}",
+        tracing::debug!("add_fragment: id={}, frag_num={}, final={}, payload_len={}",
             frag.id, frag.fragment_num, frag.final_flag, frag.payload.len());
 
         if frag.final_flag {
@@ -165,19 +165,19 @@ impl FragmentAssembly {
                 }
                 self.pending.remove(&frag.id);
                 self.final_flags.remove(&frag.id);
-                log::debug!("Assembled {} fragments, {} compressed bytes", expected_count, data.len());
+                tracing::debug!("Assembled {} fragments, {} compressed bytes", expected_count, data.len());
                 let decompressed = decompress(&data)?;
-                log::debug!("Decompressed to {} bytes, decoding protobuf", decompressed.len());
+                tracing::debug!("Decompressed to {} bytes, decoding protobuf", decompressed.len());
                 let inst = TransportInstruction::decode(decompressed.as_slice())
                     .map_err(|e| format!("Protobuf decode error: {e}"))?;
-                log::debug!("Decoded TransportInstruction: old={:?} new={:?} ack={:?} diff_len={:?}",
+                tracing::debug!("Decoded TransportInstruction: old={:?} new={:?} ack={:?} diff_len={:?}",
                     inst.old_num, inst.new_num, inst.ack_num, inst.diff.as_ref().map(|d| d.len()));
                 return Ok(Some(inst));
             } else {
-                log::debug!("Waiting for more fragments: have {}, need {}", entry.len(), expected_count);
+                tracing::debug!("Waiting for more fragments: have {}, need {}", entry.len(), expected_count);
             }
         } else {
-            log::debug!("No final flag yet for id={}", frag.id);
+            tracing::debug!("No final flag yet for id={}", frag.id);
         }
 
         Ok(None)
@@ -202,7 +202,7 @@ fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data).map_err(|e| format!("Compression error: {e}"))?;
     let compressed = encoder.finish().map_err(|e| format!("Compression finish error: {e}"))?;
-    log::debug!("Compressed {} -> {} bytes (zlib)", data.len(), compressed.len());
+    tracing::debug!("Compressed {} -> {} bytes (zlib)", data.len(), compressed.len());
     Ok(compressed)
 }
 
@@ -211,13 +211,13 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     // No extra header prefix.
     if !data.is_empty() {
         let first_bytes: Vec<String> = data.iter().take(8).map(|b| format!("{:02x}", b)).collect();
-        log::debug!("Compressed data first {} bytes: [{}]", first_bytes.len(), first_bytes.join(" "));
+        tracing::debug!("Compressed data first {} bytes: [{}]", first_bytes.len(), first_bytes.join(" "));
     }
     let mut decoder = flate2::read::ZlibDecoder::new(data);
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)
         .map_err(|e| format!("Zlib decompression error: {e} (data_len={})", data.len()))?;
-    log::debug!("Decompressed {} -> {} bytes (zlib)", data.len(), output.len());
+    tracing::debug!("Decompressed {} -> {} bytes (zlib)", data.len(), output.len());
     Ok(output)
 }
 

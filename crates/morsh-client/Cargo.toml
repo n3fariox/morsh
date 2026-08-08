@@ -20,5 +20,5 @@ morsh-network = { path = "../morsh-network" }
 morsh-statesync = { path = "../morsh-statesync" }
 morsh-prediction = { path = "../morsh-prediction" }
 prost = "0.14"
-log = "0.4"
-env_logger = "0.11"
+tracing = "0.1"
+morsh-log = { path = "../morsh-log" }

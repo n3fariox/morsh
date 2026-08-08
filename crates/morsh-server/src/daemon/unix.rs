@@ -1,5 +1,5 @@
 pub fn fork_and_detach(_port: u16) -> bool {
-    log::info!("Forking to daemonize...");
+    tracing::info!("Forking to daemonize...");
 
     match unsafe { libc::fork() } {
         -1 => {
@@ -7,13 +7,13 @@ pub fn fork_and_detach(_port: u16) -> bool {
             std::process::exit(1);
         }
         0 => {
-            log::info!("Child forked OK, calling setsid()");
+            tracing::info!("Child forked OK, calling setsid()");
             unsafe { libc::setsid(); }
-            log::info!("setsid() complete, child PID={}", std::process::id());
+            tracing::info!("setsid() complete, child PID={}", std::process::id());
             true
         }
         pid => {
-            log::info!("Parent (PID={}) exiting, child (PID={}) continues as daemon", std::process::id(), pid);
+            tracing::info!("Parent (PID={}) exiting, child (PID={}) continues as daemon", std::process::id(), pid);
             std::process::exit(0);
         }
     }
@@ -22,7 +22,7 @@ pub fn fork_and_detach(_port: u16) -> bool {
 pub fn redirect_stdio() {
     use std::os::unix::io::AsRawFd;
 
-    log::info!("Redirecting stdio to /dev/null");
+    tracing::info!("Redirecting stdio to /dev/null");
     let devnull = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

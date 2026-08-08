@@ -9,7 +9,7 @@ description = "State synchronization protocol for morsh"
 morsh-proto = { path = "../morsh-proto" }
 morsh-terminal = { path = "../morsh-terminal" }
 prost = "0.14"
-log = "0.4"
+tracing = "0.1"
 
 [dev-dependencies]
 serial_test = "3"

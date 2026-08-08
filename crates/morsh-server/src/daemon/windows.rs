@@ -7,7 +7,7 @@ pub fn fork_and_detach(_port: u16) -> bool {
         CREATE_BREAKAWAY_FROM_JOB,
     };
 
-    log::info!("Spawning detached child process via CreateProcess");
+    tracing::info!("Spawning detached child process via CreateProcess");
 
     let exe = std::env::current_exe().expect("morsh-server: failed to get executable path");
 

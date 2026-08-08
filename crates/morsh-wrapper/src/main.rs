@@ -127,7 +127,7 @@ struct ConnectInfo {
 }
 
 fn main() {
-    env_logger::init();
+    let _guard = morsh_log::init("morsh");
 
     let args = Args::parse();
 
@@ -159,7 +159,7 @@ fn main() {
 
     let server_ip = resolved_ip.unwrap_or_else(|| resolve_host(&args.host));
 
-    log::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
+    tracing::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
 
     let client_path = std::env::current_exe()
         .ok()
@@ -355,8 +355,8 @@ fn try_launch_server(
     ssh_args.push(host.to_string());
     ssh_args.push(remote_cmd.to_string());
 
-    log::info!("SSH: {ssh_command} {host}");
-    log::info!("Remote command: {}", ssh_args.last().unwrap());
+    tracing::info!("SSH: {ssh_command} {host}");
+    tracing::info!("Remote command: {}", ssh_args.last().unwrap());
 
     let mut ssh_child = Command::new(&ssh_args[0])
         .args(&ssh_args[1..])
@@ -374,7 +374,7 @@ fn try_launch_server(
 
     for line in reader.lines() {
         let line = line.ok()?;
-        log::debug!("SSH stdout: {line}");
+        tracing::debug!("SSH stdout: {line}");
 
         if line.starts_with("MOSH CONNECT") {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -408,7 +408,7 @@ fn resolve_host(host: &str) -> String {
     let hostname = host.split('@').next_back().unwrap_or(host);
     let hostname = hostname.split(':').next().unwrap_or(hostname);
 
-    log::info!("Resolving hostname: {hostname}");
+    tracing::info!("Resolving hostname: {hostname}");
 
     let addrs = format!("{hostname}:0")
         .to_socket_addrs()
@@ -444,21 +444,21 @@ fn try_launch_ssh(args: &Args, resolved_ip: &Option<String>) -> Option<ConnectIn
 
     if mode == SshMode::Russh || mode == SshMode::Auto {
         if let Some(ref key_path) = find_default_key() {
-            log::info!("Connecting via russh (key: {})", key_path.display());
+            tracing::info!("Connecting via russh (key: {})", key_path.display());
             match try_launch_russh(args, resolved_ip, key_path) {
                 Some(info) => return Some(info),
                 None if mode == SshMode::Russh => return None,
-                None => log::info!("russh connection failed, falling back to system ssh"),
+                None => tracing::info!("russh connection failed, falling back to system ssh"),
             }
         } else if mode == SshMode::Russh {
             eprintln!("No SSH private key found; use --ssh-mode system to use system ssh");
             return None;
         } else {
-            log::info!("No SSH private key found, using system ssh");
+            tracing::info!("No SSH private key found, using system ssh");
         }
     }
 
-    log::info!("using system ssh");
+    tracing::info!("using system ssh");
     let locale_vars = collect_locale_vars();
     let rust_log = std::env::var("RUST_LOG").ok();
     let shell = resolve_remote_shell_value(&args.remote_shell)
@@ -480,7 +480,7 @@ fn try_launch_russh(args: &Args, resolved_ip: &Option<String>, key_path: &std::p
 
     let addr = format!("{hostname}:{port}");
 
-    log::info!("russh: connecting to {addr} as {user}");
+    tracing::info!("russh: connecting to {addr} as {user}");
 
     let mut session = SshSession::connect(addr, user, key_path).ok()?;
 
@@ -508,7 +508,7 @@ fn try_launch_russh(args: &Args, resolved_ip: &Option<String>, key_path: &std::p
         .exec_with_handler(
             &remote_cmd,
             move |line: String| {
-                log::debug!("russh stdout: {line}");
+                tracing::debug!("russh stdout: {line}");
                 if line.starts_with("MOSH CONNECT") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 4 {
@@ -525,7 +525,7 @@ fn try_launch_russh(args: &Args, resolved_ip: &Option<String>, key_path: &std::p
         )
         .ok()?;
 
-    log::info!("russh: remote command exited with code {exit_code}");
+    tracing::info!("russh: remote command exited with code {exit_code}");
     let result = connect_info.lock().unwrap().take();
     result
 }
