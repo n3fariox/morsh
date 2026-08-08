@@ -181,6 +181,9 @@ jobs:
     needs: build
     runs-on: macos-15
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -188,20 +191,8 @@ jobs:
 
       - name: Create universal binaries
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          STAGING="morsh-${TAG}-universal-apple-darwin"
-          mkdir -p "$STAGING"
-
-          for bin in morsh morsh-client morsh-server; do
-            lipo -create \
-              "artifacts/morsh-${TAG}-aarch64-apple-darwin/morsh-${TAG}-aarch64-apple-darwin/${bin}" \
-              "artifacts/morsh-${TAG}-x86_64-apple-darwin/morsh-${TAG}-x86_64-apple-darwin/${bin}" \
-              -output "$STAGING/${bin}"
-            lipo -info "$STAGING/${bin}"
-          done
-
-          tar czf "${STAGING}.tar.gz" "$STAGING"
-          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+          ASSET="$(bash scripts/make-universal.sh make "$GITHUB_REF_NAME" artifacts)"
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
 
       - name: Upload universal artifact
         uses: actions/upload-artifact@v4
