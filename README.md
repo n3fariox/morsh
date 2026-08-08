@@ -19,6 +19,29 @@ MORSH_KEY=<key> ./target/release/morsh-client 127.0.0.1:60001
 
 The `morsh` wrapper SSHes to the remote host, starts `morsh-server`, parses the `MOSH CONNECT` line, and launches `morsh-client` locally.
 
+## Install via mise
+
+[mise](https://mise.jdx.dev) installs the prebuilt release binaries — no Rust toolchain, zig, or protoc needed:
+
+```sh
+# latest release
+mise use -g github:n3fariox/morsh
+
+# or a specific version
+mise use -g github:n3fariox/morsh@v0.0.2
+```
+
+Or pin it in a `mise.toml`:
+
+```toml
+[tools]
+"github:n3fariox/morsh" = "v0.0.2"
+```
+
+All three binaries (`morsh`, `morsh-client`, `morsh-server`) are installed onto PATH. Versions track GitHub releases; `latest` resolves to the newest published release (tags without a release are not installable).
+
+Only x86_64 builds are published (Linux musl, Windows MSVC) — on other platforms or architectures, use the source build in [Quick Start](#quick-start). Inside this repo, `mise install` also provides the pinned build tools (`zig`, `protoc`).
+
 ## Architecture
 
 ```
