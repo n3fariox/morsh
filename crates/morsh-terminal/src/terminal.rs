@@ -1,8 +1,12 @@
 use libghostty_vt::render::RenderState;
 use libghostty_vt::style::RgbColor as VtRgbColor;
+use libghostty_vt::screen::CellWide;
+use libghostty_vt::terminal::Mode;
 use libghostty_vt::{Terminal, TerminalOptions};
 
-use crate::snapshot::{CellStyle, CellData, ScreenSnapshot, StyleColor};
+use crate::snapshot::{
+    CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor,
+};
 
 /// The terminal emulator, wrapping libghostty-vt.
 pub struct MoshTerminal {
@@ -140,11 +144,34 @@ impl MoshTerminal {
                             Err(_) => CellStyle::default_style(),
                         };
 
-                        let wide = false; // TODO: detect wide chars
+                        // Read the real width from the cell. Treating every
+                        // cell as narrow makes a CJK glyph emit the character
+                        // *and* a space over the column it already covers.
+                        let width = cell
+                            .raw_cell()
+                            .and_then(|raw| raw.wide())
+                            .unwrap_or(CellWide::Narrow);
+                        let wide = width == CellWide::Wide;
+                        let spacer =
+                            width == CellWide::SpacerTail || width == CellWide::SpacerHead;
+
+                        // Canonicalise blank cells. ghostty reports a blank
+                        // as either an empty grapheme list or a single space
+                        // depending on how it came to be blank; if both forms
+                        // reach the diff, a screen that was reconstructed from
+                        // a redraw compares unequal to the identical screen
+                        // that was built by the emulator, and every cell looks
+                        // changed.
+                        let text = if spacer || text == " " {
+                            String::new()
+                        } else {
+                            text
+                        };
 
                         cells.push(CellData {
                             text,
                             wide,
+                            spacer,
                             style,
                         });
                     }
@@ -176,10 +203,49 @@ impl MoshTerminal {
             cursor_x,
             cursor_y,
             cursor_visible,
+            title: self.terminal.title().unwrap_or("").to_string(),
+            bracketed_paste: self.mode(Mode::BRACKETED_PASTE),
+            mouse_reporting: self.mouse_reporting(),
+            mouse_encoding: self.mouse_encoding(),
+            mouse_focus_event: self.mode(Mode::FOCUS_EVENT),
+            mouse_alternate_scroll: self.mode(Mode::ALT_SCROLL),
             fg,
             bg,
             palette,
         })
+    }
+
+    fn mode(&self, mode: Mode) -> bool {
+        self.terminal.mode(mode).unwrap_or(false)
+    }
+
+    /// The most specific mouse-reporting mode the host has turned on.
+    fn mouse_reporting(&self) -> MouseReporting {
+        // Later modes supersede earlier ones, matching xterm.
+        for (mode, value) in [
+            (Mode::ANY_MOUSE, MouseReporting::AnyEvent),
+            (Mode::BUTTON_MOUSE, MouseReporting::ButtonEvent),
+            (Mode::NORMAL_MOUSE, MouseReporting::VT200),
+            (Mode::X10_MOUSE, MouseReporting::X10),
+        ] {
+            if self.mode(mode) {
+                return value;
+            }
+        }
+        MouseReporting::None
+    }
+
+    fn mouse_encoding(&self) -> MouseEncoding {
+        for (mode, value) in [
+            (Mode::SGR_MOUSE, MouseEncoding::Sgr),
+            (Mode::URXVT_MOUSE, MouseEncoding::Urxvt),
+            (Mode::UTF8_MOUSE, MouseEncoding::Utf8),
+        ] {
+            if self.mode(mode) {
+                return value;
+            }
+        }
+        MouseEncoding::Default
     }
 }
 

@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
+
+/// Re-exported so callers can hold the guard in a `main`-scoped binding.
+pub use tracing_appender::non_blocking::WorkerGuard as LogGuard;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

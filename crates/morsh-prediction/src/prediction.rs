@@ -185,17 +185,21 @@ impl PredictionEngine {
 
     /// Process a user keystroke and create predictions.
     ///
-    /// `ch` is the character typed, `cursor_row`/`cursor_col` is the current
-    /// cursor position, and `cell_at_cursor` is what's currently at that position.
-    pub fn new_user_byte(
+    /// `ch` is the character typed and `cursor_row`/`cursor_col` is the current
+    /// cursor position. `cell_at(row, col)` reads the character the *server*
+    /// last put at a position: predicting an insert means shifting the real
+    /// contents of the line rightward, so the engine has to be able to see them.
+    pub fn new_user_byte<F>(
         &mut self,
         ch: char,
         cursor_row: usize,
         cursor_col: usize,
-        cell_at_cursor: char,
         num_cols: usize,
         num_rows: usize,
-    ) {
+        cell_at: F,
+    ) where
+        F: Fn(usize, usize) -> char,
+    {
         if self.display_preference == DisplayPreference::Never {
             return;
         }
@@ -213,76 +217,145 @@ impl PredictionEngine {
         self.init_cursor(cursor_row, cursor_col);
 
         if ch == '\x7f' {
-            // Backspace
-            self.predict_backspace(cursor_row, cursor_col, cell_at_cursor, num_cols, num_rows);
-        } else if ch.is_control() || !ch.is_ascii_graphic() && ch != ' ' {
+            self.predict_backspace(cursor_row, cursor_col, num_cols, &cell_at);
+        } else if ch == '\r' || ch == '\n' {
+            // A newline moves the cursor somewhere we cannot predict the
+            // contents of, so the whole epoch becomes tentative.
+            self.become_tentative();
+            self.newline_carriage_return(cursor_row, num_cols, num_rows);
+        } else if ch.is_control() || (!ch.is_ascii_graphic() && ch != ' ') {
             // Unknown control character — become tentative
             self.become_tentative();
         } else {
-            // Printable character — predict insertion
-            self.predict_insert(ch, cursor_row, cursor_col, cell_at_cursor, num_cols, num_rows);
+            self.predict_insert(ch, cursor_row, cursor_col, num_cols, num_rows, &cell_at);
         }
     }
 
-    /// Predict a backspace (move cursor left, clear cell).
-    fn predict_backspace(
+    /// Move the predicted cursor to the start of the next row.
+    ///
+    /// Mosh's `PredictionEngine::newline_carriage_return`. On the last row it
+    /// does not try to predict a scroll; it blanks the row instead.
+    fn newline_carriage_return(&mut self, cursor_row: usize, num_cols: usize, num_rows: usize) {
+        let frame = self.local_frame_sent + 1;
+        let now = Instant::now();
+        let epoch = self.prediction_epoch;
+
+        if let Some(cursor) = self.cursors.last_mut() {
+            cursor.col = 0;
+            if cursor.row + 1 < num_rows {
+                cursor.row += 1;
+            }
+            cursor.expiration_frame = frame;
+        }
+
+        if cursor_row + 1 >= num_rows {
+            // Blank prediction for the last row.
+            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
+            for cell in row.cells.iter_mut() {
+                cell.active = true;
+                cell.tentative_until_epoch = epoch;
+                cell.expire(frame, now);
+                cell.unknown = false;
+                cell.replacement = ' ';
+            }
+        }
+    }
+
+    /// Predict a backspace: move the cursor left and shift the rest of the
+    /// line leftward over the deleted cell.
+    fn predict_backspace<F>(
         &mut self,
         cursor_row: usize,
         cursor_col: usize,
-        _cell_at_cursor: char,
         num_cols: usize,
-        _num_rows: usize,
-    ) {
+        cell_at: &F,
+    ) where
+        F: Fn(usize, usize) -> char,
+    {
         if cursor_col == 0 {
             return;
         }
 
+        let new_col = cursor_col - 1;
+        let frame = self.local_frame_sent + 1;
+        let now = Instant::now();
+        let epoch = self.prediction_epoch;
+
         // Move cursor left
         if let Some(last_cursor) = self.cursors.last_mut() {
-            last_cursor.col = cursor_col - 1;
-            last_cursor.expiration_frame = self.local_frame_sent + 1;
+            last_cursor.col = new_col;
+            last_cursor.expiration_frame = frame;
         }
 
         if self.predict_overwrite {
             // Just clear the cell to the left
-            let row = self.overlay.get_or_make_row(cursor_row, num_cols, self.prediction_epoch);
-            if cursor_col > 0 {
-                let cell = &mut row.cells[cursor_col - 1];
-                cell.reset_with_orig();
-                cell.active = true;
-                cell.tentative_until_epoch = self.prediction_epoch;
-                cell.expire(self.local_frame_sent + 1, Instant::now());
-                cell.replacement = ' ';
-            }
-        } else {
-            // Shift cells left (simplified: mark cells as unknown from cursor to end)
-            let row = self.overlay.get_or_make_row(cursor_row, num_cols, self.prediction_epoch);
-            for i in cursor_col - 1..num_cols {
-                let cell = &mut row.cells[i];
-                cell.reset_with_orig();
-                cell.active = true;
-                cell.tentative_until_epoch = self.prediction_epoch;
-                cell.expire(self.local_frame_sent + 1, Instant::now());
-                if i + 1 < num_cols {
-                    // Copy from next column (simplified — mark as unknown)
-                    cell.unknown = true;
+            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
+            let cell = &mut row.cells[new_col];
+            cell.reset_with_orig();
+            cell.active = true;
+            cell.tentative_until_epoch = epoch;
+            cell.expire(frame, now);
+            cell.unknown = false;
+            cell.replacement = ' ';
+            return;
+        }
+
+        // Read the right-hand neighbours before mutating, so each cell sees
+        // the pre-shift state — the same values mosh reads, since it walks
+        // left to right and only ever looks one column ahead.
+        let right_states: Vec<(bool, bool, char)> = {
+            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
+            (0..num_cols)
+                .map(|i| {
+                    if i + 1 < num_cols {
+                        let next = &row.cells[i + 1];
+                        (next.active, next.unknown, next.replacement)
+                    } else {
+                        (false, false, ' ')
+                    }
+                })
+                .collect()
+        };
+
+        let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
+        for (i, right) in right_states.iter().enumerate().take(num_cols).skip(new_col) {
+            let cell = &mut row.cells[i];
+            cell.reset_with_orig();
+            cell.active = true;
+            cell.tentative_until_epoch = epoch;
+            cell.expire(frame, now);
+
+            if i + 2 < num_cols {
+                let (next_active, next_unknown, next_replacement) = *right;
+                if next_active {
+                    cell.unknown = next_unknown;
+                    if !next_unknown {
+                        cell.replacement = next_replacement;
+                    }
                 } else {
-                    cell.unknown = true;
+                    // Nothing predicted there: shift what the server actually
+                    // has one column left.
+                    cell.unknown = false;
+                    cell.replacement = cell_at(cursor_row, i + 1);
                 }
+            } else {
+                cell.unknown = true;
             }
         }
     }
 
     /// Predict a character insertion at the cursor position.
-    fn predict_insert(
+    fn predict_insert<F>(
         &mut self,
         ch: char,
         cursor_row: usize,
         cursor_col: usize,
-        _cell_at_cursor: char,
         num_cols: usize,
-        _num_rows: usize,
-    ) {
+        num_rows: usize,
+        cell_at: &F,
+    ) where
+        F: Fn(usize, usize) -> char,
+    {
         // If at the last column, things are tricky (wrap behavior varies by app)
         if cursor_col + 1 >= num_cols {
             self.become_tentative();
@@ -335,8 +408,11 @@ impl PredictionEngine {
                         cell.replacement = left_replacement;
                     }
                 } else {
+                    // Nothing predicted to the left: shift the cell the server
+                    // actually has rightward. Substituting a blank here is what
+                    // made every keystroke visually erase the rest of the line.
                     cell.unknown = false;
-                    cell.replacement = ' ';
+                    cell.replacement = cell_at(cursor_row, i - 1);
                 }
             }
 
@@ -350,10 +426,15 @@ impl PredictionEngine {
             cell.replacement = ch;
         }
 
-        // Move cursor right
-        if let Some(last_cursor) = self.cursors.last_mut() {
-            last_cursor.col = cursor_col + 1;
-            last_cursor.expiration_frame = frame;
+        // Move the cursor right, or wrap.
+        if cursor_col + 1 < num_cols {
+            if let Some(last_cursor) = self.cursors.last_mut() {
+                last_cursor.col = cursor_col + 1;
+                last_cursor.expiration_frame = frame;
+            }
+        } else {
+            self.become_tentative();
+            self.newline_carriage_return(cursor_row, num_cols, num_rows);
         }
     }
 
@@ -529,7 +610,7 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Never);
 
-        engine.new_user_byte('A', 0, 0, ' ', 80, 24);
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
         assert!(!engine.is_active());
     }
 
@@ -538,7 +619,7 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
 
-        engine.new_user_byte('A', 5, 10, ' ', 80, 24);
+        engine.new_user_byte('A', 5, 10, 80, 24, |_, _| ' ');
         assert!(engine.is_active());
 
         let cursor = engine.cursor_pos();
@@ -551,10 +632,10 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Always);
 
         // Type a character first
-        engine.new_user_byte('A', 5, 10, ' ', 80, 24);
+        engine.new_user_byte('A', 5, 10, 80, 24, |_, _| ' ');
 
         // Then backspace
-        engine.new_user_byte('\x7f', 5, 11, 'A', 80, 24);
+        engine.new_user_byte('\x7f', 5, 11, 80, 24, |_, _| ' ');
 
         let cursor = engine.cursor_pos();
         assert_eq!(cursor, Some((5, 10))); // moved back left
@@ -565,7 +646,7 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
 
-        engine.new_user_byte('A', 0, 0, ' ', 80, 24);
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
         assert!(engine.is_active());
 
         engine.reset();
@@ -578,7 +659,7 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Always);
 
         let initial_epoch = engine.prediction_epoch;
-        engine.new_user_byte('A', 0, 0, ' ', 80, 24);
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
 
         // Epoch should increase after becoming tentative
         assert!(engine.prediction_epoch >= initial_epoch);
@@ -593,7 +674,7 @@ mod tests {
         assert_eq!(engine.wait_time_ms(), u64::MAX);
 
         // With active predictions and timing tests necessary
-        engine.new_user_byte('A', 0, 0, ' ', 80, 24);
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
         assert_eq!(engine.wait_time_ms(), 50);
     }
 
@@ -611,5 +692,51 @@ mod tests {
         engine.set_send_interval(50);
         engine.cull(0, 0, 24, 80);
         assert!(engine.srtt_trigger);
+    }
+
+    /// Regression: predicting an insert used to mark every cell from the
+    /// cursor to the right margin `unknown`, which the renderer painted as
+    /// spaces — so each keystroke visually erased the rest of the line.
+    #[test]
+    fn insert_shifts_the_real_line_contents_rightward() {
+        let mut engine = PredictionEngine::new();
+        engine.set_local_frame_sent(1);
+
+        // The server's line reads "hello" starting at column 2.
+        let line: Vec<char> = "  hello".chars().collect();
+        let cell_at = move |_row: usize, col: usize| *line.get(col).unwrap_or(&' ');
+
+        // Type 'X' at column 2, in front of "hello".
+        engine.new_user_byte('X', 0, 2, 20, 5, cell_at);
+
+        let row = engine.overlay().get_row(0).expect("overlay row");
+        assert_eq!(row.cells[2].replacement, 'X');
+        assert!(!row.cells[2].unknown);
+
+        // "hello" shifted one column right, rather than being blanked.
+        let shifted: String = (3..8).map(|i| row.cells[i].replacement).collect();
+        assert_eq!(shifted, "hello", "prior contents were not shifted rightward");
+        for i in 3..8 {
+            assert!(
+                !row.cells[i].unknown,
+                "cell {i} was marked unknown and would render as a blank"
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_shifts_the_real_line_contents_leftward() {
+        let mut engine = PredictionEngine::new();
+        engine.set_local_frame_sent(1);
+
+        let line: Vec<char> = "abcdef".chars().collect();
+        let cell_at = move |_row: usize, col: usize| *line.get(col).unwrap_or(&' ');
+
+        // Backspace with the cursor just after 'c'.
+        engine.new_user_byte('\x7f', 0, 3, 20, 5, cell_at);
+
+        let row = engine.overlay().get_row(0).expect("overlay row");
+        let shifted: String = (2..5).map(|i| row.cells[i].replacement).collect();
+        assert_eq!(shifted, "def", "prior contents were not shifted leftward");
     }
 }

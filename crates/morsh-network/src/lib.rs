@@ -1,11 +1,13 @@
-pub mod constants;
 pub mod connection;
+pub mod constants;
 pub mod fragment;
 pub mod rtt;
+pub mod state;
 pub mod transport;
 
-pub use constants::*;
 pub use connection::Connection;
-pub use fragment::{Fragment, FragmentAssembly, Fragmenter};
+pub use constants::*;
+pub use fragment::{make_chaff, Fragment, FragmentAssembly, Fragmenter};
 pub use rtt::RttEstimator;
-pub use transport::{Transport, TransportSender, TransportReceiver, ReceivedDiff, SendState};
+pub use state::{State, TimestampedState};
+pub use transport::{RecvOutcome, Transport, TransportSender, SHUTDOWN_NUM};

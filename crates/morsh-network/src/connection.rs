@@ -4,8 +4,14 @@ use crate::rtt::RttEstimator;
 use morsh_crypto::{Nonce, Session};
 use morsh_proto::transport::Instruction as TransportInstruction;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+
+/// Largest datagram we will read. Mosh uses `Session::RECEIVE_MTU` (2048).
+const RECEIVE_MTU: usize = 2048;
+
+/// Direction bit in the nonce: set for server→client, clear for client→server.
+const TO_CLIENT_BIT: u64 = 1u64 << 63;
 
 /// Encrypted UDP connection with fragmentation and RTT estimation.
 pub struct Connection {
@@ -22,6 +28,10 @@ pub struct Connection {
     last_heard: Instant,
     /// Send nonce sequence counter. Each send increments this.
     send_seq: u64,
+    /// Lowest sequence number we will still treat as fresh. Rejecting replays
+    /// here is security-sensitive: a replayed packet could otherwise corrupt
+    /// the RTT estimate or re-target the server at an attacker's address.
+    expected_receiver_seq: u64,
     /// Last received timestamp for RTT calculation (stock mosh compatible).
     saved_timestamp: u16,
     /// When the saved_timestamp was received.
@@ -35,7 +45,11 @@ fn timestamp16() -> u16 {
         .unwrap_or_default()
         .as_millis() as u64;
     let ts = (ms % 65536) as u16;
-    if ts == 0xFFFF { 0 } else { ts }
+    if ts == 0xFFFF {
+        0
+    } else {
+        ts
+    }
 }
 
 /// Create a UDP socket, set nonblocking, and apply ECN marking (ECT(0)).
@@ -43,8 +57,8 @@ fn timestamp16() -> u16 {
 /// On Windows, also disables SIO_UDP_CONNRESET so ICMP Port Unreachable
 /// doesn't poison subsequent recvfrom calls with WSAECONNRESET.
 fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
-    let std_socket = std::net::UdpSocket::bind(addr)
-        .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
+    let std_socket =
+        std::net::UdpSocket::bind(addr).map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
     std_socket
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set nonblocking: {e}"))?;
@@ -104,12 +118,9 @@ fn disable_udp_connreset(socket: &std::net::UdpSocket) {
 }
 
 impl Connection {
-    /// Create a server-side connection (single socket, no port hopping).
-    pub async fn new_server(bind_addr: SocketAddr, session: Session) -> Result<Self, String> {
-        let socket = bind_udp(bind_addr)?;
-
+    fn build(socket: UdpSocket, session: Session, server: bool) -> Self {
         let now = Instant::now();
-        Ok(Self {
+        Self {
             sockets: vec![socket],
             remote_addr: None,
             session,
@@ -118,36 +129,28 @@ impl Connection {
             assembler: FragmentAssembly::new(),
             last_port_choice: now,
             last_roundtrip_success: now,
-            server: true,
+            server,
             has_remote_addr: false,
             last_heard: now,
             send_seq: 0,
+            expected_receiver_seq: 0,
             saved_timestamp: 0,
             saved_timestamp_received_at: now,
-        })
+        }
+    }
+
+    /// Create a server-side connection (single socket, no port hopping).
+    pub async fn new_server(bind_addr: SocketAddr, session: Session) -> Result<Self, String> {
+        Ok(Self::build(bind_udp(bind_addr)?, session, true))
     }
 
     /// Create a client-side connection.
     pub async fn new_client(session: Session) -> Result<Self, String> {
-        let socket = bind_udp("0.0.0.0:0".parse().unwrap())?;
-
-        let now = Instant::now();
-        Ok(Self {
-            sockets: vec![socket],
-            remote_addr: None,
+        Ok(Self::build(
+            bind_udp("0.0.0.0:0".parse().unwrap())?,
             session,
-            rtt: RttEstimator::new(),
-            fragger: Fragmenter::new(),
-            assembler: FragmentAssembly::new(),
-            last_port_choice: now,
-            last_roundtrip_success: now,
-            server: false,
-            has_remote_addr: false,
-            last_heard: now,
-            send_seq: 0,
-            saved_timestamp: 0,
-            saved_timestamp_received_at: now,
-        })
+            false,
+        ))
     }
 
     /// Set the remote address (called on first receive for server).
@@ -177,75 +180,152 @@ impl Connection {
         &mut self.rtt
     }
 
+    /// Smoothed round-trip time in milliseconds.
+    pub fn srtt_ms(&self) -> u64 {
+        self.rtt.srtt_ms()
+    }
+
+    /// Retransmission timeout, mosh's `Connection::timeout()`.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.rtt.rto_ms())
+    }
+
+    /// Time of the last packet whose ack proved end-to-end connectivity.
+    pub fn set_last_roundtrip_success(&mut self, when: Instant) {
+        self.last_roundtrip_success = when;
+    }
+
     /// Send an encrypted, fragmented instruction to the remote.
     pub async fn send(&mut self, inst: &TransportInstruction) -> Result<(), String> {
         let remote = self.remote_addr.ok_or("No remote address")?;
-        let frags = self.fragger.make_fragments(inst, max_fragment_payload(MTU_IPV4))?;
+        let frags = self
+            .fragger
+            .make_fragments(inst, max_fragment_payload(MTU_IPV4))?;
 
         for frag in &frags {
             let wire = self.encrypt_fragment(frag)?;
             let socket = self.sockets.last().unwrap();
-            socket.send_to(&wire, remote).await
+            socket
+                .send_to(&wire, remote)
+                .await
                 .map_err(|e| format!("Send error: {e}"))?;
         }
 
         Ok(())
     }
 
-    /// Receive and decrypt a fragment from any socket.
-    pub async fn recv(&mut self) -> Result<Option<TransportInstruction>, String> {
-        let mut buf = vec![0u8; MTU_IPV4 + 64];
+    /// Await one datagram on *any* open socket.
+    ///
+    /// Cancel-safe: the only await point is `recv_from`, which tokio
+    /// guarantees loses no data if the future is dropped. All sockets are
+    /// polled concurrently, so a datagram arriving on a socket opened by
+    /// [`Connection::hop_port`] is seen even while the original socket is idle
+    /// — a sequential loop would block forever on socket 0 and never poll the
+    /// others.
+    pub async fn recv_raw(&self) -> Result<(Vec<u8>, SocketAddr), String> {
+        if self.sockets.is_empty() {
+            return Err("No sockets open".into());
+        }
 
-        let socket_count = self.sockets.len();
-        for idx in 0..socket_count {
-            let result = if self.server && !self.has_remote_addr {
-                self.sockets[idx].recv_from(&mut buf).await
-                    .map(|(len, peer)| (len, Some(peer)))
-            } else {
-                self.sockets[idx].recv_from(&mut buf).await
-                    .map(|(len, _)| (len, None))
-            };
+        let mut receives = Vec::with_capacity(self.sockets.len());
+        for sock in &self.sockets {
+            receives.push(Box::pin(async move {
+                let mut buf = [0u8; RECEIVE_MTU];
+                match sock.recv_from(&mut buf).await {
+                    Ok((len, peer)) => Ok((buf[..len].to_vec(), peer)),
+                    Err(e) => Err(format!("Recv error: {e}")),
+                }
+            }));
+        }
 
-            match result {
-                Ok((len, Some(peer))) if len > 0 => {
-                    if !self.has_remote_addr {
-                        self.remote_addr = Some(peer);
-                        self.has_remote_addr = true;
-                        tracing::info!("Learned client address: {peer}");
-                    } else if self.remote_addr != Some(peer) {
-                        // Client hopped to a new port - update our record
-                        tracing::info!("Client hopped to new port: {peer} (was {:?})", self.remote_addr);
-                        self.remote_addr = Some(peer);
-                    }
-                    tracing::debug!("Received {} bytes from socket {}", len, idx);
-                    let data = buf[..len].to_vec();
-                    let frag = self.decrypt_fragment(&data)?;
-                    self.last_heard = Instant::now();
-                    self.last_roundtrip_success = Instant::now();
-                    return self.assembler.add_fragment(frag);
-                }
-                Ok((len, _)) if len > 0 => {
-                    tracing::debug!("Received {} bytes from socket {}", len, idx);
-                    let data = buf[..len].to_vec();
-                    let frag = self.decrypt_fragment(&data)?;
-                    self.last_heard = Instant::now();
-                    self.last_roundtrip_success = Instant::now();
-                    return self.assembler.add_fragment(frag);
-                }
-                Ok(_) => continue,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(format!("Recv error: {e}")),
+        let (result, _index, _remaining) = futures::future::select_all(receives).await;
+        result
+    }
+
+    /// Decrypt, validate, and reassemble one datagram.
+    ///
+    /// Returns `Ok(None)` while a fragmented instruction is still incomplete.
+    /// Purely synchronous, so callers can run it after a cancel-safe
+    /// [`Connection::recv_raw`] without risking a lost packet.
+    pub fn process_incoming(
+        &mut self,
+        data: &[u8],
+        peer: SocketAddr,
+    ) -> Result<Option<TransportInstruction>, String> {
+        let msg = self
+            .session
+            .decrypt(data)
+            .map_err(|e| format!("Decryption error: {e}"))?;
+
+        // Prevent malicious playback to the sender: a packet we sent must
+        // never be accepted as one we received.
+        let nonce_val = msg.nonce.val();
+        let to_client = nonce_val & TO_CLIENT_BIT != 0;
+        if to_client == self.server {
+            return Err(format!(
+                "Wrong packet direction (to_client={to_client}, we are {})",
+                if self.server { "server" } else { "client" }
+            ));
+        }
+        let seq = nonce_val & !TO_CLIENT_BIT;
+
+        if msg.text.len() < 4 {
+            return Err(format!("Message too short: {} bytes", msg.text.len()));
+        }
+        let frag = Fragment::from_bytes(&msg.text[4..])?;
+
+        // Out-of-order (or replayed) packets are still delivered to the state
+        // synchronizer — which has its own idempotency guards — but they must
+        // not be used for timestamps or for re-targeting the peer address.
+        if seq < self.expected_receiver_seq {
+            tracing::debug!(
+                "Out-of-order packet seq={} (expected >= {}), not used for timing/targeting",
+                seq,
+                self.expected_receiver_seq
+            );
+            return self.assembler.add_fragment(frag);
+        }
+        self.expected_receiver_seq = seq + 1;
+
+        let timestamp = u16::from_be_bytes([msg.text[0], msg.text[1]]);
+        let timestamp_reply = u16::from_be_bytes([msg.text[2], msg.text[3]]);
+
+        if timestamp != 0xFFFF {
+            self.saved_timestamp = timestamp;
+            self.saved_timestamp_received_at = Instant::now();
+        }
+
+        // The only RTT measurement: how long ago the peer echoed back a
+        // timestamp of ours. `timestamp_diff` keeps the 16-bit wraparound
+        // signed, so a measurement across a rollover is not read as ~65 s.
+        if timestamp_reply != 0xFFFF {
+            let rtt = timestamp_diff(timestamp16(), timestamp_reply);
+            if rtt > 0 && rtt < 5000 {
+                self.rtt.update(rtt as u64);
+                tracing::debug!("RTT measurement: {rtt}ms");
             }
         }
 
-        Ok(None)
+        let now = Instant::now();
+        self.last_heard = now;
+        self.has_remote_addr = true;
+
+        // Roaming: re-target whenever the source differs, but only after the
+        // packet has authenticated. Only the client roams.
+        if self.server && self.remote_addr != Some(peer) {
+            tracing::info!("Server now attached to client at {peer} (was {:?})", self.remote_addr);
+            self.remote_addr = Some(peer);
+        }
+
+        self.assembler.add_fragment(frag)
     }
 
     /// Check if we should hop ports (client only).
     pub fn should_hop_port(&self, now: Instant) -> bool {
         !self.server
             && (now - self.last_port_choice > std::time::Duration::from_millis(PORT_HOP_INTERVAL_MS))
-            && (now - self.last_roundtrip_success > std::time::Duration::from_millis(PORT_HOP_INTERVAL_MS))
+            && (now - self.last_roundtrip_success
+                > std::time::Duration::from_millis(PORT_HOP_INTERVAL_MS))
     }
 
     /// Create a new socket for port hopping.
@@ -255,7 +335,19 @@ impl Connection {
         self.sockets.push(socket);
         self.prune_sockets();
         self.last_port_choice = Instant::now();
+        tracing::info!("Hopped to new local port {:?}", self.local_addr());
         Ok(())
+    }
+
+    /// Number of open sockets (for tests).
+    pub fn socket_count(&self) -> usize {
+        self.sockets.len()
+    }
+
+    /// The ack number on the last instruction we fragmented. `u64::MAX` means
+    /// we have already acknowledged the counterparty's shutdown.
+    pub fn fragmenter_last_ack_sent(&self) -> u64 {
+        self.fragger.last_ack_sent()
     }
 
     fn prune_sockets(&mut self) {
@@ -303,54 +395,15 @@ impl Connection {
         // Stock mosh convention: TO_SERVER = 0, TO_CLIENT = 1 << 63
         // Client→Server uses TO_SERVER (0), Server→Client uses TO_CLIENT (1<<63)
         let nonce_val = if self.server {
-            (1u64 << 63) | self.send_seq // Server→Client: TO_CLIENT
+            TO_CLIENT_BIT | self.send_seq
         } else {
-            self.send_seq // Client→Server: TO_SERVER
+            self.send_seq
         };
         let nonce = Nonce::from_val(nonce_val);
         self.send_seq += 1;
         let msg = morsh_crypto::Message::new(nonce, plaintext);
         let ciphertext = self.session.encrypt(&msg);
         Ok(ciphertext)
-    }
-
-    fn decrypt_fragment(&mut self, data: &[u8]) -> Result<Fragment, String> {
-        let msg = self.session.decrypt(data)
-            .map_err(|e| format!("Decryption error: {e}"))?;
-        tracing::debug!("Decrypted {} -> {} bytes", data.len(), msg.text.len());
-        // Stock mosh message format: [timestamp 2B BE] [timestamp_reply 2B BE] [fragment data]
-        if msg.text.len() < 4 {
-            return Err(format!("Message too short: {} bytes", msg.text.len()));
-        }
-        let timestamp = u16::from_be_bytes([msg.text[0], msg.text[1]]);
-        let timestamp_reply = u16::from_be_bytes([msg.text[2], msg.text[3]]);
-        tracing::debug!("Timestamps: ts={}, ts_reply={}", timestamp, timestamp_reply);
-
-        // Save received timestamp for echo reply (stock mosh compatible)
-        if timestamp != 0xFFFF {
-            self.saved_timestamp = timestamp;
-            self.saved_timestamp_received_at = Instant::now();
-        }
-
-        // Compute RTT from timestamp_reply (corrected echo of our sent timestamp)
-        if timestamp_reply != 0xFFFF {
-            let now = timestamp16();
-            let rtt = now.wrapping_sub(timestamp_reply) as i32;
-            if rtt > 0 && rtt < 5000 {
-                self.rtt.update(rtt as u64);
-                tracing::debug!("RTT measurement: {}ms", rtt);
-            }
-        }
-
-        let frag_bytes = &msg.text[4..];
-        if msg.text.len() >= 14 {
-            let hex: Vec<String> = frag_bytes.iter().take(30).map(|b| format!("{:02x}", b)).collect();
-            tracing::debug!("Fragment data first {} bytes: [{}]", hex.len(), hex.join(" "));
-        }
-        let frag = Fragment::from_bytes(frag_bytes)?;
-        tracing::debug!("Fragment: id={}, final={}, frag_num={}, payload_len={}",
-            frag.id, frag.final_flag, frag.fragment_num, frag.payload.len());
-        Ok(frag)
     }
 }
 
@@ -362,6 +415,7 @@ pub fn timestamp_diff(a: u16, b: u16) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use morsh_crypto::Base64Key;
 
     #[test]
     fn timestamp_diff_basic() {
@@ -373,5 +427,132 @@ mod tests {
     fn timestamp_diff_wrapping() {
         assert_eq!(timestamp_diff(0, 65535), 1);
         assert_eq!(timestamp_diff(65535, 0), -1);
+    }
+
+    fn key() -> [u8; 16] {
+        *Base64Key::random().data()
+    }
+
+    fn instruction(new_num: u64) -> TransportInstruction {
+        TransportInstruction {
+            protocol_version: Some(MORSH_PROTOCOL_VERSION),
+            old_num: Some(new_num.saturating_sub(1)),
+            new_num: Some(new_num),
+            ack_num: Some(0),
+            throwaway_num: Some(0),
+            diff: Some(b"payload".to_vec()),
+            chaff: None,
+        }
+    }
+
+    /// A packet the server itself sent must not be accepted back by the
+    /// server: `dos_assert( p.direction == (server ? TO_SERVER : TO_CLIENT) )`.
+    #[tokio::test]
+    async fn rejects_packets_sent_in_our_own_direction() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // Encrypt as the server would, then feed it back to the server.
+        let frags = server
+            .fragger
+            .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+            .unwrap();
+        let wire = server.encrypt_fragment(&frags[0]).unwrap();
+
+        let err = server.process_incoming(&wire, peer).unwrap_err();
+        assert!(err.contains("direction"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn accepts_packets_from_the_other_direction() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let mut client = Connection::new_client(Session::new(k)).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let frags = client
+            .fragger
+            .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+            .unwrap();
+        let wire = client.encrypt_fragment(&frags[0]).unwrap();
+
+        let inst = server.process_incoming(&wire, peer).unwrap().unwrap();
+        assert_eq!(inst.new_num, Some(1));
+        assert_eq!(server.remote_addr(), Some(peer));
+    }
+
+    /// A replayed packet is still delivered (the state synchronizer dedups it)
+    /// but must not move the server to the replayer's address.
+    #[tokio::test]
+    async fn replayed_packet_does_not_retarget_the_server() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let mut client = Connection::new_client(Session::new(k)).await.unwrap();
+        let good: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let attacker: SocketAddr = "10.9.9.9:666".parse().unwrap();
+
+        let first = {
+            let frags = client
+                .fragger
+                .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+                .unwrap();
+            client.encrypt_fragment(&frags[0]).unwrap()
+        };
+        let second = {
+            let frags = client
+                .fragger
+                .make_fragments(&instruction(2), max_fragment_payload(MTU_IPV4))
+                .unwrap();
+            client.encrypt_fragment(&frags[0]).unwrap()
+        };
+
+        server.process_incoming(&first, good).unwrap();
+        server.process_incoming(&second, good).unwrap();
+        assert_eq!(server.remote_addr(), Some(good));
+
+        // Replay of the first packet from somewhere else.
+        server.process_incoming(&first, attacker).unwrap();
+        assert_eq!(
+            server.remote_addr(),
+            Some(good),
+            "replayed packet re-targeted the server"
+        );
+    }
+
+    /// Roaming: a fresh packet from a new address does move the server.
+    #[tokio::test]
+    async fn fresh_packet_from_new_address_retargets_the_server() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let mut client = Connection::new_client(Session::new(k)).await.unwrap();
+        let first_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let roamed: SocketAddr = "127.0.0.1:23456".parse().unwrap();
+
+        for (n, from) in [(1u64, first_addr), (2, roamed)] {
+            let frags = client
+                .fragger
+                .make_fragments(&instruction(n), max_fragment_payload(MTU_IPV4))
+                .unwrap();
+            let wire = client.encrypt_fragment(&frags[0]).unwrap();
+            server.process_incoming(&wire, from).unwrap();
+        }
+
+        assert_eq!(server.remote_addr(), Some(roamed));
+    }
+
+    /// Garbage must not authenticate.
+    #[tokio::test]
+    async fn rejects_undecryptable_datagrams() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(key()))
+            .await
+            .unwrap();
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(server.process_incoming(&[0u8; 40], peer).is_err());
     }
 }

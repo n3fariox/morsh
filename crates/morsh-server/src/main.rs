@@ -4,6 +4,7 @@ mod pty;
 mod server;
 
 use morsh_crypto::Base64Key;
+use morsh_log::LogGuard;
 use std::env;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -21,30 +22,45 @@ fn get_ssh_connection_ip() -> Option<String> {
     None
 }
 
+/// Find a free UDP port on `ip` within the requested range.
+///
+/// `low == 0` means "any port".  Mirrors mosh, which walks the range and takes
+/// the first port it can bind.
+fn pick_port(ip: &str, low: u16, high: u16) -> Result<u16, String> {
+    let addr_for = |port: u16| -> SocketAddr {
+        match ip.parse::<std::net::IpAddr>() {
+            Ok(parsed) => SocketAddr::new(parsed, port),
+            Err(_) => SocketAddr::new("0.0.0.0".parse().unwrap(), port),
+        }
+    };
+
+    if low == 0 {
+        let sock = std::net::UdpSocket::bind(addr_for(0))
+            .map_err(|e| format!("Failed to bind to {ip}: {e}"))?;
+        return sock.local_addr().map(|a| a.port()).map_err(|e| e.to_string());
+    }
+
+    let mut last_err = String::new();
+    for port in low..=high {
+        match std::net::UdpSocket::bind(addr_for(port)) {
+            Ok(sock) => return sock.local_addr().map(|a| a.port()).map_err(|e| e.to_string()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(format!("Failed to bind to any port in {low}:{high}: {last_err}"))
+}
+
+fn init_logging(log_file: &Option<String>) -> LogGuard {
+    match log_file {
+        Some(path) => morsh_log::init_at("morsh-server", &std::path::PathBuf::from(path)),
+        None => morsh_log::init("morsh-server"),
+    }
+}
+
 fn main() {
     let opts = cli::parse();
 
     let is_daemon_child = env::var("MORSH_DAEMON_CHILD").is_ok();
-    let mut bind_port = opts.port;
-    if is_daemon_child {
-        if let Ok(port_str) = env::var("MORSH_DAEMON_PORT") {
-            if let Ok(port_val) = port_str.parse::<u16>() {
-                bind_port = port_val;
-            }
-        }
-    }
-
-    let shell = if opts.command_args.is_empty() {
-        env::var("SHELL").unwrap_or_else(|_| {
-            if cfg!(windows) {
-                "cmd.exe".to_string()
-            } else {
-                "/bin/sh".to_string()
-            }
-        })
-    } else {
-        opts.command_args[0].clone()
-    };
 
     let key = if let Ok(key_str) = env::var("MORSH_KEY") {
         Base64Key::from_printable(&key_str).unwrap_or_else(|e| {
@@ -60,45 +76,57 @@ fn main() {
     } else {
         None
     };
-    let desired_ip = opts.bind_addr.as_deref().or(ssh_ip.as_deref());
+    let desired_ip = opts.bind_addr.clone().or(ssh_ip);
 
-    let addr: SocketAddr = if let Some(ip) = desired_ip {
-        match ip.parse::<std::net::IpAddr>() {
-            Ok(ip) => SocketAddr::new(ip, bind_port),
-            Err(_) => SocketAddr::new("0.0.0.0".parse().unwrap(), bind_port),
-        }
+    // The daemon child inherits the port its parent already advertised.
+    let port = if is_daemon_child {
+        env::var("MORSH_DAEMON_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0)
     } else {
-        SocketAddr::new("0.0.0.0".parse().unwrap(), bind_port)
+        match pick_port(
+            desired_ip.as_deref().unwrap_or("0.0.0.0"),
+            opts.port_low,
+            opts.port_high,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("morsh-server: {e}");
+                std::process::exit(1);
+            }
+        }
     };
 
-    let sock = std::net::UdpSocket::bind(addr).unwrap_or_else(|e| {
-        let fallback: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-        eprintln!("morsh-server: Failed to bind to {addr}: {e}, trying {fallback}");
-        std::net::UdpSocket::bind(fallback).unwrap_or_else(|e| {
-            eprintln!("morsh-server: Failed to bind: {e}");
-            std::process::exit(1);
+    let shell = if opts.command_args.is_empty() {
+        env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "cmd.exe".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
         })
-    });
-
-    let port = sock.local_addr().unwrap().port();
-    drop(sock);
+    } else {
+        opts.command_args[0].clone()
+    };
 
     if !is_daemon_child {
         println!("MOSH CONNECT {} {}", port, key.printable_key());
         println!("MOSH CONNECTION ID: 1");
         std::io::stdout().flush().unwrap();
-        tracing::info!("MOSH CONNECT printed, preparing to daemonize (port {port})");
     }
+
+    // The appender guard must live for the whole of `main`; binding it inside
+    // an `if` would drop it at the end of the block and silently discard every
+    // log record written after startup.
+    let mut _log_guard: Option<LogGuard> = None;
 
     if opts.no_daemonize || is_daemon_child {
         if is_daemon_child {
             daemon::redirect_stdio();
         }
 
-        let _guard = match &opts.log_file {
-            Some(path) => morsh_log::init_at("morsh-server", &std::path::PathBuf::from(path)),
-            None => morsh_log::init("morsh-server"),
-        };
+        _log_guard = Some(init_logging(&opts.log_file));
 
         if is_daemon_child {
             tracing::info!("Daemon child mode, stdio redirected to NUL, logging to file");
@@ -110,15 +138,9 @@ fn main() {
         env::set_var("MORSH_DAEMON_PORT", port.to_string());
         env::set_var("MORSH_KEY", key.printable_key());
 
-        tracing::info!("Preparing to daemonize (port {port})");
-
         if daemon::fork_and_detach(port) {
+            _log_guard = Some(init_logging(&opts.log_file));
             tracing::info!("Child process continuing after fork, detaching from SSH");
-
-            let _guard = match &opts.log_file {
-                Some(path) => morsh_log::init_at("morsh-server", &std::path::PathBuf::from(path)),
-                None => morsh_log::init("morsh-server"),
-            };
 
             eprintln!("morsh-server: logging to ~/.morsh/logs/morsh-server.log");
             daemon::redirect_stdio();
@@ -126,13 +148,15 @@ fn main() {
         }
     }
 
-    tracing::info!("Server starting on port {port} (PID: {})", std::process::id());
-
+    tracing::info!(
+        "Server starting on port {port} (PID: {})",
+        std::process::id()
+    );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     if let Err(e) = rt.block_on(server::run_server(
         port,
-        desired_ip,
+        desired_ip.as_deref(),
         key,
         shell,
         opts.command_args,
@@ -142,6 +166,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-
-

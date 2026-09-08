@@ -1,4 +1,5 @@
-use morsh_proto::client::{UserMessage, Instruction as ClientInstruction, Keystroke, ResizeMessage};
+use morsh_network::State;
+use morsh_proto::client::{Instruction as ClientInstruction, Keystroke, ResizeMessage, UserMessage};
 use prost::Message;
 
 /// A user input event: keystroke or resize.
@@ -41,7 +42,7 @@ impl UserStream {
 
     /// Compute the diff from `existing` to `self`.
     /// Returns serialized ClientBuffers::UserMessage.
-    pub fn diff_from(&self, existing: &UserStream) -> Vec<u8> {
+    fn encode_diff_from(&self, existing: &UserStream) -> Vec<u8> {
         let mut msg = UserMessage { instruction: Vec::new() };
 
         // Find where existing ends and our new events begin
@@ -88,9 +89,12 @@ impl UserStream {
     }
 
     /// Apply a serialized diff to this stream.
-    pub fn apply_string(&mut self, diff: &[u8]) {
+    ///
+    /// The diff comes off the network, so a malformed one is an error to
+    /// report — not a panic that takes the server down with it.
+    fn decode_and_apply(&mut self, diff: &[u8]) -> Result<(), String> {
         let msg = UserMessage::decode(diff)
-            .expect("Failed to decode UserMessage");
+            .map_err(|e| format!("Malformed UserMessage from peer: {e}"))?;
 
         for inst in &msg.instruction {
             if let Some(ref keystroke) = inst.keystroke {
@@ -106,12 +110,13 @@ impl UserStream {
                 self.events.push(UserEvent::Resize { width: w, height: h });
             }
         }
+
+        Ok(())
     }
 
-    /// Remove the common prefix with `prefix`.
-    pub fn subtract(&mut self, prefix: &UserStream) {
-        let common = self.common_prefix_len(prefix);
-        self.events.drain(..common);
+    /// All queued events, oldest first.
+    pub fn events(&self) -> &[UserEvent] {
+        &self.events
     }
 
     /// Number of events in the stream.
@@ -141,9 +146,34 @@ impl UserStream {
     }
 }
 
+
+impl State for UserStream {
+    /// User input is a queue: everything the peer has acknowledged can be
+    /// dropped off the front, so the protocol runs its rationalization pass.
+    const HAS_PREFIX: bool = true;
+
+    fn diff_from(&self, existing: &Self) -> Vec<u8> {
+        self.encode_diff_from(existing)
+    }
+
+    fn apply_string(&mut self, diff: &[u8]) -> Result<(), String> {
+        self.decode_and_apply(diff)
+    }
+
+    fn subtract(&mut self, prefix: &Self) {
+        let common = self.common_prefix_len(prefix);
+        self.events.drain(..common);
+    }
+
+    fn state_equal(&self, other: &Self) -> bool {
+        self.events == other.events
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use morsh_network::State;
 
     #[test]
     fn push_and_length() {
@@ -166,7 +196,7 @@ mod tests {
 
         // Apply diff to empty stream
         let mut applied = UserStream::new();
-        applied.apply_string(&diff);
+        applied.apply_string(&diff).unwrap();
         assert_eq!(applied.len(), 1);
         assert_eq!(applied.get(0), Some(&UserEvent::UserByte(b'x')));
     }
@@ -185,7 +215,7 @@ mod tests {
         // b has more events, so b.diff_from(&a) gives the new event
         let diff = b.diff_from(&a);
         let mut result = a.clone();
-        result.apply_string(&diff);
+        result.apply_string(&diff).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.get(2), Some(&UserEvent::UserByte(b'c')));
     }
@@ -228,7 +258,7 @@ mod tests {
         // s has new events compared to empty
         let diff = s.diff_from(&empty);
         let mut result = UserStream::new();
-        result.apply_string(&diff);
+        result.apply_string(&diff).unwrap();
         assert_eq!(result.get(0), Some(&UserEvent::Resize { width: 120, height: 40 }));
     }
 }
