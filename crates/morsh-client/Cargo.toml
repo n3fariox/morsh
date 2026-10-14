@@ -11,8 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "sync", "signal"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
-futures = "0.3"
+crossterm = "0.28"
 morsh-crypto = { path = "../morsh-crypto" }
 morsh-proto = { path = "../morsh-proto" }
 morsh-terminal = { path = "../morsh-terminal" }

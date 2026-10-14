@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use cli::ParseOutcome;
 use frame::output_new_frame;
-use input::{handle_term_event, spawn_input_reader, TermEvent};
+use input::{handle_term_event, spawn_input_reader, EscapeConfig, TermEvent};
 
 /// Longest we sleep between housekeeping passes.
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -80,12 +80,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prediction.set_send_interval(transport.send_interval_ms());
 
     let mut notifications = NotificationEngine::new();
-    notifications.set_escape_key_string("Ctrl-^ .".to_string());
+    // Same variable and values as stock mosh-client; empty disables it.
+    let escape = EscapeConfig::from_env();
+    if let Some(escape) = &escape {
+        notifications.set_escape_key_string(escape.quit_keystroke());
+        notifications.set_escape_key_help(escape.help());
+    }
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     #[cfg(windows)]
     let original_console_mode = enable_delayed_wrap();
+    #[cfg(windows)]
+    let original_input_mode = input::enable_vt_input();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
     // What we believe is currently on the user's screen. The alternate screen
@@ -95,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut local_framebuffer = Complete::new(cols, rows)?.snapshot();
 
     let (term_tx, mut term_rx) = mpsc::channel::<TermEvent>(64);
-    let input_handle = spawn_input_reader(term_tx);
+    spawn_input_reader(term_tx, escape);
 
     tracing::info!("Entering event loop");
     let started = Instant::now();
@@ -195,10 +202,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup
     let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
+    // The saved input mode is the raw one, so put it back before leaving raw mode.
+    #[cfg(windows)]
+    input::restore_input_mode(original_input_mode);
     let _ = terminal::disable_raw_mode();
     #[cfg(windows)]
     restore_console_mode(original_console_mode);
-    input_handle.abort();
     println!("morsh is exiting.");
 
     if connect_failed {
