@@ -3,6 +3,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
+mod ssh_config;
+use ssh_config::SshConfig;
+
 /// Which SSH backend to use for connecting to the remote host.
 #[cfg_attr(not(feature = "russh"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -153,8 +156,12 @@ fn main() {
         ip => BindServer::Address(ip.to_string()),
     };
 
+    // Expand ssh aliases (`Host` blocks in ~/.ssh/config) the way ssh itself
+    // would, so `morsh alias` reaches the same machine as `ssh alias`.
+    let ssh_cfg = query_ssh_config(&args.ssh_command, &args.host);
+
     #[cfg(feature = "russh")]
-    let info = try_launch_ssh(&args, &bind_arg).unwrap_or_else(|| {
+    let info = try_launch_ssh(&args, &bind_arg, ssh_cfg.as_ref()).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
@@ -178,7 +185,7 @@ fn main() {
     // our own DNS lookup would never produce.
     let server_ip = match &bind_arg {
         BindServer::Address(ip) => ip.clone(),
-        _ => resolve_host(&args.host),
+        _ => resolve_host(&target_hostname(&args.host, ssh_cfg.as_ref())),
     };
 
     tracing::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
@@ -460,31 +467,42 @@ fn try_launch_server(
     connect_info
 }
 
-fn resolve_host(host: &str) -> String {
-    let hostname = host.split('@').next_back().unwrap_or(host);
-    let hostname = hostname.split(':').next().unwrap_or(hostname);
+/// The host part of a `[user@]host[:port]` argument.
+fn host_part(host: &str) -> &str {
+    host.rsplit_once('@').map_or(host, |(_, h)| h)
+}
 
+/// Ask ssh how it would expand `host`, unless the argument uses morsh's own
+/// `host:port` form, which ssh does not understand.
+fn query_ssh_config(ssh_command: &str, host: &str) -> Option<SshConfig> {
+    if host_part(host).contains(':') {
+        return None;
+    }
+    ssh_config::query(ssh_command, host)
+}
+
+/// The real host name behind the argument: ssh's `HostName` for an alias,
+/// otherwise the argument minus any `user@` and `:port`.
+fn target_hostname(host: &str, cfg: Option<&SshConfig>) -> String {
+    if let Some(hostname) = cfg.and_then(|c| c.hostname.as_deref()) {
+        return hostname.to_string();
+    }
+    let hostname = host_part(host);
+    hostname.split(':').next().unwrap_or(hostname).to_string()
+}
+
+fn resolve_host(hostname: &str) -> String {
     tracing::info!("Resolving hostname: {hostname}");
 
-    let addrs = format!("{hostname}:0")
+    let addrs: Vec<_> = (hostname, 0u16)
         .to_socket_addrs()
         .unwrap_or_else(|e| {
             eprintln!("Failed to resolve hostname '{hostname}': {e}");
             std::process::exit(1);
-        });
-
-    for addr in addrs {
-        if addr.ip().is_ipv4() {
-            return addr.ip().to_string();
-        }
-    }
-
-    let addrs: Vec<_> = format!("{hostname}:0")
-        .to_socket_addrs()
-        .expect("No addresses found")
+        })
         .collect();
 
-    if let Some(addr) = addrs.first() {
+    if let Some(addr) = addrs.iter().find(|a| a.ip().is_ipv4()).or(addrs.first()) {
         return addr.ip().to_string();
     }
 
@@ -495,13 +513,20 @@ fn resolve_host(host: &str) -> String {
 // ── russh (pure-Rust) backend ──────────────────────────────────────────────────
 
 #[cfg(feature = "russh")]
-fn try_launch_ssh(args: &Args, bind: &BindServer) -> Option<ConnectInfo> {
-    let mode = args.ssh_mode;
+fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Option<ConnectInfo> {
+    let mut mode = args.ssh_mode;
+
+    // russh can't follow ProxyJump/ProxyCommand; only system ssh reaches
+    // such hosts.
+    if mode == SshMode::Auto && cfg.is_some_and(|c| c.uses_proxy) {
+        tracing::info!("host is behind a proxy in ssh config, using system ssh");
+        mode = SshMode::System;
+    }
 
     if mode == SshMode::Russh || mode == SshMode::Auto {
-        if let Some(ref key_path) = find_default_key() {
+        if let Some(ref key_path) = find_key(cfg) {
             tracing::info!("Connecting via russh (key: {})", key_path.display());
-            match try_launch_russh(args, bind, key_path) {
+            match try_launch_russh(args, bind, cfg, key_path) {
                 Some(info) => return Some(info),
                 None if mode == SshMode::Russh => return None,
                 None => tracing::info!("russh connection failed, falling back to system ssh"),
@@ -524,16 +549,15 @@ fn try_launch_ssh(args: &Args, bind: &BindServer) -> Option<ConnectInfo> {
 }
 
 #[cfg(feature = "russh")]
-fn try_launch_russh(args: &Args, bind: &BindServer, key_path: &std::path::Path) -> Option<ConnectInfo> {
+fn try_launch_russh(
+    args: &Args,
+    bind: &BindServer,
+    cfg: Option<&SshConfig>,
+    key_path: &std::path::Path,
+) -> Option<ConnectInfo> {
     use morsh_ssh::SshSession;
 
-    let (user, hostname) = parse_user_host(&args.host);
-
-    let port = hostname
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-        .unwrap_or(22);
-
+    let (user, hostname, port) = russh_target(&args.host, cfg);
     let addr = format!("{hostname}:{port}");
 
     tracing::info!("russh: connecting to {addr} as {user}");
@@ -586,43 +610,59 @@ fn try_launch_russh(args: &Args, bind: &BindServer, key_path: &std::path::Path) 
     result
 }
 
+/// User, host name and port for a direct russh connection.
+///
+/// An explicit `user@` / `:port` in the argument wins, then ssh config, then
+/// the same defaults ssh uses (the local user name, port 22).
 #[cfg(feature = "russh")]
-fn parse_user_host(s: &str) -> (String, String) {
-    if let Some(at_pos) = s.rfind('@') {
-        let user = s[..at_pos].to_string();
-        let host = s[at_pos + 1..].to_string();
-        (user, host)
-    } else {
-        ("root".to_string(), s.to_string())
-    }
+fn russh_target(host: &str, cfg: Option<&SshConfig>) -> (String, String, u16) {
+    let explicit_user = host.rsplit_once('@').map(|(u, _)| u.to_string());
+    let explicit_port = host_part(host)
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok());
+
+    let user = explicit_user
+        .or_else(|| cfg.and_then(|c| c.user.clone()))
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_else(|| "root".to_string());
+    let hostname = target_hostname(host, cfg);
+    let port = explicit_port
+        .or_else(|| cfg.and_then(|c| c.port))
+        .unwrap_or(22);
+
+    (user, hostname, port)
 }
 
 #[cfg(feature = "russh")]
 fn tilde_expand(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        // HOME is usually unset on Windows; USERPROFILE is its equivalent.
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             return format!("{home}/{rest}");
         }
     }
     path.to_string()
 }
 
+/// The private key to offer: the first existing `IdentityFile` from ssh
+/// config (which already lists ssh's defaults when none is configured),
+/// otherwise the usual default locations.
 #[cfg(feature = "russh")]
-fn find_default_key() -> Option<std::path::PathBuf> {
-    let candidates = [
+fn find_key(cfg: Option<&SshConfig>) -> Option<std::path::PathBuf> {
+    const DEFAULTS: [&str; 4] = [
         "~/.ssh/id_ed25519",
         "~/.ssh/id_rsa",
         "~/.ssh/id_ecdsa",
         "~/.ssh/identity",
     ];
-    for pattern in &candidates {
-        let path = tilde_expand(pattern);
-        let path = std::path::PathBuf::from(&path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
+    let configured = cfg.map(|c| c.identity_files.as_slice()).unwrap_or_default();
+    configured
+        .iter()
+        .map(String::as_str)
+        .chain(DEFAULTS)
+        .map(|p| std::path::PathBuf::from(tilde_expand(p)))
+        .find(|p| p.is_file())
 }
 
 #[cfg(test)]
@@ -726,6 +766,57 @@ mod tests {
         );
         assert!(cmd.contains("'hello world'"), "{cmd}");
         assert!(cmd.starts_with("export LANG=en_US.UTF-8;"), "{cmd}");
+    }
+
+    #[test]
+    fn an_alias_resolves_to_its_configured_hostname() {
+        let cfg = SshConfig {
+            hostname: Some("203.0.113.9".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(target_hostname("myalias", Some(&cfg)), "203.0.113.9");
+        assert_eq!(target_hostname("bob@myalias", Some(&cfg)), "203.0.113.9");
+    }
+
+    #[test]
+    fn without_ssh_config_the_argument_is_taken_literally() {
+        assert_eq!(target_hostname("bob@example.org:2222", None), "example.org");
+        assert_eq!(target_hostname("example.org", None), "example.org");
+    }
+
+    #[test]
+    fn morshs_host_port_form_is_not_sent_to_ssh() {
+        assert!(query_ssh_config("ssh", "bob@example.org:2222").is_none());
+    }
+
+    #[cfg(feature = "russh")]
+    #[test]
+    fn russh_uses_user_and_port_from_ssh_config() {
+        let cfg = SshConfig {
+            hostname: Some("203.0.113.9".to_string()),
+            user: Some("alice".to_string()),
+            port: Some(2222),
+            ..Default::default()
+        };
+        assert_eq!(
+            russh_target("myalias", Some(&cfg)),
+            ("alice".to_string(), "203.0.113.9".to_string(), 2222)
+        );
+    }
+
+    #[cfg(feature = "russh")]
+    #[test]
+    fn an_explicit_user_and_port_override_ssh_config() {
+        let cfg = SshConfig {
+            hostname: Some("h".to_string()),
+            user: Some("alice".to_string()),
+            port: Some(2222),
+            ..Default::default()
+        };
+        let (user, _, _) = russh_target("bob@myalias", Some(&cfg));
+        assert_eq!(user, "bob");
+        let (_, host, port) = russh_target("example.org:2200", None);
+        assert_eq!((host.as_str(), port), ("example.org", 2200));
     }
 
     #[test]
