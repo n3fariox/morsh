@@ -13,7 +13,22 @@ permissions:
   contents: write
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tags come from `cargo release`; refuse to ship binaries whose --version disagrees with the tag.
+      - name: Check tag matches Cargo.toml version
+        run: |
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${VERSION}; release with 'cargo release'"
+            exit 1
+          fi
+
   build:
+    needs: check-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
