@@ -9,6 +9,19 @@ pub enum DisplayPreference {
     Adaptive,
 }
 
+/// Where we are in parsing an escape sequence typed by the user
+/// (e.g. arrow keys arrive as `ESC [ D` or `ESC O D`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputState {
+    Ground,
+    /// Saw ESC.
+    Escape,
+    /// Saw `ESC [`; parameter/intermediate bytes until a final byte.
+    Csi,
+    /// Saw `ESC O` (application cursor/keypad mode); next byte is final.
+    Ss3,
+}
+
 /// The prediction engine tracks speculative local echo for low-latency feel.
 ///
 /// When the user types a character, the prediction engine immediately shows
@@ -53,6 +66,9 @@ pub struct PredictionEngine {
     last_height: usize,
     /// Last known terminal width.
     last_width: usize,
+
+    /// Escape-sequence parser state for user input.
+    input_state: InputState,
 }
 
 // Thresholds (from mosh C++ source)
@@ -84,6 +100,7 @@ impl PredictionEngine {
             predict_overwrite: false,
             last_height: 0,
             last_width: 0,
+            input_state: InputState::Ground,
         }
     }
 
@@ -152,6 +169,20 @@ impl PredictionEngine {
         self.prediction_epoch += 1;
     }
 
+    /// Input whose effect we can't predict (Enter, Ctrl-C, Up/Down, Alt+key...).
+    /// The server may move the cursor anywhere, so drop the predicted cursor;
+    /// the next keystroke then starts from the server's real cursor position.
+    fn unknown_input(&mut self) {
+        self.cursors.clear();
+        self.become_tentative();
+    }
+
+    /// Highest epoch the server has confirmed. Overlay cells from later
+    /// epochs are tentative and must not be displayed.
+    pub fn confirmed_epoch(&self) -> u64 {
+        self.confirmed_epoch
+    }
+
     /// Initialize cursor prediction if none exists.
     fn init_cursor(&mut self, cursor_row: usize, cursor_col: usize) {
         let dominated = self.cursors.last().is_some_and(|c| {
@@ -174,6 +205,18 @@ impl PredictionEngine {
     /// Get the current cursor position from the cursor predictions.
     pub fn cursor_pos(&self) -> Option<(usize, usize)> {
         self.cursors.last().filter(|c| c.active).map(|c| (c.row, c.col))
+    }
+
+    /// Predicted cursor position to show on screen, if predictions are being
+    /// displayed and the prediction isn't tentative.
+    pub fn display_cursor(&self) -> Option<(usize, usize)> {
+        if !self.should_display() {
+            return None;
+        }
+        self.cursors
+            .last()
+            .filter(|c| c.active && !c.is_tentative(self.confirmed_epoch))
+            .map(|c| (c.row, c.col))
     }
 
     /// Reset all predictions.
@@ -216,18 +259,68 @@ impl PredictionEngine {
 
         self.init_cursor(cursor_row, cursor_col);
 
-        if ch == '\x7f' {
+        // Escape sequences (arrow keys, function keys, Alt+key) must not be
+        // predicted as printable text.
+        match self.input_state {
+            InputState::Ground => {}
+            InputState::Escape => {
+                self.input_state = match ch {
+                    '[' => InputState::Csi,
+                    'O' => InputState::Ss3,
+                    _ => {
+                        // Alt+key or other ESC dispatch: unknown effect
+                        self.unknown_input();
+                        InputState::Ground
+                    }
+                };
+                return;
+            }
+            InputState::Csi => {
+                // Final bytes are 0x40..=0x7E; anything else is a parameter/intermediate
+                if ('\x40'..='\x7e').contains(&ch) {
+                    self.input_state = InputState::Ground;
+                    self.predict_cursor_key(ch, num_cols);
+                }
+                return;
+            }
+            InputState::Ss3 => {
+                self.input_state = InputState::Ground;
+                self.predict_cursor_key(ch, num_cols);
+                return;
+            }
+        }
+
+        if ch == '\x1b' {
+            self.input_state = InputState::Escape;
+        } else if ch == '\x7f' {
             self.predict_backspace(cursor_row, cursor_col, num_cols, &cell_at);
-        } else if ch == '\r' || ch == '\n' {
-            // A newline moves the cursor somewhere we cannot predict the
-            // contents of, so the whole epoch becomes tentative.
-            self.become_tentative();
-            self.newline_carriage_return(cursor_row, num_cols, num_rows);
         } else if ch.is_control() || (!ch.is_ascii_graphic() && ch != ' ') {
-            // Unknown control character — become tentative
-            self.become_tentative();
+            // Unknown control character (including Enter) — the server may
+            // move the cursor anywhere, so it's no longer predictable
+            self.unknown_input();
         } else {
             self.predict_insert(ch, cursor_row, cursor_col, num_cols, num_rows, &cell_at);
+        }
+    }
+
+    /// Handle the final byte of a CSI/SS3 key sequence. Left/right arrows move
+    /// the predicted cursor (as stock mosh does); anything else is unknown.
+    fn predict_cursor_key(&mut self, final_byte: char, num_cols: usize) {
+        let frame = self.local_frame_sent + 1;
+        match (final_byte, self.cursors.last_mut()) {
+            ('C', Some(cursor)) => {
+                if cursor.col + 1 < num_cols {
+                    cursor.col += 1;
+                    cursor.expiration_frame = frame;
+                }
+            }
+            ('D', Some(cursor)) => {
+                if cursor.col > 0 {
+                    cursor.col -= 1;
+                    cursor.expiration_frame = frame;
+                }
+            }
+            _ => self.unknown_input(),
         }
     }
 
@@ -624,6 +717,82 @@ mod tests {
 
         let cursor = engine.cursor_pos();
         assert_eq!(cursor, Some((5, 11))); // moved right
+    }
+
+    #[test]
+    fn arrow_keys_are_not_predicted_as_text() {
+        for seq in ["\x1b[D", "\x1bOD", "\x1b[1;5D"] {
+            let mut engine = PredictionEngine::new();
+            engine.set_display_preference(DisplayPreference::Always);
+            for ch in seq.chars() {
+                engine.new_user_byte(ch, 5, 10, 80, 24, |_, _| ' ');
+            }
+            assert!(!engine.is_active(), "{seq:?} produced overlay cells");
+            assert_eq!(engine.cursor_pos(), Some((5, 9)), "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn enter_drops_predicted_cursor_and_makes_next_key_tentative() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.new_user_byte('l', 5, 10, 80, 24, |_, _| ' ');
+        engine.new_user_byte('\r', 5, 11, 80, 24, |_, _| ' ');
+        // Server decides where the cursor goes after Enter
+        assert_eq!(engine.cursor_pos(), None);
+
+        // Next key starts from the server's cursor (a new line), not the old one
+        engine.new_user_byte('h', 7, 2, 80, 24, |_, _| ' ');
+        assert_eq!(engine.cursor_pos(), Some((7, 3)));
+        let cell = engine.overlay().rows()
+            .flat_map(|r| r.cells.iter().map(move |c| (r.row_num, c)))
+            .find(|(_, c)| c.active && c.replacement == 'h')
+            .map(|(row, c)| (row, c.col, c.is_tentative(engine.confirmed_epoch())));
+        assert_eq!(cell, Some((7, 2, true)));
+    }
+
+    fn predicted_row(engine: &PredictionEngine, row: usize) -> String {
+        engine.overlay().rows().find(|r| r.row_num == row).map(|r| {
+            r.cells.iter().map(|c| match (c.active, c.unknown) {
+                (false, _) => '.',
+                (true, true) => '?',
+                (true, false) => c.replacement,
+            }).collect()
+        }).unwrap_or_default()
+    }
+
+    #[test]
+    fn insert_mid_line_shifts_actual_text() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        let row: Vec<char> = "$ abc     ".chars().collect();
+        // Cursor on 'b'; typing 'X' should predict "$ aXbc" with the tail shifted
+        engine.new_user_byte('X', 0, 3, 10, 5, |_, col| row[col]);
+        assert_eq!(predicted_row(&engine, 0), "...Xbc   ?");
+    }
+
+    #[test]
+    fn backspace_mid_line_shifts_actual_text() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        let row: Vec<char> = "$ abc     ".chars().collect();
+        // Cursor on 'c'; backspace removes 'b'
+        engine.new_user_byte('\x7f', 0, 4, 10, 5, |_, col| row[col]);
+        assert_eq!(predicted_row(&engine, 0), "...c    ??");
+        assert_eq!(engine.cursor_pos(), Some((0, 3)));
+    }
+
+    #[test]
+    fn typing_resumes_after_escape_sequence() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        for ch in "\x1b[C".chars() {
+            engine.new_user_byte(ch, 5, 10, 80, 24, |_, _| ' ');
+        }
+        assert_eq!(engine.cursor_pos(), Some((5, 11)));
+        engine.new_user_byte('x', 5, 11, 80, 24, |_, _| ' ');
+        assert!(engine.is_active());
+        assert_eq!(engine.cursor_pos(), Some((5, 12)));
     }
 
     #[test]

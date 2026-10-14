@@ -135,18 +135,20 @@ impl DisplayDiff {
         let mut last_style = CellStyle::default_style();
 
         for (y, row) in snap.rows.iter().enumerate() {
-            if y > 0 {
-                out.push_str("\r\n");
-            }
+            // Absolute positioning per row rather than "\r\n": terminals differ
+            // on wrap/newline behavior at the right margin (notably the
+            // Windows console), and CUP is unambiguous.
+            let _ = write!(out, "\x1b[{};1H", y + 1);
             let mut x = 0usize;
             while x < row.len() {
                 let cell = &row[x];
-                if !cell.style.is_default() && cell.style != last_style {
-                    out.push_str(&style_on(&cell.style));
-                    last_style = cell.style;
-                } else if cell.style.is_default() && !last_style.is_default() {
+                if cell.style != last_style {
+                    // Reset first so attributes of the previous style don't leak
                     out.push_str("\x1b[0m");
-                    last_style = CellStyle::default_style();
+                    if !cell.style.is_default() {
+                        out.push_str(&style_on(&cell.style));
+                    }
+                    last_style = cell.style;
                 }
                 if cell.text.is_empty() {
                     out.push(' ');
@@ -691,5 +693,51 @@ mod tests {
         assert!(vt.contains("\x1b[?2004l"));
         assert!(vt.contains("\x1b[?1000l"));
         assert!(vt.contains("\x1b[r"), "scrolling region must be reset");
+    }
+
+    fn text_rows(snap: &ScreenSnapshot) -> Vec<String> {
+        snap.rows.iter().map(|r| r.iter().map(|c| if c.text.is_empty() { " " } else { c.text.as_str() }).collect()).collect()
+    }
+
+    /// Replays a stock mosh-server session (from a real log) into a model
+    /// terminal, renders it frame by frame into a second terminal, and checks
+    /// the second terminal ends up identical — including after an absolute
+    /// cursor move (Ctrl-A -> CSI 3;3 H), which exposed vertical drift when the
+    /// raw bytes were written straight to the Windows console.
+    #[test]
+    fn rendering_reproduces_model_across_frames() {
+        use crate::MoshTerminal;
+        let (cols, rows) = (40u16, 10u16);
+        let mut first = String::from("\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[?25l");
+        for _ in 0..rows { first.push_str("\x1b[K\n"); }
+        first.push_str("\x1b[K\x1b[1;1H\x1b[?25h\x1b[0m");
+        let frames: Vec<&str> = vec![
+            &first,
+            "\n",
+            "\x1b]0;captain@destroyer:~\x07\x1b[0;1;32mcaptain@destroyer\x1b[0m: \x1b[0;33m~\x1b[0m \x1b[?25l\r\n$ \x1b[?25h",
+            "a", ";", "sk", "d", "j", " f", "\u{4e2d}x",
+            "\x1b[3;3H",
+            "\x1b[K",
+            "fs",
+        ];
+
+        let mut model = MoshTerminal::new(cols, rows, 0).unwrap();
+        let mut screen = MoshTerminal::new(cols, rows, 0).unwrap();
+        let mut displayed: Option<ScreenSnapshot> = None;
+        for f in frames {
+            model.write(f.as_bytes());
+            let snap = model.snapshot().unwrap();
+            let out = match &displayed {
+                Some(old) => DisplayDiff::diff(old, &snap),
+                None => DisplayDiff::full_redraw(&snap),
+            };
+            screen.write(out.as_bytes());
+            let shown = screen.snapshot().unwrap();
+            assert_eq!(text_rows(&shown), text_rows(&snap), "after frame {f:?}");
+            assert_eq!((shown.cursor_x, shown.cursor_y), (snap.cursor_x, snap.cursor_y), "cursor after frame {f:?}");
+            displayed = Some(snap);
+        }
+        let last = displayed.unwrap();
+        assert_eq!((last.cursor_x, last.cursor_y), (4, 2));
     }
 }
