@@ -11,6 +11,7 @@ use russh::*;
 pub struct SshSession {
     session: Option<client::Handle<SshHandler>>,
     rt: tokio::runtime::Runtime,
+    peer: std::net::SocketAddr,
 }
 
 struct SshHandler;
@@ -41,13 +42,17 @@ impl SshSession {
 
         let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
 
-        let session = rt.block_on(async move {
+        let (session, peer) = rt.block_on(async move {
             let config = Arc::new(client::Config {
                 inactivity_timeout: Some(Duration::from_secs(30)),
                 ..<_>::default()
             });
 
-            let mut session = client::connect(config, addr, SshHandler)
+            let socket = connect_tcp(&addr).await?;
+            let peer = socket.peer_addr()?;
+            let _ = socket.set_nodelay(true);
+
+            let mut session = client::connect_stream(config, socket, SshHandler)
                 .await
                 .context("Failed to connect to SSH server")?;
 
@@ -57,7 +62,7 @@ impl SshSession {
                     Ok(key) => {
                         if try_key(&mut session, &user, key).await? {
                             tracing::info!("authenticated with {}", path.display());
-                            return Ok(session);
+                            return Ok((session, peer));
                         }
                     }
                     Err(keys::Error::KeyIsEncrypted) => encrypted.push(path),
@@ -69,7 +74,7 @@ impl SshSession {
                     .context("Failed to load SSH private key")?;
                 if try_key(&mut session, &user, key).await? {
                     tracing::info!("authenticated with {}", path.display());
-                    return Ok(session);
+                    return Ok((session, peer));
                 }
             }
 
@@ -79,7 +84,14 @@ impl SshSession {
         Ok(Self {
             session: Some(session),
             rt,
+            peer,
         })
+    }
+
+    /// The address the SSH connection actually reached. Like mosh's proxy
+    /// mode, the UDP session should go to this same address.
+    pub fn peer_addr(&self) -> std::net::SocketAddr {
+        self.peer
     }
 
     /// Execute a command and return all stdout + the exit code.
@@ -192,6 +204,28 @@ impl SshSession {
             })?;
         }
         Ok(())
+    }
+}
+
+/// Connect to the first reachable address of `host:port`, IPv4 first
+/// (mosh's default `--family=prefer-inet`).
+async fn connect_tcp(addr: &str) -> Result<tokio::net::TcpStream> {
+    let mut addrs: Vec<_> = tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("Failed to resolve {addr}"))?
+        .collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+
+    let mut last_err = None;
+    for a in addrs {
+        match tokio::net::TcpStream::connect(a).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    match last_err {
+        Some(e) => Err(e).with_context(|| format!("Failed to connect to {addr}")),
+        None => bail!("No addresses found for {addr}"),
     }
 }
 

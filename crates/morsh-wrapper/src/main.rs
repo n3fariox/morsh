@@ -1,8 +1,9 @@
 use clap::Parser;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
+mod fake_proxy;
 mod ssh_config;
 use ssh_config::SshConfig;
 
@@ -138,9 +139,18 @@ enum BindServer {
 struct ConnectInfo {
     port: u16,
     key: String,
+    /// The address the SSH connection actually reached (mosh's `MOSH IP`),
+    /// when the backend could observe it.
+    ip: Option<String>,
 }
 
 fn main() {
+    // ssh runs us as its ProxyCommand; see fake_proxy.rs.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some(fake_proxy::FLAG) {
+        fake_proxy::run(&argv[2..]);
+    }
+
     let _guard = morsh_log::init("morsh");
 
     let args = Args::parse();
@@ -168,7 +178,7 @@ fn main() {
     });
 
     #[cfg(not(feature = "russh"))]
-    let info = try_launch_server(&args.ssh_command, &args.host, &{
+    let info = try_launch_server(&args.ssh_command, &args.host, ssh_cfg.as_ref(), &{
         let locale_vars = collect_locale_vars();
         let rust_log = std::env::var("RUST_LOG").ok();
         let shell = resolve_remote_shell_value(&args.remote_shell)
@@ -180,15 +190,21 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Where *we* send packets. Independent of what the server binds to: a
-    // server told to use $SSH_CONNECTION may well be listening on an address
-    // our own DNS lookup would never produce.
-    let server_ip = match &bind_arg {
-        BindServer::Address(ip) => ip.clone(),
-        _ => resolve_host(&target_hostname(&args.host, ssh_cfg.as_ref())),
+    // Where *we* send packets. Like mosh, prefer the address the SSH
+    // connection itself reached; only when the backend couldn't observe it
+    // (a ProxyJump/ProxyCommand host) fall back to resolving it ourselves.
+    let server_ip = match (info.ip.clone(), &bind_arg) {
+        (Some(ip), _) => ip,
+        (None, BindServer::Address(ip)) => ip.clone(),
+        (None, _) => resolve_host(&target_hostname(&args.host, ssh_cfg.as_ref())),
+    };
+    // Bracket IPv6 literals so the port can be appended.
+    let server_addr = match server_ip.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, info.port).to_string(),
+        Err(_) => format!("{server_ip}:{}", info.port),
     };
 
-    tracing::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
+    tracing::info!("Connecting to {server_addr} with key {}", &info.key[..8]);
 
     let client_path = std::env::current_exe()
         .ok()
@@ -196,7 +212,7 @@ fn main() {
         .unwrap_or_else(|| "morsh-client".into());
 
     let exit_status = Command::new(&client_path)
-        .arg(format!("{}:{}", server_ip, info.port))
+        .arg(&server_addr)
         .env("MORSH_KEY", &info.key)
         .env("MOSH_PREDICTION_DISPLAY", &args.predict)
         .status()
@@ -412,26 +428,68 @@ fn pwsh_quote(s: &str) -> String {
 fn try_launch_server(
     ssh_command: &str,
     host: &str,
+    cfg: Option<&SshConfig>,
     remote_cmd: &str,
 ) -> Option<ConnectInfo> {
     let mut ssh_args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
+
+    // mosh's default `--experimental-remote-ip=proxy`: make ssh connect
+    // through `morsh --fake-proxy`, which reports the address it reached.
+    // Unlike mosh, keep a ProxyJump/ProxyCommand the user configured: ours
+    // would replace it and the host would become unreachable.
+    let proxy = match cfg {
+        Some(c) if c.uses_proxy => None,
+        _ => fake_proxy::proxy_command(),
+    };
+    if let Some(proxy) = &proxy {
+        // `-S none`: a shared ControlMaster connection would skip the proxy.
+        ssh_args.extend(["-S".into(), "none".into(), "-o".into(), format!("ProxyCommand={proxy}")]);
+    }
     ssh_args.push(host.to_string());
     ssh_args.push(remote_cmd.to_string());
 
-    tracing::info!("SSH: {ssh_command} {host}");
+    tracing::info!("SSH: {}", ssh_args[..ssh_args.len() - 1].join(" "));
     tracing::info!("Remote command: {}", ssh_args.last().unwrap());
 
-    let mut ssh_child = Command::new(&ssh_args[0])
+    let mut command = Command::new(&ssh_args[0]);
+    command
         .args(&ssh_args[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stdin(Stdio::null());
+    // ssh runs ProxyCommand with `$SHELL -c`; mosh pins it to /bin/sh because
+    // exotic shells and noisy rc files break the proxy.
+    #[cfg(unix)]
+    if proxy.is_some() {
+        command.env("SHELL", "/bin/sh");
+    }
+    let mut ssh_child = command.spawn().ok()?;
 
     let stdout = ssh_child.stdout.take()?;
     let stderr = ssh_child.stderr.take()?;
     let reader = BufReader::new(stdout);
+
+    // The fake proxy reports on stderr. Read it as it arrives, or a chatty
+    // ssh could fill the pipe and stall. The address is handed over as soon
+    // as it is seen, so we never wait on the proxy process to exit.
+    let (ip_tx, ip_rx) = std::sync::mpsc::channel::<String>();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut rest = String::new();
+        let mut seen_ip = false;
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            match fake_proxy::parse_ip_line(&line) {
+                Some(addr) if !seen_ip => {
+                    seen_ip = true;
+                    let _ = ip_tx.send(addr.to_string());
+                }
+                _ => {
+                    rest.push_str(&line);
+                    rest.push('\n');
+                }
+            }
+        }
+        rest
+    });
 
     let mut connect_info = None;
 
@@ -446,6 +504,7 @@ fn try_launch_server(
                     connect_info = Some(ConnectInfo {
                         port,
                         key: parts[3].to_string(),
+                        ip: None,
                     });
                     break;
                 }
@@ -455,12 +514,23 @@ fn try_launch_server(
 
     let _ = ssh_child.wait();
 
-    // If we never found the MOSH CONNECT line, the SSH command likely
-    // failed. Surface its stderr so the user can see what went wrong.
-    if connect_info.is_none() {
-        let mut err = String::new();
-        if BufReader::new(stderr).read_to_string(&mut err).is_ok() && !err.trim().is_empty() {
-            eprint!("{err}");
+    match &mut connect_info {
+        // The proxy spoke before ssh could even authenticate, so the address
+        // is already waiting if there is one.
+        Some(info) => {
+            info.ip = ip_rx.try_recv().ok();
+            if proxy.is_some() && info.ip.is_none() {
+                tracing::info!("fake proxy reported no address; resolving locally");
+            }
+        }
+        // If we never found the MOSH CONNECT line, the SSH command likely
+        // failed. Surface its stderr so the user can see what went wrong.
+        None => {
+            if let Ok(err) = stderr_reader.join() {
+                if !err.trim().is_empty() {
+                    eprint!("{err}");
+                }
+            }
         }
     }
 
@@ -546,7 +616,7 @@ fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Op
     let shell = resolve_remote_shell_value(&args.remote_shell)
         .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
     let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
-    try_launch_server(&args.ssh_command, &args.host, &remote_cmd)
+    try_launch_server(&args.ssh_command, &args.host, cfg, &remote_cmd)
 }
 
 #[cfg(feature = "russh")]
@@ -600,6 +670,7 @@ fn try_launch_russh(
                             *guard = Some(ConnectInfo {
                                 port,
                                 key: parts[3].to_string(),
+                                ip: None,
                             });
                         }
                     }
@@ -610,7 +681,12 @@ fn try_launch_russh(
 
     tracing::info!("russh: remote command exited with code {exit_code}");
     let result = connect_info.lock().unwrap().take();
-    result
+    // We made the TCP connection ourselves, so we know where it went: the
+    // russh equivalent of mosh's fake proxy.
+    result.map(|info| ConnectInfo {
+        ip: Some(session.peer_addr().ip().to_string()),
+        ..info
+    })
 }
 
 /// User, host name and port for a direct russh connection.
