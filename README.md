@@ -110,20 +110,6 @@ transports over UDP through a proxy that impairs the link.
   when a state deep in the receive history is written to — restores cells,
   cursor, title, and input modes, but not scrollback or the scrolling region.
 
-## Releasing
-
-All crates share the version in the root `Cargo.toml`. Releases are cut from
-`main` with [cargo-release](https://github.com/crate-ci/cargo-release)
-(`cargo binstall cargo-release`):
-
-```sh
-cargo release patch            # dry run: shows the bump, commit, and tag
-cargo release patch --execute  # bump, commit "chore: release vX.Y.Z", tag vX.Y.Z, push
-```
-
-The pushed tag triggers the release workflow, which fails if the tag does not
-match the `Cargo.toml` version.
-
 ## Disclaimer
 
 This codebase was heavily AI-generated (by [opencode](https://opencode.ai) / Claude) and is not audited for correctness or security. Use at your own risk.
