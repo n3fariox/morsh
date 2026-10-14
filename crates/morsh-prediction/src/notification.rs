@@ -17,6 +17,8 @@ pub struct NotificationEngine {
     show_quit_keystroke: bool,
     /// The escape key description (e.g. "Ctrl-c .").
     escape_key_string: String,
+    /// Shown while the escape key waits for its second key.
+    escape_key_help: String,
 }
 
 impl NotificationEngine {
@@ -30,6 +32,7 @@ impl NotificationEngine {
             message_expiration: None,
             show_quit_keystroke: true,
             escape_key_string: String::new(),
+            escape_key_help: String::new(),
         }
     }
 
@@ -48,10 +51,31 @@ impl NotificationEngine {
         self.escape_key_string = s;
     }
 
+    /// Set the help shown while the escape key waits for its second key.
+    pub fn set_escape_key_help(&mut self, s: String) {
+        self.escape_key_help = s;
+    }
+
+    /// Show the escape key help until [`Self::hide_escape_help`]. The quit
+    /// keystroke is left off, since the help already says how to quit.
+    pub fn show_escape_help(&mut self) {
+        self.set_notification(self.escape_key_help.clone(), true);
+        self.show_quit_keystroke = false;
+    }
+
+    /// Take down the escape key help, unless something else has replaced it.
+    pub fn hide_escape_help(&mut self) {
+        if !self.message_is_network_error && self.message == self.escape_key_help {
+            self.message.clear();
+            self.show_quit_keystroke = true;
+        }
+    }
+
     /// Show a notification message.
     pub fn set_notification(&mut self, msg: String, permanent: bool) {
         self.message = msg;
         self.message_is_network_error = false;
+        self.show_quit_keystroke = true;
         if permanent {
             self.message_expiration = None;
         } else {
@@ -63,7 +87,9 @@ impl NotificationEngine {
     pub fn set_network_error(&mut self, msg: String) {
         self.message = msg;
         self.message_is_network_error = true;
-        self.message_expiration = Some(Instant::now() + std::time::Duration::from_millis(3100)); // ACK_INTERVAL + 100
+        self.show_quit_keystroke = true;
+        self.message_expiration = Some(Instant::now() + std::time::Duration::from_millis(3100));
+        // ACK_INTERVAL + 100
     }
 
     /// Clear the network error if one is displayed.
@@ -207,6 +233,27 @@ mod tests {
         engine.set_notification("Connected".to_string(), false);
         assert!(engine.has_message());
         assert!(!engine.need_countup());
+    }
+
+    #[test]
+    fn escape_help_hides_quit_keystroke_and_only_clears_itself() {
+        let mut engine = NotificationEngine::new();
+        engine.set_escape_key_string("Ctrl-^ .".to_string());
+        engine.set_escape_key_help("Commands: ...".to_string());
+
+        engine.show_escape_help();
+        assert_eq!(engine.get_text(), "morsh: Commands: ...");
+        engine.hide_escape_help();
+        assert!(!engine.has_message());
+
+        // Something else replaced the help: leave it up, with the quit keystroke.
+        engine.show_escape_help();
+        engine.set_notification("Exiting on user request...".to_string(), true);
+        engine.hide_escape_help();
+        assert_eq!(
+            engine.get_text(),
+            "morsh: Exiting on user request... [To quit: Ctrl-^ .]"
+        );
     }
 
     #[test]
