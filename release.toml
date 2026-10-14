@@ -1,0 +1,9 @@
+# cargo-release config: `cargo release patch --execute` bumps the shared workspace
+# version, commits, tags vX.Y.Z and pushes; the tag triggers .github/workflows/release.yml.
+allow-branch = ["main"]
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore: release v{{version}}"
+tag-message = "morsh v{{version}}"
+publish = false

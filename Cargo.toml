@@ -1,6 +1,5 @@
 [workspace]
 resolver = "2"
-license = "GPL-3.0-or-later"
 members = [
     "crates/morsh-crypto",
     "crates/morsh-proto",
@@ -14,6 +13,13 @@ members = [
     "crates/morsh-ssh",
     "crates/morsh-log",
 ]
+
+# Every crate shares this version; `cargo release` bumps it (see release.toml).
+[workspace.package]
+version = "0.0.4"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
 
 # Patch libghostty-vt-sys: its static-link mode emits `rustc-link-lib=static=ghostty-vt`,
 # which MSVC resolves to the 43 KB DLL import library (ghostty-vt.lib) instead of the real
