@@ -20,6 +20,9 @@ pub fn apply_overlay(frame: &mut ScreenSnapshot, prediction: &PredictionEngine) 
 
     let flagging = prediction.is_flagging();
     let late_acked = prediction.local_frame_late_acked();
+    // Tentative cells (typed after Enter, Up, etc.) aren't shown until the
+    // server confirms a prediction from that epoch.
+    let confirmed_epoch = prediction.confirmed_epoch();
     let (cols, rows) = (frame.cols as usize, frame.rows_count as usize);
 
     for row in prediction.overlay().rows() {
@@ -27,7 +30,9 @@ pub fn apply_overlay(frame: &mut ScreenSnapshot, prediction: &PredictionEngine) 
             continue;
         }
         for cell in &row.cells {
-            if !cell.active || cell.col >= cols {
+            // Like stock mosh, leave the last column to the server: wrap
+            // behavior there varies by application.
+            if !cell.active || cell.is_tentative(confirmed_epoch) || cell.col + 1 >= cols {
                 continue;
             }
             let pending = late_acked < cell.expiration_frame;
@@ -38,7 +43,7 @@ pub fn apply_overlay(frame: &mut ScreenSnapshot, prediction: &PredictionEngine) 
                 // An unknown prediction says "something will be here", not
                 // "a blank will be here" — painting a space over it is what
                 // made every keystroke erase the rest of the line.
-                if flagging && pending && cell.col + 1 != cols {
+                if flagging && pending {
                     target.style.underline = true;
                 }
                 continue;
@@ -52,7 +57,8 @@ pub fn apply_overlay(frame: &mut ScreenSnapshot, prediction: &PredictionEngine) 
         }
     }
 
-    if let Some((row, col)) = prediction.cursor_pos() {
+    // The predicted cursor is hidden while tentative, like its cells.
+    if let Some((row, col)) = prediction.display_cursor() {
         if row < rows && col < cols {
             frame.cursor_y = row as u16;
             frame.cursor_x = col as u16;
@@ -73,7 +79,21 @@ pub fn output_new_frame(
 
     let diff = DisplayDiff::diff(local_framebuffer, &target);
     if !diff.is_empty() {
-        stdout.write_all(diff.as_bytes())?;
+        if local_framebuffer.rows != target.rows {
+            // Synchronized update (ignored where unsupported) with the cursor
+            // hidden, so the terminal never shows a half-drawn frame or the
+            // cursor hopping between changed cells.
+            let mut out = String::with_capacity(diff.len() + 32);
+            out.push_str("\x1b[?2026h\x1b[?25l");
+            out.push_str(&diff);
+            if target.cursor_visible {
+                out.push_str("\x1b[?25h");
+            }
+            out.push_str("\x1b[?2026l");
+            stdout.write_all(out.as_bytes())?;
+        } else {
+            stdout.write_all(diff.as_bytes())?;
+        }
         stdout.flush()?;
     }
     *local_framebuffer = target;

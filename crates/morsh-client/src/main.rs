@@ -69,7 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Transport::new_client(connection, user_stream, Complete::new(cols, rows)?);
 
     let mut prediction = PredictionEngine::new();
-    prediction.set_display_preference(DisplayPreference::Adaptive);
+    // Same variable and values as stock mosh-client
+    let display_preference = match std::env::var("MOSH_PREDICTION_DISPLAY").as_deref() {
+        Ok("always") => DisplayPreference::Always,
+        Ok("never") => DisplayPreference::Never,
+        _ => DisplayPreference::Adaptive,
+    };
+    tracing::info!("Prediction display: {display_preference:?}");
+    prediction.set_display_preference(display_preference);
     prediction.set_send_interval(transport.send_interval_ms());
 
     let mut notifications = NotificationEngine::new();
@@ -77,6 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
+    #[cfg(windows)]
+    let original_console_mode = enable_delayed_wrap();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
     // What we believe is currently on the user's screen. The alternate screen
@@ -90,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Entering event loop");
     let started = Instant::now();
+    let mut connect_failed = false;
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
         output_new_frame(&transport, &prediction, &mut local_framebuffer, &mut stdout)?;
@@ -166,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             tracing::info!("Timed out waiting for server");
             notifications.set_notification("Timed out waiting for server...".to_string(), true);
+            connect_failed = true;
             break Ok(());
         }
 
@@ -185,8 +196,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup
     let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
+    #[cfg(windows)]
+    restore_console_mode(original_console_mode);
     input_handle.abort();
     println!("morsh is exiting.");
 
+    if connect_failed {
+        eprint!("{}", connect_failure_hint(server_addr));
+        std::process::exit(1);
+    }
+
     result
+}
+
+/// Message shown when the server never answers. SSH already worked, so the
+/// server is almost certainly running and UDP is being blocked on the way.
+fn connect_failure_hint(server_addr: SocketAddr) -> String {
+    let port = server_addr.port();
+    let waited = CONNECT_TIMEOUT.as_secs();
+    format!(
+        "morsh: no response from server at {server_addr} (UDP) after {waited}s.\n\
+         \n\
+         SSH worked, so the server was started, but its UDP packets aren't reaching us.\n\
+         This is usually a firewall on the remote host (or between you and it).\n\
+         Allow inbound UDP port {port} (mosh/morsh use 60000-61000 by default), e.g.:\n\
+         \n\
+         \x20 ufw:          sudo ufw allow 60000:61000/udp\n\
+         \x20 firewalld:    sudo firewall-cmd --permanent --add-port=60000-61000/udp && sudo firewall-cmd --reload\n\
+         \x20 nftables:     sudo nft add rule inet filter input udp dport 60000-61000 accept\n"
+    )
+}
+
+/// Windows console: make the cursor wait at the right margin instead of
+/// wrapping as soon as the last column is written (which scrolls the screen
+/// when on the bottom row). Returns the original mode to restore on exit.
+#[cfg(windows)]
+fn enable_delayed_wrap() -> Option<u32> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return None;
+        }
+        let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+        if SetConsoleMode(handle, new_mode) == 0 {
+            tracing::warn!("Failed to set console mode {new_mode:#x}");
+            return None;
+        }
+        Some(mode)
+    }
+}
+
+#[cfg(windows)]
+fn restore_console_mode(mode: Option<u32>) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_OUTPUT_HANDLE};
+    if let Some(mode) = mode {
+        unsafe {
+            SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+        }
+    }
 }

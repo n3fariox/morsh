@@ -42,7 +42,7 @@ struct Args {
     port_range: Option<String>,
 
     /// Predict the future (enable prediction engine)
-    #[arg(long = "predict", default_value = "adaptive")]
+    #[arg(long = "predict", default_value = "adaptive", value_parser = ["adaptive", "always", "never"])]
     predict: String,
 
     /// Control the IP address that morsh-server binds to:
@@ -191,6 +191,7 @@ fn main() {
     let exit_status = Command::new(&client_path)
         .arg(format!("{}:{}", server_ip, info.port))
         .env("MORSH_KEY", &info.key)
+        .env("MOSH_PREDICTION_DISPLAY", &args.predict)
         .status()
         .expect("Failed to start morsh-client. Is it in PATH?");
 

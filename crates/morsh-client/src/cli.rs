@@ -17,7 +17,8 @@ Options:
   -v, --version    Show version information
 
 Environment:
-  MORSH_KEY    Base64 encryption key (from morsh-server output)";
+  MORSH_KEY                Base64 encryption key (from morsh-server output)
+  MOSH_PREDICTION_DISPLAY  always | never | adaptive (default)";
 
 /// What the caller should do with the argv it was given.
 #[derive(Debug)]
