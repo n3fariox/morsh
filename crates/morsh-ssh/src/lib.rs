@@ -27,21 +27,21 @@ impl client::Handler for SshHandler {
 }
 
 impl SshSession {
-    /// Connect to `host:port` using the given username and private key path.
+    /// Connect to `host:port` as `user`, offering each private key in turn
+    /// the way ssh does.
+    ///
+    /// Unencrypted keys are tried first; a passphrase is only asked for once
+    /// none of them was accepted, so an unused encrypted key never prompts.
     pub fn connect(
         addr: String,
         user: impl Into<String> + Send,
-        key_path: impl AsRef<std::path::Path> + Send,
+        key_paths: &[std::path::PathBuf],
     ) -> Result<Self> {
         let user = user.into();
-        let key_path = key_path.as_ref().to_path_buf();
 
         let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
 
         let session = rt.block_on(async move {
-            let key_pair = load_key_with_passphrase_prompt(&key_path)
-                .context("Failed to load SSH private key")?;
-
             let config = Arc::new(client::Config {
                 inactivity_timeout: Some(Duration::from_secs(30)),
                 ..<_>::default()
@@ -51,22 +51,29 @@ impl SshSession {
                 .await
                 .context("Failed to connect to SSH server")?;
 
-            let auth_res = session
-                .authenticate_publickey(
-                    user,
-                    PrivateKeyWithHashAlg::new(
-                        Arc::new(key_pair),
-                        session.best_supported_rsa_hash().await?.flatten(),
-                    ),
-                )
-                .await
-                .context("Publickey authentication failed")?;
-
-            if !auth_res.success() {
-                bail!("SSH connection was refused (authentication check failed)");
+            let mut encrypted = Vec::new();
+            for path in key_paths {
+                match load_secret_key(path, None) {
+                    Ok(key) => {
+                        if try_key(&mut session, &user, key).await? {
+                            tracing::info!("authenticated with {}", path.display());
+                            return Ok(session);
+                        }
+                    }
+                    Err(keys::Error::KeyIsEncrypted) => encrypted.push(path),
+                    Err(e) => tracing::info!("skipping key {}: {e}", path.display()),
+                }
+            }
+            for path in encrypted {
+                let key = load_key_with_passphrase_prompt(path)
+                    .context("Failed to load SSH private key")?;
+                if try_key(&mut session, &user, key).await? {
+                    tracing::info!("authenticated with {}", path.display());
+                    return Ok(session);
+                }
             }
 
-            Ok::<_, anyhow::Error>(session)
+            bail!("SSH connection was refused (no key was accepted)");
         })?;
 
         Ok(Self {
@@ -186,6 +193,21 @@ impl SshSession {
         }
         Ok(())
     }
+}
+
+/// Offer one key; `Ok(false)` means the server declined it and another may
+/// be tried on the same session.
+async fn try_key(
+    session: &mut client::Handle<SshHandler>,
+    user: &str,
+    key: PrivateKey,
+) -> Result<bool> {
+    let hash = session.best_supported_rsa_hash().await?.flatten();
+    let auth_res = session
+        .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+        .await
+        .context("Publickey authentication failed")?;
+    Ok(auth_res.success())
 }
 
 fn load_key_with_passphrase_prompt(path: &std::path::Path) -> Result<PrivateKey> {

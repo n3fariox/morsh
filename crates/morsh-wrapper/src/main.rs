@@ -524,9 +524,10 @@ fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Op
     }
 
     if mode == SshMode::Russh || mode == SshMode::Auto {
-        if let Some(ref key_path) = find_key(cfg) {
-            tracing::info!("Connecting via russh (key: {})", key_path.display());
-            match try_launch_russh(args, bind, cfg, key_path) {
+        let key_paths = find_keys(cfg);
+        if !key_paths.is_empty() {
+            tracing::info!("Connecting via russh (keys: {key_paths:?})");
+            match try_launch_russh(args, bind, cfg, &key_paths) {
                 Some(info) => return Some(info),
                 None if mode == SshMode::Russh => return None,
                 None => tracing::info!("russh connection failed, falling back to system ssh"),
@@ -553,7 +554,7 @@ fn try_launch_russh(
     args: &Args,
     bind: &BindServer,
     cfg: Option<&SshConfig>,
-    key_path: &std::path::Path,
+    key_paths: &[std::path::PathBuf],
 ) -> Option<ConnectInfo> {
     use morsh_ssh::SshSession;
 
@@ -562,7 +563,9 @@ fn try_launch_russh(
 
     tracing::info!("russh: connecting to {addr} as {user}");
 
-    let mut session = SshSession::connect(addr, user, key_path).ok()?;
+    let mut session = SshSession::connect(addr, user, key_paths)
+        .inspect_err(|e| tracing::info!("russh: {e:#}"))
+        .ok()?;
 
     // Probe the remote shell using the same session.
     let shell = match resolve_remote_shell_value(&args.remote_shell) {
@@ -645,24 +648,26 @@ fn tilde_expand(path: &str) -> String {
     path.to_string()
 }
 
-/// The private key to offer: the first existing `IdentityFile` from ssh
-/// config (which already lists ssh's defaults when none is configured),
+/// The private keys to offer, in order: the existing `IdentityFile`s from
+/// ssh config (which already lists ssh's defaults when none is configured),
 /// otherwise the usual default locations.
 #[cfg(feature = "russh")]
-fn find_key(cfg: Option<&SshConfig>) -> Option<std::path::PathBuf> {
+fn find_keys(cfg: Option<&SshConfig>) -> Vec<std::path::PathBuf> {
     const DEFAULTS: [&str; 4] = [
         "~/.ssh/id_ed25519",
         "~/.ssh/id_rsa",
         "~/.ssh/id_ecdsa",
         "~/.ssh/identity",
     ];
-    let configured = cfg.map(|c| c.identity_files.as_slice()).unwrap_or_default();
-    configured
-        .iter()
-        .map(String::as_str)
-        .chain(DEFAULTS)
+    let configured: Vec<&str> = cfg
+        .map(|c| c.identity_files.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let candidates = if configured.is_empty() { DEFAULTS.to_vec() } else { configured };
+    candidates
+        .into_iter()
         .map(|p| std::path::PathBuf::from(tilde_expand(p)))
-        .find(|p| p.is_file())
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 #[cfg(test)]
