@@ -8,6 +8,7 @@ description = "State synchronization protocol for morsh"
 [dependencies]
 morsh-proto = { path = "../morsh-proto" }
 morsh-terminal = { path = "../morsh-terminal" }
+morsh-network = { path = "../morsh-network" }
 prost = "0.14"
 tracing = "0.1"
 

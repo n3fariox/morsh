@@ -68,12 +68,13 @@ morsh/
    - Separate modules (`transport`, `host`, `client`) to avoid name conflicts
    - 4 tests: roundtrip for all 3 message types + field number verification
 
-3. **Wire compatibility test** — TODO
-   - Generate test packets using the original C++ mosh code
-   - Decrypt, parse, and verify in Rust
-   - Encrypt and send to C++ mosh — verify it decrypts correctly
+3. **Wire compatibility test** ✅
+   - `scripts/interop.sh` runs every client/server pairing against stock
+     mosh 1.4.0 and checks that remote output reaches the client's screen:
+     `morsh-client`↔`mosh-server`, `mosh-client`↔`morsh-server`, and both
+     wrappers' launch lines against both servers
 
-### Phase 2: Terminal Emulation via libghostty-vt
+### Phase 2: Terminal Emulation via libghostty-vt ✅ DONE
 **Goal:** VT parsing, framebuffer state, key encoding — powered by libghostty-vt.
 
 1. **`morsh-terminal` crate** ✅
@@ -89,28 +90,53 @@ morsh/
    - `KeyMap` wrapper around libghostty-vt's `key::Encoder` — char/enter/backspace/arrows/modifiers
 
 3. **Mosh-specific adaptations** ✅
-   - Snapshot model captures full grid, cursor, colors, palette
+   - Snapshot model captures the full grid, cursor, colors, palette, wide-cell
+     widths, window title, bracketed paste, and the mouse reporting/encoding
+     modes — mosh's `Framebuffer`/`DrawState`, minus the icon name and
+     clipboard, which libghostty-vt does not expose
    - VT generation uses SGR sequences for styles, CUP for cursor positioning
-   - Diff algorithm skips unchanged rows, emits only changed runs
+   - Diff algorithm skips unchanged rows, emits only changed runs, and detects
+     a scrolled display so a scrolled line costs a scroll rather than a repaint
+     (ported from `terminaldisplay.cc`)
    - Style resets emitted correctly between styled/unstyled cells
 
-### Phase 3: State Synchronization
+### Phase 3: State Synchronization ✅ DONE
 **Goal:** The SSP (State Synchronization Protocol) — diffs, transport sender/receiver.
 
 1. **`morsh-statesync` crate** ✅
-   - `Complete`: Screen snapshot with VT diff_from() / apply_string() interface
-   - `UserStream`: Queue of user events (keystrokes + resize), protobuf serialization
-   - Minimal VT parser: CUP, SGR (colors/bold/italic/underline), ED, EL, CR/LF/BS
-   - 6 tests: create, apply, diff, cursor, color, same-states
+   - `Complete`: terminal state whose diff is a serialized
+     `HostBuffers::HostMessage` (echo ack, resize, host bytes), matching what
+     stock `mosh-client` parses; VT parsing is libghostty-vt's
+   - `Complete::set_echo_ack` / `register_input_frame` — echo timing, which is
+     what drives the client's prediction underlining
+   - `UserStream`: Queue of user events (keystrokes + resize), protobuf
+     serialization; a malformed message is an error, not a panic
+   - Both implement `morsh_network::State`
 
 2. **`morsh-network` crate** ✅
    - `Connection`: UDP socket management via `tokio::net::UdpSocket`
    - `Fragmenter` / `FragmentAssembly`: zlib-compressed MTU-aware fragmentation with 10-byte headers
    - `RttEstimator`: RFC 6298 SRTT/RTTVAR with clamped RTO (50ms-1000ms)
    - ECN marking (IP_TOS ECT(0))
-   - Port hopping support (client-side, 10s interval)
-   - Timestamp diff with 16-bit wrapping arithmetic
-   - 13 tests: fragment roundtrip, multi-fragment, assembly, chaff, RTT, RTO, send interval, timestamps
+   - Port hopping support (client-side, 10s interval); every open socket is
+     polled concurrently, so a hopped session actually recovers
+   - Timestamp diff with 16-bit wrapping arithmetic; RTT comes only from the
+     timestamp echo
+   - Packet direction and sequence checks (mosh's `dos_assert` and
+     `expected_receiver_seq`), so a replayed packet cannot re-target the server
+   - Random chaff from the CSPRNG
+
+3. **The protocol itself** ✅
+   - `TransportSender<S>`: `sent_states` history, `update_assumed_receiver_state`
+     (the regression that recovers from loss), `process_acknowledgment_through`,
+     `rationalize_states`, `attempt_prospective_resend_optimization`,
+     `calculate_timers` / `tick`
+   - `Transport<M, R>`: `received_states`, duplicate suppression, the
+     `old_num` reference-state guard, throwaway culling, the receiver quench
+     timer, and sorted insertion of out-of-order states
+   - `Transport::recv` is cancel-safe: the only await is a `recv_from`
+   - Convergence under 10%/33% loss, duplication, reordering, and a port hop is
+     covered by `tests/transport_integration.rs`
 
 ### Phase 4: Prediction Engine ✅ DONE
 **Goal:** Speculative local echo for low-latency feel.
@@ -228,18 +254,20 @@ Phase 1-7 maintains wire compatibility. Phase 8+ can introduce:
 | Phase 8: Windows Polish | Tweaks | ~500 |
 | **Total** | | **~7,100** |
 
+Phases 1–7 are implemented and interoperate with stock mosh 1.4.0 in both
+directions; see the Compatibility section of the README for what is verified
+and what is still missing.
+
 ---
 
-## Phase 1 Status: COMPLETE ✅
+## Current Status
 
-- Workspace: `Cargo.toml` with two member crates
-- `morsh-crypto`: 17 tests passing (Session, Nonce, Base64Key, PRNG, block counter)
-- `morsh-proto`: 4 tests passing (all message types + field number verification)
-- Wire-compatible proto2 extensions handled via field-number-preserving flattening
+Phases 1–7 are done and verified:
 
-## Next: Phase 2 — Terminal Emulation via libghostty-vt
+- `cargo test --workspace` — unit tests plus the impaired-link protocol suite
+- `./scripts/interop.sh` — every pairing against stock mosh 1.4.0
 
-1. Install Zig 0.15.x toolchain
-2. Add `libghostty-rs` dependency to workspace
-3. Build adapter layer: libghostty Terminal ↔ Mosh state sync interface
-4. Verify dirty-cell tracking can generate minimal ANSI diffs
+Remaining work is Phase 8 (Windows polish) and the gaps listed under
+"Known gaps" in the README: Ctrl-^ Ctrl-Z suspend, terminal replies to host
+queries, and scrollback/scrolling-region fidelity when a state is rebuilt from
+a snapshot.

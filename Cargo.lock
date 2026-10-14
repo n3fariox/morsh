@@ -1640,6 +1640,7 @@ name = "morsh-network"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "futures",
  "morsh-crypto",
  "morsh-proto",
  "prost",
@@ -1699,6 +1700,7 @@ dependencies = [
 name = "morsh-statesync"
 version = "0.1.0"
 dependencies = [
+ "morsh-network",
  "morsh-proto",
  "morsh-terminal",
  "prost",

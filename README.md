@@ -1,6 +1,6 @@
 # morsh — mobile (rust) shell
 
-A Rust implementation of [Mosh](https://mosh.org) (mobile shell), a replacement for SSH that tolerates network latency, roaming, and IP address changes. Compatible with stock `mosh-server` on the wire.
+A Rust implementation of [Mosh](https://mosh.org) (mobile shell), a replacement for SSH that tolerates network latency, roaming, and IP address changes. Interoperable with stock mosh 1.4.0 in both directions — see [Compatibility](#compatibility).
 
 ## Quick Start
 
@@ -69,11 +69,46 @@ Only x86_64 builds are published (Linux musl, Windows MSVC) — on other platfor
 
 ## Key Features
 
-- **Wire-compatible** with stock `mosh-server` — uses the same AES-128-OCB3 encryption, zlib compression, fragment format, and protobuf messages
-- **Roaming** — survives IP address changes (port hopping)
+- **Wire-compatible** with stock mosh — the same AES-128-OCB3 encryption, zlib compression, fragment format, and protobuf messages
+- **State Synchronization Protocol** — the sender keeps a history of the states it has sent and diffs against the one the receiver is assumed to hold, so a lost packet is recovered by the next diff rather than by retransmission; the receiver refuses duplicates and diffs whose reference state it does not hold
+- **Roaming** — the server re-targets on the first authenticated packet from a new address, and the client polls every socket it has opened
 - **Prediction engine** — local echo with adaptive display (underlines pending characters)
 - **Escape sequence** — Ctrl-^ (`0x1E`) then `.` to quit; Ctrl-^ twice sends literal `0x1E`
 - **Cross-platform** — Linux, macOS, Windows
+
+## Compatibility
+
+Verified against stock mosh 1.4.0 by `scripts/interop.sh`, which runs each
+pairing end to end and checks that output from the remote command reaches the
+client's screen:
+
+| Pairing | Status |
+|---|---|
+| `morsh-client` → `morsh-server` | Works |
+| `morsh-client` → stock `mosh-server` | Works |
+| stock `mosh-client` → `morsh-server` | Works |
+| stock `mosh`'s launch line (`mosh-server new -c 256 -s -p … -l … -- …`) | Accepted |
+| `morsh`'s launch line against stock `mosh-server` | Accepted |
+
+Run it yourself:
+
+```sh
+./scripts/interop.sh          # add --release to test the release binaries
+```
+
+Loss, duplication, reordering, and port hopping are covered by
+`crates/morsh-network/tests/transport_integration.rs`, which runs two real
+transports over UDP through a proxy that impairs the link.
+
+### Known gaps
+
+- The client does not yet implement Ctrl-^ Ctrl-Z suspend.
+- Terminal replies to host queries (DA, DSR, cursor position reports) are not
+  sent back to the child process; `libghostty-vt` does not surface them
+  through the API morsh uses.
+- A terminal state reconstructed from a screen snapshot — which happens only
+  when a state deep in the receive history is written to — restores cells,
+  cursor, title, and input modes, but not scrollback or the scrolling region.
 
 ## Disclaimer
 

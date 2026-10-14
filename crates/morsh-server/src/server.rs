@@ -1,22 +1,25 @@
 use crate::pty::{self, MorshPty, PtyEvent};
 use morsh_crypto::{Base64Key, Session};
-use morsh_network::transport::{ReceivedDiff, SendState};
-use morsh_network::{Connection, Transport};
-use morsh_proto::client::UserMessage;
-use morsh_statesync::Complete;
-use morsh_terminal::ScreenSnapshot;
+use morsh_network::{Connection, RecvOutcome, State, Transport};
+use morsh_statesync::{Complete, UserEvent, UserStream};
 use portable_pty::PtySize;
-use prost::Message;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long to wait for a first client packet before giving up.
+const TIMEOUT_IF_NO_CLIENT: Duration = Duration::from_secs(60);
+/// Longest we sleep between housekeeping passes.
+const MAX_WAIT: Duration = Duration::from_millis(5000);
+
+type ServerTransport = Transport<Complete, UserStream>;
 
 struct Handler {
-    transport: Transport,
-    terminal_state: Complete,
-    client_assumed_state: ScreenSnapshot,
+    transport: ServerTransport,
     pty: MorshPty,
+    /// Newest remote state we have already fed to the terminal.
+    last_remote_num: u64,
 }
 
 pub async fn run_server(
@@ -27,27 +30,36 @@ pub async fn run_server(
     command_args: Vec<String>,
     locale_vars: Vec<(String, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("run_server entered: port={bind_port}, shell={shell}, ip={:?}, args.len={}",
-    desired_ip,
-    command_args.len());
+    tracing::info!(
+        "run_server entered: port={bind_port}, shell={shell}, ip={:?}, args.len={}",
+        desired_ip,
+        command_args.len()
+    );
 
     let mut transport = bind_transport(bind_port, desired_ip, &key).await?;
-    transport.sender.set_state(SendState::Active);
     tracing::info!("UDP transport ready, waiting for client on port {bind_port}");
 
-    let (terminal_state, pty_size) = wait_for_client(&mut transport).await?;
+    let pty_size = wait_for_client(&mut transport).await?;
 
-    tracing::info!("Client connected, spawning shell (remote_state_num={})",
-    transport.receiver.remote_state_num());
+    tracing::info!(
+        "Client connected, spawning shell (remote_state_num={})",
+        transport.get_remote_state_num()
+    );
+
+    // The terminal the protocol synchronizes is the sender's current state;
+    // there is no second copy to keep in step with it.
+    transport
+        .get_current_state_mut()
+        .resize(pty_size.cols, pty_size.rows)
+        .map_err(|e| format!("Failed to size terminal: {e}"))?;
 
     let pty_setup = pty::spawn_pty(pty_size, &shell, &command_args, &locale_vars)?;
-    let client_assumed_state: ScreenSnapshot = Complete::new(80, 24)?.snapshot();
 
+    let last_remote_num = transport.get_remote_state_num();
     let mut handler = Handler {
         transport,
-        terminal_state,
-        client_assumed_state,
         pty: pty_setup,
+        last_remote_num,
     };
 
     handler.run().await
@@ -57,7 +69,7 @@ async fn bind_transport(
     bind_port: u16,
     desired_ip: Option<&str>,
     key: &Base64Key,
-) -> Result<Transport, Box<dyn std::error::Error>> {
+) -> Result<ServerTransport, Box<dyn std::error::Error>> {
     let session = Session::new(*key.data());
 
     let connection = if let Some(ip) = desired_ip {
@@ -83,13 +95,17 @@ async fn bind_transport(
             .map_err(|e| format!("Failed to bind: {e}"))?
     };
 
-    Ok(Transport::new_server(connection))
+    Ok(Transport::new_server(
+        connection,
+        Complete::new(80, 24)?,
+        UserStream::new(),
+    ))
 }
 
-async fn wait_for_client(
-    transport: &mut Transport,
-) -> Result<(Complete, PtySize), Box<dyn std::error::Error>> {
-    let mut terminal_state = Complete::new(80, 24)?;
+/// Block until the client's first state arrives, and take the window size it
+/// asks for. Mosh releases the login shell at the same point.
+async fn wait_for_client(transport: &mut ServerTransport) -> Result<PtySize, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + TIMEOUT_IF_NO_CLIENT;
     let mut pty_size = PtySize {
         rows: 24,
         cols: 80,
@@ -97,75 +113,81 @@ async fn wait_for_client(
         pixel_height: 0,
     };
 
-    loop {
-        match transport.recv_diff().await {
-            Ok(Some(diff)) => {
-                tracing::info!("Wait loop received diff: {} bytes (old={}, new={})",
-                diff.diff.len(),
-                diff.old_num,
-                diff.new_num);
-                if !diff.diff.is_empty() {
-                    if let Ok(msg) = UserMessage::decode(diff.diff.as_slice()) {
-                        tracing::info!("Decoded UserMessage with {} instructions",
-                        msg.instruction.len());
-                        for inst in &msg.instruction {
-                            if let Some(ref resize) = inst.resize {
-                                pty_size = PtySize {
-                                    rows: resize.height.unwrap_or(24) as u16,
-                                    cols: resize.width.unwrap_or(80) as u16,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                };
-                                terminal_state =
-                                    Complete::new(pty_size.cols, pty_size.rows)?;
-                                tracing::info!("Client initial resize: {}x{}",
-                                pty_size.cols,
-                                pty_size.rows);
-                            }
-                        }
-                    }
+    while transport.get_remote_state_num() == 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "No connection within {} seconds",
+                TIMEOUT_IF_NO_CLIENT.as_secs()
+            )
+            .into());
+        }
+
+        tokio::select! {
+            result = transport.recv() => match result {
+                Ok(RecvOutcome::NewState { num }) => {
+                    tracing::info!("Client's first state: {num}");
                 }
-                tracing::info!("Wait loop breaking, proceeding to spawn PTY");
-                break;
-            }
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!("Error waiting for client: {e}");
-                continue;
-            }
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!("Error waiting for client: {e}");
+                    continue;
+                }
+            },
+            _ = tokio::time::sleep(remaining) => continue,
         }
     }
 
-    Ok((terminal_state, pty_size))
+    let mut stream = UserStream::new();
+    if let Err(e) = stream.apply_string(&transport.get_remote_diff()) {
+        tracing::warn!("Client's first state was malformed: {e}");
+    }
+    for event in stream.events() {
+        if let UserEvent::Resize { width, height } = event {
+            pty_size = PtySize {
+                rows: (*height).clamp(1, u16::MAX as i32) as u16,
+                cols: (*width).clamp(1, u16::MAX as i32) as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            tracing::info!("Client initial resize: {}x{}", pty_size.cols, pty_size.rows);
+        }
+    }
+
+    Ok(pty_size)
 }
 
 impl Handler {
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Entering serve loop");
 
-        let mut keepalive_timer = tokio::time::interval(Duration::from_millis(3000));
-        keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         let result = loop {
+            let wait = self.wait_time();
+
             tokio::select! {
+                // `mpsc::Receiver::recv` and `Transport::recv` are both
+                // cancel-safe, so losing this race never drops an event.
                 Some(pty_event) = self.pty.rx.recv() => {
-                    if self.handle_pty_event(pty_event).await == ControlFlow::Break(()) {
-                        break Ok(());
+                    self.handle_pty_event(pty_event);
+                }
+                result = self.transport.recv() => {
+                    if let Err(e) = result {
+                        tracing::warn!("Recv error: {e}");
                     }
                 }
-                result = self.transport.recv_diff() => {
-                    if self.handle_network_receive(result).await == ControlFlow::Break(()) {
-                        break Ok(());
-                    }
-                }
-                _ = keepalive_timer.tick() => {
-                    if !self.transport.connection().has_remote() {
-                        continue;
-                    }
-                    if self.handle_keepalive().await == ControlFlow::Break(()) {
-                        break Ok(());
-                    }
-                }
+                _ = tokio::time::sleep(wait) => {}
+            }
+
+            if self.handle_client_input().is_break() {
+                break Ok(());
+            }
+
+            if self.housekeeping().is_break() {
+                break Ok(());
+            }
+
+            if let Err(e) = self.transport.tick().await {
+                tracing::warn!("Send error: {e}");
             }
         };
 
@@ -173,146 +195,139 @@ impl Handler {
         result
     }
 
-    async fn handle_pty_event(&mut self, event: PtyEvent) -> ControlFlow<()> {
+    /// How long we may sleep before the transport or the echo-ack timer needs
+    /// attention.
+    fn wait_time(&mut self) -> Duration {
+        let now = Instant::now();
+        let mut wait = self.transport.wait_time_ms();
+        if let Some(echo) = self.transport.get_current_state().wait_time_ms(now) {
+            wait = wait.min(echo);
+        }
+        Duration::from_millis(wait).min(MAX_WAIT)
+    }
+
+    fn handle_pty_event(&mut self, event: PtyEvent) {
         match event {
             PtyEvent::Output(data) => {
-                tracing::info!("PTY output: {} bytes", data.len());
-                self.terminal_state.apply_string(&data);
-
-                let diff = self.terminal_state.diff_from(&self.client_assumed_state);
-                tracing::info!("Diff from state: {} bytes, state_num={}",
-                diff.len(),
-                self.transport.sender.state_num());
-                if diff.is_empty() {
-                    return ControlFlow::Continue(());
+                tracing::debug!("PTY output: {} bytes", data.len());
+                if self.transport.shutdown_in_progress() {
+                    return;
                 }
-
-                let ack_num = self.transport.receiver.remote_state_num();
-                let throwaway = self.transport.sender.throwaway_num();
-                tracing::info!("Sending diff: ack_num={}, throwaway={}", ack_num, throwaway);
-
-                if let Err(e) = self.transport.send_diff(diff, ack_num, throwaway).await {
-                    tracing::warn!("Send error: {e}");
-                } else {
-                    self.client_assumed_state = self.terminal_state.snapshot();
-                    self.transport.sender.advance_state();
-                    tracing::info!("Sent diff OK, state_num now={}",
-                    self.transport.sender.state_num());
+                if let Err(e) = self.transport.get_current_state_mut().act(&data) {
+                    tracing::warn!("Terminal error: {e}");
                 }
-                ControlFlow::Continue(())
             }
             PtyEvent::Exited(status) => {
                 tracing::info!("Shell exited with status: {}", status.exit_code());
-                self.send_remaining_diff().await;
-                ControlFlow::Break(())
+                // The final screen goes out with the shutdown packet.
+                self.transport.start_shutdown();
             }
         }
     }
 
-    async fn handle_network_receive(
-        &mut self,
-        result: Result<Option<ReceivedDiff>, String>,
-    ) -> ControlFlow<()> {
-        match result {
-            Ok(Some(diff)) => {
-                if !diff.diff.is_empty() {
-                    if let Ok(user_msg) = UserMessage::decode(diff.diff.as_slice()) {
-                        self.apply_client_instructions(&user_msg);
-                    } else {
-                        tracing::warn!("Failed to decode UserMessage");
+    /// Feed any newly received user input to the terminal and the child.
+    fn handle_client_input(&mut self) -> ControlFlow<()> {
+        let remote_num = self.transport.get_remote_state_num();
+        if remote_num == self.last_remote_num {
+            return ControlFlow::Continue(());
+        }
+        self.last_remote_num = remote_num;
+
+        let mut stream = UserStream::new();
+        if let Err(e) = stream.apply_string(&self.transport.get_remote_diff()) {
+            tracing::warn!("Malformed user input from client: {e}");
+            return ControlFlow::Continue(());
+        }
+
+        let events: Vec<UserEvent> = stream.events().to_vec();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                UserEvent::UserByte(byte) => {
+                    if let Err(e) = self.pty.writer.write_all(&[*byte]) {
+                        tracing::warn!("PTY write error: {e}");
                     }
                 }
-
-                if self.transport.receiver.shutdown_received() {
-                    tracing::info!("Client sent shutdown");
-                    return ControlFlow::Break(());
+                UserEvent::Resize { width, height } => {
+                    // Apply only the last of a run of resizes.
+                    if matches!(events.get(i + 1), Some(UserEvent::Resize { .. })) {
+                        continue;
+                    }
+                    self.apply_resize(*width, *height);
                 }
-
-                if let Err(e) = self.pty.writer.flush() {
-                    tracing::warn!("PTY flush error: {e}");
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!("Recv error: {e}");
             }
         }
+
+        if let Err(e) = self.pty.writer.flush() {
+            tracing::warn!("PTY flush error: {e}");
+        }
+
+        if !events.is_empty() && !self.transport.shutdown_in_progress() {
+            // Remember when this input arrived, so the echo ack can tell the
+            // client when it was actually echoed rather than merely received.
+            self.transport
+                .get_current_state_mut()
+                .register_input_frame(remote_num, Instant::now());
+        }
+
         ControlFlow::Continue(())
     }
 
-    fn apply_client_instructions(&mut self, user_msg: &UserMessage) {
-        for inst in &user_msg.instruction {
-            if let Some(ref keystroke) = inst.keystroke {
-                self.write_keystrokes(keystroke);
-            }
-            if let Some(ref resize) = inst.resize {
-                self.apply_resize(resize);
-            }
-        }
-    }
+    fn apply_resize(&mut self, width: i32, height: i32) {
+        let w = width.clamp(1, u16::MAX as i32) as u16;
+        let h = height.clamp(1, u16::MAX as i32) as u16;
 
-    fn write_keystrokes(&mut self, keystroke: &morsh_proto::client::Keystroke) {
-        let Some(ref keys) = keystroke.keys else {
-            return;
-        };
-        for &byte in keys {
-            if let Err(e) = self.pty.writer.write_all(&[byte]) {
-                tracing::warn!("PTY write error: {e}");
-            }
-        }
-    }
-
-    fn apply_resize(&mut self, resize: &morsh_proto::client::ResizeMessage) {
-        let w = resize.width.unwrap_or(80) as u16;
-        let h = resize.height.unwrap_or(24) as u16;
         let _ = self.pty.master.resize(PtySize {
             rows: h,
             cols: w,
             pixel_width: 0,
             pixel_height: 0,
         });
-        match Complete::new(w, h) {
-            Ok(new_state) => self.terminal_state = new_state,
-            Err(e) => tracing::warn!("Failed to create terminal state: {e}"),
+
+        if self.transport.shutdown_in_progress() {
+            return;
+        }
+        // Resize the terminal in place. Replacing it with a fresh blank one
+        // threw away everything on the screen.
+        if let Err(e) = self.transport.get_current_state_mut().resize(w, h) {
+            tracing::warn!("Failed to resize terminal: {e}");
         }
         tracing::info!("Client resize: {w}x{h}");
     }
 
-    async fn handle_keepalive(&mut self) -> ControlFlow<()> {
+    /// Everything mosh's serve loop does between reading and ticking.
+    fn housekeeping(&mut self) -> ControlFlow<()> {
         if let Ok(Some(status)) = self.pty.child.try_wait() {
             tracing::info!("Child process exited with status {}", status.exit_code());
-            self.send_remaining_diff().await;
-            return ControlFlow::Break(());
+            self.transport.start_shutdown();
         }
 
-        let now = std::time::Instant::now();
-        if now
-            .duration_since(self.transport.sender.last_send_time())
-            .as_millis()
-            > 2000
-        {
-            let ack_num = self.transport.receiver.remote_state_num();
-            if let Err(e) = self.transport.send_ack(ack_num).await {
-                tracing::debug!("Keepalive ACK error: {e}");
+        if self.transport.shutdown_in_progress() {
+            if self.transport.shutdown_acknowledged() {
+                tracing::info!("Shutdown acknowledged by client");
+                return ControlFlow::Break(());
             }
+            if self.transport.shutdown_ack_timed_out() {
+                tracing::info!("Gave up waiting for the client to acknowledge shutdown");
+                return ControlFlow::Break(());
+            }
+        } else {
+            // Publish a new echo ack when input has been sitting in the
+            // terminal long enough to count as echoed.
+            self.transport
+                .get_current_state_mut()
+                .set_echo_ack(Instant::now());
+        }
+
+        // The client asked to shut down and we have acknowledged it.
+        if self.transport.counterparty_shutdown_ack_sent() {
+            tracing::info!("Client requested shutdown; acknowledged");
+            return ControlFlow::Break(());
         }
 
         ControlFlow::Continue(())
     }
 
-    async fn send_remaining_diff(&mut self) {
-        let diff = self.terminal_state.diff_from(&self.client_assumed_state);
-        if !diff.is_empty() {
-            let ack_num = self.transport.receiver.remote_state_num();
-            let throwaway = self.transport.sender.throwaway_num();
-            let _ = self.transport.send_diff(diff, ack_num, throwaway).await;
-            self.transport.sender.advance_state();
-        }
-    }
-
     async fn shutdown(&mut self) {
-        tracing::info!("Sending shutdown marker");
-        let _ = self.transport.send_shutdown().await;
         tracing::info!("Shutting down");
         let _ = self.pty.child.kill();
     }

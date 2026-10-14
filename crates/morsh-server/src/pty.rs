@@ -20,19 +20,17 @@ pub fn spawn_pty(
     command_args: &[String],
     locale_vars: &[(String, String)],
 ) -> Result<MorshPty, Box<dyn std::error::Error>> {
+    // Execute the command directly, the way mosh does (`execvp( command_argv[0],
+    // command_argv )`). Re-joining the arguments with spaces and handing the
+    // result to `sh -c` re-parses them: `morsh host /bin/sh -c 'echo hi'` came
+    // out as `sh -c "/bin/sh -c echo hi"`, which ran the wrong thing.
     let mut cmd = if command_args.is_empty() {
         CommandBuilder::new(shell)
     } else {
-        let full_cmd = command_args.join(" ");
-        #[cfg(windows)]
-        let mut c = CommandBuilder::new("cmd.exe");
-        #[cfg(not(windows))]
-        let mut c = CommandBuilder::new("/bin/sh");
-        #[cfg(windows)]
-        c.arg("/c");
-        #[cfg(not(windows))]
-        c.arg("-c");
-        c.arg(full_cmd);
+        let mut c = CommandBuilder::new(&command_args[0]);
+        for arg in &command_args[1..] {
+            c.arg(arg);
+        }
         c
     };
     cmd.env("TERM", "xterm-256color");

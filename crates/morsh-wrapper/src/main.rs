@@ -120,6 +120,17 @@ fn resolve_remote_shell_system(ssh_command: &str, host: &str) -> RemoteShell {
     }
 }
 
+/// Where the remote server should bind its UDP socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BindServer {
+    /// `-s`: the server takes the address from `$SSH_CONNECTION`.
+    SshConnection,
+    /// No bind argument: the server listens on all addresses.
+    Any,
+    /// `-i ADDR`.
+    Address(String),
+}
+
 /// Parsed MOSH CONNECT line from server.
 struct ConnectInfo {
     port: u16,
@@ -131,14 +142,19 @@ fn main() {
 
     let args = Args::parse();
 
-    let resolved_ip = match args.bind_server.as_str() {
-        "any" => None,
-        "ssh" => Some(resolve_host(&args.host)),
-        ip => Some(ip.to_string()),
+    // Which address the *server* should bind to. "ssh" means "let the server
+    // read it out of $SSH_CONNECTION" — that is what `-s` is for, and it is
+    // the only option that gets the right answer when the name we resolve
+    // locally is not the address the server actually sees (NAT, split-horizon
+    // DNS, multi-homed hosts).
+    let bind_arg = match args.bind_server.as_str() {
+        "any" => BindServer::Any,
+        "ssh" => BindServer::SshConnection,
+        ip => BindServer::Address(ip.to_string()),
     };
 
     #[cfg(feature = "russh")]
-    let info = try_launch_ssh(&args, &resolved_ip).unwrap_or_else(|| {
+    let info = try_launch_ssh(&args, &bind_arg).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
@@ -150,14 +166,20 @@ fn main() {
         let rust_log = std::env::var("RUST_LOG").ok();
         let shell = resolve_remote_shell_value(&args.remote_shell)
             .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
-        build_remote_cmd(&args, &resolved_ip, shell, rust_log, &locale_vars)
+        build_remote_cmd(&args, &bind_arg, shell, rust_log, &locale_vars)
     }).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
     });
 
-    let server_ip = resolved_ip.unwrap_or_else(|| resolve_host(&args.host));
+    // Where *we* send packets. Independent of what the server binds to: a
+    // server told to use $SSH_CONNECTION may well be listening on an address
+    // our own DNS lookup would never produce.
+    let server_ip = match &bind_arg {
+        BindServer::Address(ip) => ip.clone(),
+        _ => resolve_host(&args.host),
+    };
 
     tracing::info!("Connecting to {}:{} with key {}", server_ip, info.port, &info.key[..8]);
 
@@ -194,17 +216,17 @@ fn collect_locale_vars() -> Vec<(String, String)> {
 }
 fn build_remote_cmd(
     args: &Args,
-    resolved_ip: &Option<String>,
+    bind: &BindServer,
     shell: RemoteShell,
     rust_log: Option<String>,
     locale_vars: &[(String, String)],
 ) -> String {
     if args.server_path == "morsh-server" {
-        let first = build_server_args("morsh-server", resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
-        let second = build_server_args("mosh-server", resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let first = build_server_args("morsh-server", bind, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let second = build_server_args("mosh-server", bind, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
         render_remote_command(shell, first, Some(second), rust_log, locale_vars)
     } else {
-        let only = build_server_args(&args.server_path, resolved_ip, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let only = build_server_args(&args.server_path, bind, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
         render_remote_command(shell, only, None, rust_log, locale_vars)
     }
 }
@@ -212,7 +234,7 @@ fn build_remote_cmd(
 /// Build the argv for a single server invocation (no shell quoting yet).
 fn build_server_args(
     server_path: &str,
-    resolved_ip: &Option<String>,
+    bind: &BindServer,
     server_log_file: &Option<String>,
     no_daemonize: bool,
     command: &[String],
@@ -222,11 +244,13 @@ fn build_server_args(
     parts.push(server_path.to_string());
     parts.push("new".to_string());
 
-    if let Some(ref ip) = resolved_ip {
-        parts.push("-i".to_string());
-        parts.push(ip.clone());
-    } else {
-        parts.push("-s".to_string());
+    match bind {
+        BindServer::SshConnection => parts.push("-s".to_string()),
+        BindServer::Address(ip) => {
+            parts.push("-i".to_string());
+            parts.push(ip.clone());
+        }
+        BindServer::Any => {}
     }
 
     for (name, val) in locale_vars {
@@ -244,7 +268,9 @@ fn build_server_args(
     }
 
     if !command.is_empty() {
-        parts.push("-e".to_string());
+        // `--` is the separator both servers accept; neither has ever had a
+        // `-e`, so `morsh host <cmd>` was broken end to end.
+        parts.push("--".to_string());
         parts.extend(command.iter().cloned());
     }
 
@@ -273,26 +299,30 @@ fn render_remote_command(
                 // Fedora 34+, and most modern distros).
                 "export LC_ALL=C.UTF-8".to_string()
             } else {
-                let exports: Vec<String> = locale_vars.iter()
+                let exports: Vec<String> = locale_vars
+                    .iter()
                     .filter(|(_, v)| !v.is_empty())
-                    .map(|(n, v)| format!("{n}={v}"))
+                    .map(|(n, v)| format!("{n}={}", shell_quote(v)))
                     .collect();
                 format!("export {}", exports.join(" "))
             };
 
-            let first = first.join(" ");
+            let first = shell_quote_all(&first);
             let base = match second {
                 Some(second) => {
-                    let second = second.join(" ");
+                    let second = shell_quote_all(&second);
                     if let Some(v) = &rust_log {
-                        format!("(env RUST_LOG={v} {first} 2>/dev/null) || {second}")
+                        format!(
+                            "(env RUST_LOG={} {first} 2>/dev/null) || {second}",
+                            shell_quote(v)
+                        )
                     } else {
                         format!("({first} 2>/dev/null) || {second}")
                     }
                 }
                 None => {
                     if let Some(v) = &rust_log {
-                        format!("env RUST_LOG={v} {first}")
+                        format!("env RUST_LOG={} {first}", shell_quote(v))
                     } else {
                         first
                     }
@@ -329,6 +359,31 @@ fn render_remote_command(
             }
         }
     }
+}
+
+/// Quote an argument for a Posix shell.
+///
+/// `mosh.pl` runs every argument through `shell_quote` before handing it to
+/// ssh; joining with spaces instead breaks on any locale value or command
+/// argument containing a space, a quote, or a shell metacharacter.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&b))
+    {
+        return s.to_string();
+    }
+    // Single quotes protect everything except a single quote itself, which is
+    // spliced in as '\''.
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn shell_quote_all(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| shell_quote(p))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Quote an argument for cmd.exe (double quotes only when needed).
@@ -439,13 +494,13 @@ fn resolve_host(host: &str) -> String {
 // ── russh (pure-Rust) backend ──────────────────────────────────────────────────
 
 #[cfg(feature = "russh")]
-fn try_launch_ssh(args: &Args, resolved_ip: &Option<String>) -> Option<ConnectInfo> {
+fn try_launch_ssh(args: &Args, bind: &BindServer) -> Option<ConnectInfo> {
     let mode = args.ssh_mode;
 
     if mode == SshMode::Russh || mode == SshMode::Auto {
         if let Some(ref key_path) = find_default_key() {
             tracing::info!("Connecting via russh (key: {})", key_path.display());
-            match try_launch_russh(args, resolved_ip, key_path) {
+            match try_launch_russh(args, bind, key_path) {
                 Some(info) => return Some(info),
                 None if mode == SshMode::Russh => return None,
                 None => tracing::info!("russh connection failed, falling back to system ssh"),
@@ -463,12 +518,12 @@ fn try_launch_ssh(args: &Args, resolved_ip: &Option<String>) -> Option<ConnectIn
     let rust_log = std::env::var("RUST_LOG").ok();
     let shell = resolve_remote_shell_value(&args.remote_shell)
         .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
-    let remote_cmd = build_remote_cmd(args, resolved_ip, shell, rust_log, &locale_vars);
+    let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
     try_launch_server(&args.ssh_command, &args.host, &remote_cmd)
 }
 
 #[cfg(feature = "russh")]
-fn try_launch_russh(args: &Args, resolved_ip: &Option<String>, key_path: &std::path::Path) -> Option<ConnectInfo> {
+fn try_launch_russh(args: &Args, bind: &BindServer, key_path: &std::path::Path) -> Option<ConnectInfo> {
     use morsh_ssh::SshSession;
 
     let (user, hostname) = parse_user_host(&args.host);
@@ -499,7 +554,7 @@ fn try_launch_russh(args: &Args, resolved_ip: &Option<String>, key_path: &std::p
 
     let rust_log = std::env::var("RUST_LOG").ok();
     let locale_vars = collect_locale_vars();
-    let remote_cmd = build_remote_cmd(args, resolved_ip, shell, rust_log, &locale_vars);
+    let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
 
     let connect_info = std::sync::Arc::new(std::sync::Mutex::new(None::<ConnectInfo>));
     let connect_info_clone = connect_info.clone();
@@ -567,4 +622,120 @@ fn find_default_key() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `morsh host <cmd>` used to emit `-e`, which neither server accepts.
+    #[test]
+    fn a_remote_command_is_introduced_with_a_double_dash() {
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::SshConnection,
+            &None,
+            false,
+            &strings(&["htop", "-d", "5"]),
+            &[],
+        );
+        assert!(!args.contains(&"-e".to_string()), "{args:?}");
+        let dashdash = args.iter().position(|a| a == "--").expect("-- separator");
+        assert_eq!(&args[dashdash + 1..], &strings(&["htop", "-d", "5"])[..]);
+    }
+
+    /// The default `--bind-server ssh` must let the *server* pick the address
+    /// out of $SSH_CONNECTION, rather than passing whatever our local resolver
+    /// happened to return.
+    #[test]
+    fn bind_server_ssh_emits_dash_s() {
+        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, false, &[], &[]);
+        assert!(args.contains(&"-s".to_string()), "{args:?}");
+        assert!(!args.contains(&"-i".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn explicit_bind_address_emits_dash_i() {
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::Address("10.0.0.7".to_string()),
+            &None,
+            false,
+            &[],
+            &[],
+        );
+        let i = args.iter().position(|a| a == "-i").expect("-i");
+        assert_eq!(args[i + 1], "10.0.0.7");
+        assert!(!args.contains(&"-s".to_string()));
+    }
+
+    #[test]
+    fn bind_server_any_emits_neither() {
+        let args = build_server_args("morsh-server", &BindServer::Any, &None, false, &[], &[]);
+        assert!(!args.contains(&"-s".to_string()));
+        assert!(!args.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn the_generated_invocation_matches_mosh_pls_shape() {
+        let args = build_server_args(
+            "mosh-server",
+            &BindServer::SshConnection,
+            &None,
+            false,
+            &[],
+            &[("LANG".to_string(), "en_US.UTF-8".to_string())],
+        );
+        assert_eq!(
+            args,
+            strings(&["mosh-server", "new", "-s", "-l", "LANG=en_US.UTF-8"])
+        );
+    }
+
+    #[test]
+    fn shell_quoting_leaves_ordinary_words_alone() {
+        assert_eq!(shell_quote("mosh-server"), "mosh-server");
+        assert_eq!(shell_quote("LANG=en_US.UTF-8"), "LANG=en_US.UTF-8");
+        assert_eq!(shell_quote("/usr/bin/mosh-server"), "/usr/bin/mosh-server");
+    }
+
+    /// Anything with a space or a metacharacter has to be quoted, or the
+    /// remote shell re-splits it.
+    #[test]
+    fn shell_quoting_protects_spaces_and_metacharacters() {
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("a;rm -rf /"), "'a;rm -rf /'");
+        assert_eq!(shell_quote("$(whoami)"), "'$(whoami)'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn posix_command_quotes_locale_values_and_arguments() {
+        let cmd = render_remote_command(
+            RemoteShell::Posix,
+            strings(&["morsh-server", "new", "-s", "--", "echo", "hello world"]),
+            None,
+            None,
+            &[("LANG".to_string(), "en_US.UTF-8".to_string())],
+        );
+        assert!(cmd.contains("'hello world'"), "{cmd}");
+        assert!(cmd.starts_with("export LANG=en_US.UTF-8;"), "{cmd}");
+    }
+
+    #[test]
+    fn posix_command_quotes_a_locale_value_containing_a_space() {
+        let cmd = render_remote_command(
+            RemoteShell::Posix,
+            strings(&["morsh-server", "new", "-s"]),
+            None,
+            None,
+            &[("LC_ALL".to_string(), "weird value".to_string())],
+        );
+        assert!(cmd.contains("LC_ALL='weird value'"), "{cmd}");
+    }
 }

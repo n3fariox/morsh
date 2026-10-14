@@ -56,7 +56,11 @@ impl CellStyle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellData {
     pub text: String,
+    /// This cell holds a double-width glyph and owns the column to its right.
     pub wide: bool,
+    /// This cell is the right half of a double-width glyph. Nothing may be
+    /// drawn here: writing the wide glyph already covered it.
+    pub spacer: bool,
     pub style: CellStyle,
 }
 
@@ -66,6 +70,7 @@ impl CellData {
         Self {
             text: String::new(),
             wide: false,
+            spacer: false,
             style: CellStyle::default_style(),
         }
     }
@@ -75,8 +80,40 @@ impl CellData {
     }
 }
 
+/// Which mouse-reporting mode the host has requested.
+///
+/// Mirrors mosh's `Terminal::DrawState::mouse_reporting_mode`; the numeric
+/// values are the DEC private mode numbers so they can be written straight
+/// into an escape sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseReporting {
+    #[default]
+    None = 0,
+    X10 = 9,
+    VT200 = 1000,
+    ButtonEvent = 1002,
+    AnyEvent = 1003,
+}
+
+/// How mouse coordinates are encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    #[default]
+    Default = 0,
+    Utf8 = 1005,
+    Sgr = 1006,
+    Urxvt = 1015,
+}
+
 /// A complete snapshot of the terminal screen at a point in time.
-#[derive(Clone, Debug)]
+///
+/// This is morsh's equivalent of mosh's `Terminal::Framebuffer`: everything
+/// the protocol synchronizes about a terminal, and everything
+/// [`crate::DisplayDiff`] needs to reproduce it. It carries more than the
+/// grid — the window title and the input modes are part of the terminal's
+/// observable state, and a client that never learns about them can never show
+/// a title or run a mouse-driven program.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScreenSnapshot {
     pub rows: Vec<Vec<CellData>>,
     pub cols: u16,
@@ -84,6 +121,18 @@ pub struct ScreenSnapshot {
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub cursor_visible: bool,
+    /// Window title set by the host (OSC 0/2).
+    pub title: String,
+    /// DEC 2004: bracketed paste.
+    pub bracketed_paste: bool,
+    /// DEC 9 / 1000 / 1002 / 1003.
+    pub mouse_reporting: MouseReporting,
+    /// DEC 1005 / 1006 / 1015.
+    pub mouse_encoding: MouseEncoding,
+    /// DEC 1004: focus in/out reporting.
+    pub mouse_focus_event: bool,
+    /// DEC 1007: alternate scroll.
+    pub mouse_alternate_scroll: bool,
     pub fg: RgbColor,
     pub bg: RgbColor,
     pub palette: [RgbColor; 256],
@@ -100,6 +149,12 @@ impl ScreenSnapshot {
             cursor_x: 0,
             cursor_y: 0,
             cursor_visible: true,
+            title: String::new(),
+            bracketed_paste: false,
+            mouse_reporting: MouseReporting::None,
+            mouse_encoding: MouseEncoding::Default,
+            mouse_focus_event: false,
+            mouse_alternate_scroll: false,
             fg: RgbColor { r: 255, g: 255, b: 255 },
             bg: RgbColor { r: 0, g: 0, b: 0 },
             palette: default_palette(),
