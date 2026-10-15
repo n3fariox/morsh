@@ -102,8 +102,9 @@ transports over UDP through a proxy that impairs the link.
 
 ### Differences from `mosh`
 
-The `morsh` launcher replaces `mosh.pl`. Where it behaves differently, it is
-listed here; anything not listed is meant to match `mosh`.
+`morsh` replaces `mosh.pl` and `morsh-server` replaces `mosh-server`. Where
+either behaves differently, it is listed here; anything not listed is meant
+to match `mosh`.
 
 **Connecting over SSH**
 
@@ -131,6 +132,35 @@ listed here; anything not listed is meant to match `mosh`.
 - `--remote-shell auto|posix|cmd|powershell` supports Windows SSH servers
   (default: detect).
 - `-D`/`--no-daemonize` and `--server-log-file` are for debugging the server.
+
+**`morsh-server`**
+
+It accepts `mosh-server`'s command line (`new`, `-s`, `-i`, `-p`, `-c`, `-l`,
+`-v`, `-@`, `--`, the legacy positional form), so stock `mosh` can use it with
+`mosh --server=morsh-server` or a `mosh-server` symlink (`interop.sh` checks
+the command line and the protocol, but not that whole path over ssh). At
+runtime:
+
+- **The shell is not a login shell.** `mosh-server` starts `$SHELL` as `-bash`
+  (and so reads `~/.profile`); `morsh-server` starts it plainly, and falls
+  back to `/bin/sh` (`cmd.exe` on Windows) rather than the passwd entry.
+- **Locale:** `mosh-server` keeps the server's own locale when it is UTF-8 and
+  only applies the client's `-l` variables when it is not. `morsh-server`
+  always sets `LANG=en_US.UTF-8` and then the client's `-l` variables, for the
+  shell only.
+- **Default bind address:** with neither `-s` nor `-i`, `morsh-server` still
+  binds to the address in `$SSH_CONNECTION`; `mosh-server` listens on all
+  addresses (what `mosh --bind-server=any` asks for).
+- `TERM` is always `xterm-256color`; `-c` is accepted but ignored
+  (`mosh-server` uses `xterm` unless `-c 256`). `-v` is accepted but does
+  nothing.
+- No motd, no "you have a detached Mosh session" warning, no utmp entries, and
+  no `cd` to `$HOME` before starting the shell.
+- `MOSH_SERVER_NETWORK_TMOUT` and `MOSH_SERVER_SIGNAL_TMOUT` are ignored.
+- After `MOSH CONNECT` it also prints `MOSH CONNECTION ID: 1`, and it reports
+  its log file on stderr instead of `[mosh-server detached, pid = N]`.
+- Additions: Windows hosts, `-D`/`--no-daemonize`, `--log-file`, and
+  `MORSH_KEY` in the environment to choose the session key.
 
 **Not supported yet**
 
