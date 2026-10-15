@@ -20,6 +20,11 @@ pub struct SshConfig {
     /// The host is only reachable through another hop, so neither a direct
     /// russh connection nor a local DNS lookup is meaningful on its own.
     pub uses_proxy: bool,
+    /// `StrictHostKeyChecking`, as `ssh -G` prints it (`true`, `false`,
+    /// `accept-new`, `ask`).
+    pub strict_host_key_checking: Option<String>,
+    /// `HostKeyAlias`: the name the host key is recorded under.
+    pub host_key_alias: Option<String>,
 }
 
 /// Run `<ssh_command> -G <host>` and parse its output.
@@ -63,6 +68,8 @@ pub fn parse(output: &str) -> SshConfig {
             "user" => config.user = Some(value.to_string()),
             "port" => config.port = value.parse().ok(),
             "identityfile" => config.identity_files.push(value.to_string()),
+            "stricthostkeychecking" => config.strict_host_key_checking = Some(value.to_string()),
+            "hostkeyalias" => config.host_key_alias = Some(value.to_string()),
             // `ssh -G` prints "proxyjump none" / omits it when unset.
             "proxycommand" | "proxyjump" if !value.eq_ignore_ascii_case("none") => {
                 config.uses_proxy = true;
@@ -96,6 +103,13 @@ mod tests {
             vec!["~/.ssh/work_ed25519".to_string(), "~/.ssh/id_rsa".to_string()]
         );
         assert!(!config.uses_proxy);
+    }
+
+    #[test]
+    fn host_key_settings_are_read() {
+        let config = parse("stricthostkeychecking accept-new\nhostkeyalias web\n");
+        assert_eq!(config.strict_host_key_checking.as_deref(), Some("accept-new"));
+        assert_eq!(config.host_key_alias.as_deref(), Some("web"));
     }
 
     #[test]

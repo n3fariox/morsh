@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
+mod banner;
 mod fake_proxy;
 mod ssh_config;
 use ssh_config::SshConfig;
@@ -11,7 +12,7 @@ use ssh_config::SshConfig;
 #[cfg_attr(not(feature = "russh"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SshMode {
-    /// Try russh (pure Rust), fall back to system ssh if no private key is found.
+    /// Use the system ssh command, or russh when no ssh is installed.
     Auto,
     /// Use the system ssh command.
     System,
@@ -68,8 +69,8 @@ struct Args {
     #[arg(long = "server", short = 'S', default_value = "morsh-server")]
     server_path: String,
 
-    /// SSH backend: "auto" (try russh, fall back to system ssh),
-    /// "russh" (pure Rust), or "system" (system ssh command).
+    /// SSH backend: "auto" (system ssh, or russh when no ssh is installed),
+    /// "system" (system ssh command), or "russh" (pure Rust).
     /// Only available when compiled with the "russh" feature.
     #[cfg(feature = "russh")]
     #[arg(long = "ssh-mode", default_value = "auto")]
@@ -113,7 +114,26 @@ fn resolve_remote_shell_value(value: &str) -> Option<RemoteShell> {
     }
 }
 
-fn resolve_remote_shell_system(ssh_command: &str, host: &str) -> RemoteShell {
+/// Detect the remote shell for the system-ssh backend.
+///
+/// The server's SSH banner, read before any login, settles the common case:
+/// anything but a Windows SSH server gets a POSIX shell, as mosh always
+/// assumes. Only Windows servers, and hosts we can't reach directly, need a
+/// second ssh login to ask.
+fn resolve_remote_shell_system(ssh_command: &str, host: &str, cfg: Option<&SshConfig>) -> RemoteShell {
+    if !cfg.is_some_and(|c| c.uses_proxy) {
+        let hostname = target_hostname(host, cfg);
+        let port = target_port(host, cfg);
+        match banner::fetch(&hostname, port) {
+            Some(b) if !banner::is_windows(&b) => {
+                tracing::info!("SSH banner {b:?}: assuming a POSIX shell");
+                return RemoteShell::Posix;
+            }
+            Some(b) => tracing::info!("SSH banner {b:?}: Windows, probing the shell"),
+            None => tracing::info!("no SSH banner from {hostname}:{port}, probing the shell"),
+        }
+    }
+
     let mut args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
     args.push(host.to_string());
     args.push("uname -s".to_string());
@@ -182,7 +202,7 @@ fn main() {
         let locale_vars = collect_locale_vars();
         let rust_log = std::env::var("RUST_LOG").ok();
         let shell = resolve_remote_shell_value(&args.remote_shell)
-            .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
+            .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host, ssh_cfg.as_ref()));
         build_remote_cmd(&args, &bind_arg, shell, rust_log, &locale_vars)
     }).unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
@@ -561,6 +581,15 @@ fn target_hostname(host: &str, cfg: Option<&SshConfig>) -> String {
     hostname.split(':').next().unwrap_or(hostname).to_string()
 }
 
+/// The SSH port: an explicit `:port` in the argument, then ssh config, then 22.
+fn target_port(host: &str, cfg: Option<&SshConfig>) -> u16 {
+    host_part(host)
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .or_else(|| cfg.and_then(|c| c.port))
+        .unwrap_or(22)
+}
+
 fn resolve_host(hostname: &str) -> String {
     tracing::info!("Resolving hostname: {hostname}");
 
@@ -582,39 +611,51 @@ fn resolve_host(hostname: &str) -> String {
 
 // ── russh (pure-Rust) backend ──────────────────────────────────────────────────
 
+/// Can the ssh command be run at all?
+#[cfg(feature = "russh")]
+fn ssh_installed(ssh_command: &str) -> bool {
+    let Some(program) = ssh_command.split_whitespace().next() else {
+        return false;
+    };
+    Command::new(program)
+        .arg("-V")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
 #[cfg(feature = "russh")]
 fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Option<ConnectInfo> {
-    let mut mode = args.ssh_mode;
-
-    // russh can't follow ProxyJump/ProxyCommand; only system ssh reaches
-    // such hosts.
-    if mode == SshMode::Auto && cfg.is_some_and(|c| c.uses_proxy) {
-        tracing::info!("host is behind a proxy in ssh config, using system ssh");
-        mode = SshMode::System;
-    }
-
-    if mode == SshMode::Russh || mode == SshMode::Auto {
-        let key_paths = find_keys(cfg);
-        if !key_paths.is_empty() {
-            tracing::info!("Connecting via russh (keys: {key_paths:?})");
-            match try_launch_russh(args, bind, cfg, &key_paths) {
-                Some(info) => return Some(info),
-                None if mode == SshMode::Russh => return None,
-                None => tracing::info!("russh connection failed, falling back to system ssh"),
-            }
-        } else if mode == SshMode::Russh {
-            eprintln!("No SSH private key found; use --ssh-mode system to use system ssh");
-            return None;
-        } else {
-            tracing::info!("No SSH private key found, using system ssh");
+    // System ssh first: it knows the user's whole configuration, agent and
+    // trust prompts. russh is only for machines without it. A failing ssh is
+    // not retried with russh, which would bury ssh's error and, after a
+    // host key mismatch, undo the point of checking.
+    let mode = match args.ssh_mode {
+        SshMode::Auto if ssh_installed(&args.ssh_command) => SshMode::System,
+        SshMode::Auto => {
+            tracing::info!("{} not found, using the built-in ssh client", args.ssh_command);
+            SshMode::Russh
         }
+        mode => mode,
+    };
+
+    if mode == SshMode::Russh {
+        let key_paths = find_keys(cfg);
+        if key_paths.is_empty() {
+            eprintln!("No SSH private key found for the built-in ssh client");
+            return None;
+        }
+        tracing::info!("Connecting via russh (keys: {key_paths:?})");
+        return try_launch_russh(args, bind, cfg, &key_paths);
     }
 
     tracing::info!("using system ssh");
     let locale_vars = collect_locale_vars();
     let rust_log = std::env::var("RUST_LOG").ok();
     let shell = resolve_remote_shell_value(&args.remote_shell)
-        .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host));
+        .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host, cfg));
     let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
     try_launch_server(&args.ssh_command, &args.host, cfg, &remote_cmd)
 }
@@ -633,8 +674,9 @@ fn try_launch_russh(
 
     tracing::info!("russh: connecting to {addr} as {user}");
 
-    let mut session = SshSession::connect(addr, user, key_paths)
-        .inspect_err(|e| tracing::info!("russh: {e:#}"))
+    let host_keys = host_key_policy(&hostname, port, cfg);
+    let mut session = SshSession::connect(addr, user, key_paths, host_keys)
+        .inspect_err(|e| eprintln!("morsh: {e:#}"))
         .ok()?;
 
     // Probe the remote shell using the same session.
@@ -696,21 +738,47 @@ fn try_launch_russh(
 #[cfg(feature = "russh")]
 fn russh_target(host: &str, cfg: Option<&SshConfig>) -> (String, String, u16) {
     let explicit_user = host.rsplit_once('@').map(|(u, _)| u.to_string());
-    let explicit_port = host_part(host)
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok());
 
     let user = explicit_user
         .or_else(|| cfg.and_then(|c| c.user.clone()))
         .or_else(|| std::env::var("USER").ok())
         .or_else(|| std::env::var("USERNAME").ok())
         .unwrap_or_else(|| "root".to_string());
-    let hostname = target_hostname(host, cfg);
-    let port = explicit_port
-        .or_else(|| cfg.and_then(|c| c.port))
-        .unwrap_or(22);
 
-    (user, hostname, port)
+    (user, target_hostname(host, cfg), target_port(host, cfg))
+}
+
+/// How russh should verify `hostname`'s key: the same files and settings
+/// ssh would use. Custom `UserKnownHostsFile`s are not read, because
+/// `ssh -G` prints them unquoted and a path with a space can't be recovered.
+#[cfg(feature = "russh")]
+fn host_key_policy(hostname: &str, port: u16, cfg: Option<&SshConfig>) -> morsh_ssh::HostKeyPolicy {
+    use morsh_ssh::{HostKeyPolicy, StrictHostKeyChecking};
+    use std::path::PathBuf;
+
+    let user_file = PathBuf::from(tilde_expand("~/.ssh/known_hosts"));
+    let mut known_hosts = vec![user_file.clone(), PathBuf::from(tilde_expand("~/.ssh/known_hosts2"))];
+    if cfg!(windows) {
+        if let Ok(data) = std::env::var("ProgramData") {
+            known_hosts.push(PathBuf::from(&data).join("ssh").join("ssh_known_hosts"));
+        }
+    } else {
+        known_hosts.push(PathBuf::from("/etc/ssh/ssh_known_hosts"));
+        known_hosts.push(PathBuf::from("/etc/ssh/ssh_known_hosts2"));
+    }
+
+    HostKeyPolicy {
+        // ssh records host names in lower case.
+        host: cfg
+            .and_then(|c| c.host_key_alias.clone())
+            .unwrap_or_else(|| hostname.to_ascii_lowercase()),
+        port,
+        known_hosts,
+        learn_into: user_file,
+        strict: cfg
+            .and_then(|c| c.strict_host_key_checking.as_deref())
+            .map_or(StrictHostKeyChecking::Ask, StrictHostKeyChecking::from_ssh),
+    }
 }
 
 #[cfg(feature = "russh")]

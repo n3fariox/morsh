@@ -5,6 +5,9 @@ use anyhow::{bail, Context, Result};
 use russh::keys::{self, *};
 use russh::*;
 
+mod host_keys;
+pub use host_keys::{HostKeyPolicy, StrictHostKeyChecking};
+
 /// A blocking SSH session that executes commands on a remote host.
 ///
 /// Runs a hidden tokio runtime internally so callers don't need to be async.
@@ -14,22 +17,31 @@ pub struct SshSession {
     peer: std::net::SocketAddr,
 }
 
-struct SshHandler;
+struct SshHandler {
+    host_keys: Arc<HostKeyPolicy>,
+}
 
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        // Verifying may read files and ask the user; keep it off the runtime.
+        let policy = self.host_keys.clone();
+        let key = server_public_key.clone();
+        let trusted = tokio::task::spawn_blocking(move || policy.verify(&key))
+            .await
+            .unwrap_or(false);
+        tracing::debug!("host key trusted: {trusted}");
+        Ok(trusted)
     }
 }
 
 impl SshSession {
     /// Connect to `host:port` as `user`, offering each private key in turn
-    /// the way ssh does.
+    /// the way ssh does, and verifying the server against `host_keys`.
     ///
     /// Unencrypted keys are tried first; a passphrase is only asked for once
     /// none of them was accepted, so an unused encrypted key never prompts.
@@ -37,6 +49,7 @@ impl SshSession {
         addr: String,
         user: impl Into<String> + Send,
         key_paths: &[std::path::PathBuf],
+        host_keys: HostKeyPolicy,
     ) -> Result<Self> {
         let user = user.into();
 
@@ -45,16 +58,21 @@ impl SshSession {
         let (session, peer) = rt.block_on(async move {
             let config = Arc::new(client::Config {
                 inactivity_timeout: Some(Duration::from_secs(30)),
+                preferred: host_keys.preferred(),
                 ..<_>::default()
             });
+            let handler = SshHandler {
+                host_keys: Arc::new(host_keys),
+            };
 
             let socket = connect_tcp(&addr).await?;
             let peer = socket.peer_addr()?;
             let _ = socket.set_nodelay(true);
 
-            let mut session = client::connect_stream(config, socket, SshHandler)
+            let mut session = client::connect_stream(config, socket, handler)
                 .await
                 .context("Failed to connect to SSH server")?;
+            tracing::debug!("connected to {peer}");
 
             let mut encrypted = Vec::new();
             for path in key_paths {
@@ -236,6 +254,7 @@ async fn try_key(
     user: &str,
     key: PrivateKey,
 ) -> Result<bool> {
+    tracing::debug!("offering {} key", key.algorithm());
     let hash = session.best_supported_rsa_hash().await?.flatten();
     let auth_res = session
         .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
@@ -251,62 +270,11 @@ fn load_key_with_passphrase_prompt(path: &std::path::Path) -> Result<PrivateKey>
         Err(e) => return Err(e.into()),
     }
 
-    let passphrase = prompt_passphrase(path)?;
+    // rpassword reads from the terminal with echo off (/dev/tty on Unix, the
+    // console on Windows) and strips the line ending, `\r\n` included.
+    let passphrase = rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))
+        .context("Cannot prompt for SSH key passphrase")?;
     load_secret_key(path, Some(&passphrase)).context("Failed to decrypt key with provided passphrase; is the passphrase correct?")
-}
-
-#[cfg(unix)]
-fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
-    use std::io::{BufRead, Write};
-    use std::os::fd::FromRawFd;
-
-    let tty_fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR) };
-    if tty_fd < 0 {
-        bail!("Cannot open /dev/tty to prompt for SSH key passphrase");
-    }
-
-    let prompt = format!("Enter passphrase for {}: ", path.display());
-    let _ = unsafe {
-        libc::write(tty_fd, prompt.as_ptr().cast(), prompt.len())
-    };
-
-    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(tty_fd, termios.as_mut_ptr()) } != 0 {
-        unsafe { libc::close(tty_fd) };
-        bail!("tcgetattr failed");
-    }
-    let mut termios = unsafe { termios.assume_init() };
-    let old_lflag = termios.c_lflag;
-    termios.c_lflag &= !libc::ECHO;
-    unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &termios) };
-
-    let tty_file = unsafe { std::fs::File::from_raw_fd(tty_fd) };
-    let mut reader = std::io::BufReader::new(tty_file);
-    let mut passphrase = String::new();
-    reader.read_line(&mut passphrase).ok();
-    drop(reader); // closes fd via File drop
-
-    // Restore echo using a fresh /dev/tty handle.
-    termios.c_lflag = old_lflag;
-    let restore_fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR) };
-    if restore_fd >= 0 {
-        unsafe { libc::tcsetattr(restore_fd, libc::TCSANOW, &termios) };
-        unsafe { libc::close(restore_fd) };
-    }
-
-    writeln!(std::io::stderr()).ok();
-    Ok(passphrase.trim_end_matches('\n').to_string())
-}
-
-#[cfg(not(unix))]
-fn prompt_passphrase(path: &std::path::Path) -> Result<String> {
-    use std::io::Write;
-    let prompt = format!("Enter passphrase for {}: ", path.display());
-    print!("{}", prompt);
-    std::io::stdout().flush().ok();
-    let mut passphrase = String::new();
-    std::io::stdin().read_line(&mut passphrase).ok();
-    Ok(passphrase.trim_end_matches('\n').to_string())
 }
 
 impl Drop for SshSession {
