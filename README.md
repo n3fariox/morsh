@@ -108,15 +108,21 @@ to match `mosh`.
 
 **Connecting over SSH**
 
-- **Built-in SSH client.** By default (`--ssh-mode auto`) `morsh` connects
-  with [russh](https://github.com/Eugeny/russh) and falls back to the system
-  `ssh` if that fails or there is no key file. `--ssh-mode system` always uses `ssh`, like
-  `mosh`; `--ssh-mode russh` never does.
-  - It takes host, user, port and key files from your ssh config via
-    `ssh -G`, so aliases work, but it needs an `ssh` binary for that.
-  - It offers key files only: no ssh-agent, Pageant or certificates.
-  - **It does not check the server's host key against `known_hosts`.** Use
-    `--ssh-mode system` if that matters to you.
+- **Built-in SSH client for machines without `ssh`.** By default
+  (`--ssh-mode auto`) `morsh` uses the system `ssh`, like `mosh`, and only
+  switches to its built-in [russh](https://github.com/Eugeny/russh) client
+  when no `ssh` is installed. A failing `ssh` is not retried with russh.
+  `--ssh-mode system` and `--ssh-mode russh` force one or the other. The
+  built-in client:
+  - checks the server's host key against `~/.ssh/known_hosts`,
+    `known_hosts2` and the system-wide file, asks before trusting a new host
+    (or follows `StrictHostKeyChecking`), and refuses a changed key. It does
+    not understand wildcard, `@cert-authority` or `@revoked` entries, or a
+    custom `UserKnownHostsFile`;
+  - offers key files only: no ssh-agent, Pageant, certificates or passwords;
+  - reads host, user, port, key files, `HostKeyAlias` and
+    `StrictHostKeyChecking` from `ssh -G` when an `ssh` binary exists, and
+    can't follow `ProxyJump`/`ProxyCommand`.
 - **Finding the server's address** follows `mosh`'s default
   (`--experimental-remote-ip=proxy`): system `ssh` connects through
   `morsh --fake-proxy`, which reports the address it reached; the built-in
@@ -129,8 +135,11 @@ to match `mosh`.
 
 - `morsh-server` is tried first, then stock `mosh-server`; `--server` names a
   single program instead.
-- `--remote-shell auto|posix|cmd|powershell` supports Windows SSH servers
-  (default: detect).
+- `--remote-shell auto|posix|cmd|powershell` supports Windows SSH servers.
+  `auto` (the default) reads the server's SSH banner before logging in: any
+  non-Windows server gets a POSIX shell, as `mosh` assumes. Only for Windows
+  servers, or hosts behind a jump host, does it log in once more to run
+  `uname -s` and tell `cmd` from POSIX.
 - `-D`/`--no-daemonize` and `--server-log-file` are for debugging the server.
 
 **`morsh-server`**
