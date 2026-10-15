@@ -100,6 +100,88 @@ Loss, duplication, reordering, and port hopping are covered by
 `crates/morsh-network/tests/transport_integration.rs`, which runs two real
 transports over UDP through a proxy that impairs the link.
 
+### Differences from `mosh`
+
+`morsh` replaces `mosh.pl` and `morsh-server` replaces `mosh-server`. Where
+either behaves differently, it is listed here; anything not listed is meant
+to match `mosh`.
+
+**Connecting over SSH**
+
+- **Built-in SSH client for machines without `ssh`.** By default
+  (`--ssh-mode auto`) `morsh` uses the system `ssh`, like `mosh`, and only
+  switches to its built-in [russh](https://github.com/Eugeny/russh) client
+  when no `ssh` is installed. A failing `ssh` is not retried with russh.
+  `--ssh-mode system` and `--ssh-mode russh` force one or the other. The
+  built-in client:
+  - checks the server's host key against `~/.ssh/known_hosts`,
+    `known_hosts2` and the system-wide file, asks before trusting a new host
+    (or follows `StrictHostKeyChecking`), and refuses a changed key. It does
+    not understand wildcard, `@cert-authority` or `@revoked` entries, or a
+    custom `UserKnownHostsFile`;
+  - offers key files only: no ssh-agent, Pageant, certificates or passwords;
+  - reads host, user, port, key files, `HostKeyAlias` and
+    `StrictHostKeyChecking` from `ssh -G` when an `ssh` binary exists, and
+    can't follow `ProxyJump`/`ProxyCommand`.
+- **Finding the server's address** follows `mosh`'s default
+  (`--experimental-remote-ip=proxy`): system `ssh` connects through
+  `morsh --fake-proxy`, which reports the address it reached; the built-in
+  client records it directly. Unlike `mosh`, a `ProxyJump`/`ProxyCommand` in
+  your ssh config is kept rather than replaced, and the host name is then
+  resolved locally instead.
+- `host:port` is accepted as the host argument as well as `user@host`.
+
+**Starting the server**
+
+- `morsh-server` is tried first, then stock `mosh-server`; `--server` names a
+  single program instead.
+- `--remote-shell auto|posix|cmd|powershell` supports Windows SSH servers.
+  `auto` (the default) reads the server's SSH banner before logging in: any
+  non-Windows server gets a POSIX shell, as `mosh` assumes. Only for Windows
+  servers, or hosts behind a jump host, does it log in once more to run
+  `uname -s` and tell `cmd` from POSIX.
+- `-D`/`--no-daemonize` and `--server-log-file` are for debugging the server.
+
+**`morsh-server`**
+
+It accepts `mosh-server`'s command line (`new`, `-s`, `-i`, `-p`, `-c`, `-l`,
+`-v`, `-@`, `--`, the legacy positional form), so stock `mosh` can use it with
+`mosh --server=morsh-server` or a `mosh-server` symlink (`interop.sh` checks
+the command line and the protocol, but not that whole path over ssh). At
+runtime:
+
+- **The shell is not a login shell.** `mosh-server` starts `$SHELL` as `-bash`
+  (and so reads `~/.profile`); `morsh-server` starts it plainly, and falls
+  back to `/bin/sh` (`cmd.exe` on Windows) rather than the passwd entry.
+- **Locale:** `mosh-server` keeps the server's own locale when it is UTF-8 and
+  only applies the client's `-l` variables when it is not. `morsh-server`
+  always sets `LANG=en_US.UTF-8` and then the client's `-l` variables, for the
+  shell only.
+- **Default bind address:** with neither `-s` nor `-i`, `morsh-server` still
+  binds to the address in `$SSH_CONNECTION`; `mosh-server` listens on all
+  addresses (what `mosh --bind-server=any` asks for).
+- `TERM` is always `xterm-256color`; `-c` is accepted but ignored
+  (`mosh-server` uses `xterm` unless `-c 256`). `-v` is accepted but does
+  nothing.
+- No motd, no "you have a detached Mosh session" warning, no utmp entries, and
+  no `cd` to `$HOME` before starting the shell.
+- `MOSH_SERVER_NETWORK_TMOUT` and `MOSH_SERVER_SIGNAL_TMOUT` are ignored.
+- After `MOSH CONNECT` it also prints `MOSH CONNECTION ID: 1`, and it reports
+  its log file on stderr instead of `[mosh-server detached, pid = N]`.
+- Additions: Windows hosts, `-D`/`--no-daemonize`, `--log-file`, and
+  `MORSH_KEY` in the environment to choose the session key.
+
+**Not supported yet**
+
+- `--family`, `-4`, `-6`; addresses are tried IPv4 first, like
+  `--family=prefer-inet`.
+- `--experimental-remote-ip=local|remote`.
+- `--local`, `--client`, `--no-init`, `--no-ssh-pty`, `-o`/`--predict-overwrite`,
+  `--predict=experimental`, and the `-a`/`-n`/`-p` short options.
+- `--port` is accepted but not yet passed to the server.
+- The terminal's colour count (`mosh-server -c`) is not sent.
+- `--ssh` is split on whitespace, not with shell quoting.
+
 ### Known gaps
 
 - The client does not yet implement Ctrl-^ Ctrl-Z suspend.
