@@ -100,6 +100,49 @@ Loss, duplication, reordering, and port hopping are covered by
 `crates/morsh-network/tests/transport_integration.rs`, which runs two real
 transports over UDP through a proxy that impairs the link.
 
+### Differences from `mosh`
+
+The `morsh` launcher replaces `mosh.pl`. Where it behaves differently, it is
+listed here; anything not listed is meant to match `mosh`.
+
+**Connecting over SSH**
+
+- **Built-in SSH client.** By default (`--ssh-mode auto`) `morsh` connects
+  with [russh](https://github.com/Eugeny/russh) and falls back to the system
+  `ssh` if that fails or there is no key file. `--ssh-mode system` always uses `ssh`, like
+  `mosh`; `--ssh-mode russh` never does.
+  - It takes host, user, port and key files from your ssh config via
+    `ssh -G`, so aliases work, but it needs an `ssh` binary for that.
+  - It offers key files only: no ssh-agent, Pageant or certificates.
+  - **It does not check the server's host key against `known_hosts`.** Use
+    `--ssh-mode system` if that matters to you.
+- **Finding the server's address** follows `mosh`'s default
+  (`--experimental-remote-ip=proxy`): system `ssh` connects through
+  `morsh --fake-proxy`, which reports the address it reached; the built-in
+  client records it directly. Unlike `mosh`, a `ProxyJump`/`ProxyCommand` in
+  your ssh config is kept rather than replaced, and the host name is then
+  resolved locally instead.
+- `host:port` is accepted as the host argument as well as `user@host`.
+
+**Starting the server**
+
+- `morsh-server` is tried first, then stock `mosh-server`; `--server` names a
+  single program instead.
+- `--remote-shell auto|posix|cmd|powershell` supports Windows SSH servers
+  (default: detect).
+- `-D`/`--no-daemonize` and `--server-log-file` are for debugging the server.
+
+**Not supported yet**
+
+- `--family`, `-4`, `-6`; addresses are tried IPv4 first, like
+  `--family=prefer-inet`.
+- `--experimental-remote-ip=local|remote`.
+- `--local`, `--client`, `--no-init`, `--no-ssh-pty`, `-o`/`--predict-overwrite`,
+  `--predict=experimental`, and the `-a`/`-n`/`-p` short options.
+- `--port` is accepted but not yet passed to the server.
+- The terminal's colour count (`mosh-server -c`) is not sent.
+- `--ssh` is split on whitespace, not with shell quoting.
+
 ### Known gaps
 
 - The client does not yet implement Ctrl-^ Ctrl-Z suspend.
