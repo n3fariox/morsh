@@ -5,6 +5,7 @@ mod server;
 
 use morsh_crypto::Base64Key;
 use morsh_log::LogGuard;
+use morsh_network::{PORT_RANGE_HIGH, PORT_RANGE_LOW};
 use std::env;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -24,8 +25,10 @@ fn get_ssh_connection_ip() -> Option<String> {
 
 /// Find a free UDP port on `ip` within the requested range.
 ///
-/// `low == 0` means "any port".  Mirrors mosh, which walks the range and takes
-/// the first port it can bind.
+/// `low == 0` means no range was requested, so use mosh's default
+/// 60001-60999 rather than an OS-assigned ephemeral port that firewall rules
+/// for mosh won't cover.  Mirrors mosh, which walks the range and takes the
+/// first port it can bind.
 fn pick_port(ip: &str, low: u16, high: u16) -> Result<u16, String> {
     let addr_for = |port: u16| -> SocketAddr {
         match ip.parse::<std::net::IpAddr>() {
@@ -34,11 +37,11 @@ fn pick_port(ip: &str, low: u16, high: u16) -> Result<u16, String> {
         }
     };
 
-    if low == 0 {
-        let sock = std::net::UdpSocket::bind(addr_for(0))
-            .map_err(|e| format!("Failed to bind to {ip}: {e}"))?;
-        return sock.local_addr().map(|a| a.port()).map_err(|e| e.to_string());
-    }
+    let (low, high) = if low == 0 {
+        (PORT_RANGE_LOW, PORT_RANGE_HIGH)
+    } else {
+        (low, high)
+    };
 
     let mut last_err = String::new();
     for port in low..=high {
@@ -164,5 +167,24 @@ fn main() {
     )) {
         tracing::error!("Server error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without `-p`, the server used to bind port 0 and land in the OS
+    /// ephemeral range (~49152+ on Windows), outside mosh firewall rules.
+    #[test]
+    fn no_requested_range_uses_moshs_default() {
+        let port = pick_port("127.0.0.1", 0, 0).unwrap();
+        assert!((PORT_RANGE_LOW..=PORT_RANGE_HIGH).contains(&port), "{port}");
+    }
+
+    #[test]
+    fn an_explicit_range_is_honoured() {
+        let port = pick_port("127.0.0.1", 61500, 61510).unwrap();
+        assert!((61500..=61510).contains(&port), "{port}");
     }
 }
