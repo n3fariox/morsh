@@ -239,27 +239,26 @@ impl Handler {
             return ControlFlow::Continue(());
         }
 
+        // Keystrokes go to the pty in one write per run, not one per byte.
+        // Windows ConPTY parses each write on its own and takes an ESC that
+        // ends a write as the Escape key, so a byte-at-a-time Shift+Left
+        // (`ESC [ 1 ; 2 D`) reached the shell as Escape plus "[1;2D".
+        let mut keys = Vec::new();
         let events: Vec<UserEvent> = stream.events().to_vec();
         for (i, event) in events.iter().enumerate() {
             match event {
-                UserEvent::UserByte(byte) => {
-                    if let Err(e) = self.pty.writer.write_all(&[*byte]) {
-                        tracing::warn!("PTY write error: {e}");
-                    }
-                }
+                UserEvent::UserByte(byte) => keys.push(*byte),
                 UserEvent::Resize { width, height } => {
                     // Apply only the last of a run of resizes.
                     if matches!(events.get(i + 1), Some(UserEvent::Resize { .. })) {
                         continue;
                     }
+                    self.write_keys(&mut keys);
                     self.apply_resize(*width, *height);
                 }
             }
         }
-
-        if let Err(e) = self.pty.writer.flush() {
-            tracing::warn!("PTY flush error: {e}");
-        }
+        self.write_keys(&mut keys);
 
         if !events.is_empty() && !self.transport.shutdown_in_progress() {
             // Remember when this input arrived, so the echo ack can tell the
@@ -270,6 +269,20 @@ impl Handler {
         }
 
         ControlFlow::Continue(())
+    }
+
+    /// Write and drain pending keystrokes as a single pty write.
+    fn write_keys(&mut self, keys: &mut Vec<u8>) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Err(e) = self.pty.writer.write_all(keys) {
+            tracing::warn!("PTY write error: {e}");
+        }
+        if let Err(e) = self.pty.writer.flush() {
+            tracing::warn!("PTY flush error: {e}");
+        }
+        keys.clear();
     }
 
     fn apply_resize(&mut self, width: i32, height: i32) {
