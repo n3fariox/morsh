@@ -1,6 +1,7 @@
 /target
 *.log
 _scratch/
+.claude/worktrees
 
 # Vendored libghostty-vt-sys build artifacts
 /third_party/libghostty-vt-sys/target/
