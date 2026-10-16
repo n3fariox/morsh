@@ -266,11 +266,11 @@ fn build_remote_cmd(
     locale_vars: &[(String, String)],
 ) -> String {
     if args.server_path == "morsh-server" {
-        let first = build_server_args("morsh-server", bind, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
-        let second = build_server_args("mosh-server", bind, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let first = build_server_args("morsh-server", bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let second = build_server_args("mosh-server", bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
         render_remote_command(shell, first, Some(second), rust_log, locale_vars)
     } else {
-        let only = build_server_args(&args.server_path, bind, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let only = build_server_args(&args.server_path, bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
         render_remote_command(shell, only, None, rust_log, locale_vars)
     }
 }
@@ -279,6 +279,7 @@ fn build_remote_cmd(
 fn build_server_args(
     server_path: &str,
     bind: &BindServer,
+    port_range: &Option<String>,
     server_log_file: &Option<String>,
     no_daemonize: bool,
     command: &[String],
@@ -295,6 +296,11 @@ fn build_server_args(
             parts.push(ip.clone());
         }
         BindServer::Any => {}
+    }
+
+    if let Some(ref range) = port_range {
+        parts.push("-p".to_string());
+        parts.push(range.clone());
     }
 
     for (name, val) in locale_vars {
@@ -829,6 +835,7 @@ mod tests {
             "morsh-server",
             &BindServer::SshConnection,
             &None,
+            &None,
             false,
             &strings(&["htop", "-d", "5"]),
             &[],
@@ -843,9 +850,32 @@ mod tests {
     /// happened to return.
     #[test]
     fn bind_server_ssh_emits_dash_s() {
-        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, false, &[], &[]);
+        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, &None, false, &[], &[]);
         assert!(args.contains(&"-s".to_string()), "{args:?}");
         assert!(!args.contains(&"-i".to_string()), "{args:?}");
+    }
+
+    /// `--port` used to be parsed and then dropped, so the server always
+    /// picked its own port.
+    #[test]
+    fn port_range_is_forwarded_as_dash_p() {
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::SshConnection,
+            &Some("60000:60010".to_string()),
+            &None,
+            false,
+            &[],
+            &[],
+        );
+        let p = args.iter().position(|a| a == "-p").expect("-p");
+        assert_eq!(args[p + 1], "60000:60010");
+    }
+
+    #[test]
+    fn no_port_range_emits_no_dash_p() {
+        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, &None, false, &[], &[]);
+        assert!(!args.contains(&"-p".to_string()), "{args:?}");
     }
 
     #[test]
@@ -853,6 +883,7 @@ mod tests {
         let args = build_server_args(
             "morsh-server",
             &BindServer::Address("10.0.0.7".to_string()),
+            &None,
             &None,
             false,
             &[],
@@ -865,7 +896,7 @@ mod tests {
 
     #[test]
     fn bind_server_any_emits_neither() {
-        let args = build_server_args("morsh-server", &BindServer::Any, &None, false, &[], &[]);
+        let args = build_server_args("morsh-server", &BindServer::Any, &None, &None, false, &[], &[]);
         assert!(!args.contains(&"-s".to_string()));
         assert!(!args.contains(&"-i".to_string()));
     }
@@ -875,6 +906,7 @@ mod tests {
         let args = build_server_args(
             "mosh-server",
             &BindServer::SshConnection,
+            &None,
             &None,
             false,
             &[],
