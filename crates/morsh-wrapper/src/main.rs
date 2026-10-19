@@ -90,7 +90,7 @@ struct Args {
 }
 
 /// Shell used on the remote host to interpret the launch command.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RemoteShell {
     Posix,
     Cmd,
@@ -111,6 +111,27 @@ fn resolve_remote_shell_value(value: &str) -> Option<RemoteShell> {
             );
             std::process::exit(1);
         }
+    }
+}
+
+/// Run on the remote to tell its shell apart: PowerShell expands it to
+/// `Desktop` or `Core`, cmd.exe echoes it verbatim, and a POSIX shell expands
+/// the unset `$PSVersionTable` to nothing, leaving `.PSEdition`.
+/// `uname -s` can't do this, since it fails under both Windows shells.
+const SHELL_PROBE: &str = "echo $PSVersionTable.PSEdition";
+
+/// Classify the remote shell from the output of [`SHELL_PROBE`].
+///
+/// A failed probe keeps the old answer of cmd.exe, which is what a Windows
+/// server runs unless `DefaultShell` says otherwise.
+fn classify_shell_probe(success: bool, stdout: &str) -> RemoteShell {
+    let out = stdout.trim();
+    if !success || out.is_empty() || out.contains("$PSVersionTable") {
+        RemoteShell::Cmd
+    } else if out == "Desktop" || out == "Core" {
+        RemoteShell::PowerShell
+    } else {
+        RemoteShell::Posix
     }
 }
 
@@ -136,12 +157,14 @@ fn resolve_remote_shell_system(ssh_command: &str, host: &str, cfg: Option<&SshCo
 
     let mut args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
     args.push(host.to_string());
-    args.push("uname -s".to_string());
+    args.push(SHELL_PROBE.to_string());
 
-    match Command::new(&args[0]).args(&args[1..]).output() {
-        Ok(out) if out.status.success() && !out.stdout.is_empty() => RemoteShell::Posix,
-        _ => RemoteShell::Cmd,
-    }
+    let shell = match Command::new(&args[0]).args(&args[1..]).output() {
+        Ok(out) => classify_shell_probe(out.status.success(), &String::from_utf8_lossy(&out.stdout)),
+        Err(_) => RemoteShell::Cmd,
+    };
+    tracing::info!("remote shell probe: {shell:?}");
+    shell
 }
 
 /// Where the remote server should bind its UDP socket.
@@ -689,12 +712,10 @@ fn try_launch_russh(
     let shell = match resolve_remote_shell_value(&args.remote_shell) {
         Some(s) => s,
         None => {
-            let (exit_code, probe_out) = session.exec_raw("uname -s").ok()?;
-            if exit_code == 0 && !probe_out.is_empty() {
-                RemoteShell::Posix
-            } else {
-                RemoteShell::Cmd
-            }
+            let (exit_code, probe_out) = session.exec_raw(SHELL_PROBE).ok()?;
+            let shell = classify_shell_probe(exit_code == 0, &probe_out);
+            tracing::info!("remote shell probe: {shell:?}");
+            shell
         }
     };
 
@@ -823,6 +844,25 @@ fn find_keys(cfg: Option<&SshConfig>) -> Vec<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PowerShell remote failed `uname -s` and was sent cmd.exe syntax,
+    /// whose `&&`/`||` Windows PowerShell 5.1 can't parse.
+    #[test]
+    fn shell_probe_recognises_powershell() {
+        assert_eq!(classify_shell_probe(true, "Desktop
+"), RemoteShell::PowerShell);
+        assert_eq!(classify_shell_probe(true, "Core
+"), RemoteShell::PowerShell);
+    }
+
+    #[test]
+    fn shell_probe_recognises_cmd_and_posix() {
+        assert_eq!(classify_shell_probe(true, "$PSVersionTable.PSEdition
+"), RemoteShell::Cmd);
+        assert_eq!(classify_shell_probe(true, ".PSEdition
+"), RemoteShell::Posix);
+        assert_eq!(classify_shell_probe(false, ""), RemoteShell::Cmd);
+    }
 
     fn strings(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
