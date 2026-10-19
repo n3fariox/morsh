@@ -117,6 +117,9 @@ fn main() {
         println!("MOSH CONNECT {} {}", port, key.printable_key());
         println!("MOSH CONNECTION ID: 1");
         std::io::stdout().flush().unwrap();
+        // Like stock mosh-server's banner; the wrapper shows stderr when the
+        // connect fails, so this says which build the remote actually ran.
+        eprintln!("morsh-server (morsh) {}", env!("CARGO_PKG_VERSION"));
     }
 
     // The appender guard must live for the whole of `main`; binding it inside
@@ -152,7 +155,8 @@ fn main() {
     }
 
     tracing::info!(
-        "Server starting on port {port} (PID: {})",
+        "morsh-server {} starting on port {port} (PID: {})",
+        env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
 
