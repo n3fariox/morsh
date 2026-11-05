@@ -2,7 +2,7 @@
 //! diffing the result against what the user is currently looking at.
 
 use crate::ClientTransport;
-use morsh_prediction::PredictionEngine;
+use morsh_prediction::{NotificationEngine, PredictionEngine};
 use morsh_terminal::{DisplayDiff, ScreenSnapshot};
 use std::io::{self, Write};
 
@@ -67,15 +67,19 @@ pub fn apply_overlay(frame: &mut ScreenSnapshot, prediction: &PredictionEngine) 
 }
 
 /// Paint the difference between what is on the user's screen and what the
-/// server's latest state (plus predictions) says should be there.
+/// server's latest state (plus predictions and the notification bar) says
+/// should be there.
 pub fn output_new_frame(
     transport: &ClientTransport,
     prediction: &PredictionEngine,
+    notifications: &mut NotificationEngine,
     local_framebuffer: &mut ScreenSnapshot,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     let mut target = transport.get_latest_remote_state().state.snapshot();
     apply_overlay(&mut target, prediction);
+    notifications.adjust_message();
+    notifications.apply(&mut target);
 
     let diff = DisplayDiff::diff(local_framebuffer, &target);
     if !diff.is_empty() {

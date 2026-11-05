@@ -20,6 +20,12 @@ use input::{handle_term_event, spawn_input_reader, EscapeConfig, TermEvent};
 const MAX_WAIT: Duration = Duration::from_millis(250);
 /// Give up if the server never answers at all.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Say that the server hasn't answered once it has been this long.
+const CONNECTING_NOTICE_AFTER: Duration = Duration::from_millis(250);
+/// Stock mosh-client's warning when the server never acknowledged the end of
+/// the session.
+const UNCLEAN_SHUTDOWN: &str = "\n\nmorsh did not shut down cleanly. Please note that the\n\
+                                morsh-server process may still be running on the server.\n";
 
 pub type ClientTransport = Transport<UserStream, Complete>;
 
@@ -104,14 +110,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (term_tx, mut term_rx) = mpsc::channel::<TermEvent>(64);
     spawn_input_reader(term_tx, escape);
 
+    let mut shutdown_signals = ShutdownSignals::new();
+
     tracing::info!("Entering event loop");
     let started = Instant::now();
     let mut connect_failed = false;
+    // Like stock mosh: true once the session ended by agreement with the
+    // server, rather than by giving up on it.
+    let mut clean_shutdown = false;
+    let connecting_notification = format!(
+        "Nothing received from server on UDP port {}.",
+        server_addr.port()
+    );
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
-        output_new_frame(&transport, &prediction, &mut local_framebuffer, &mut stdout)?;
+        output_new_frame(
+            &transport,
+            &prediction,
+            &mut notifications,
+            &mut local_framebuffer,
+            &mut stdout,
+        )?;
 
-        let mut wait = transport.wait_time_ms().min(prediction.wait_time_ms());
+        let mut wait = transport
+            .wait_time_ms()
+            .min(prediction.wait_time_ms())
+            .min(notifications.wait_time_ms());
         if transport.get_remote_state_num() == 0 {
             wait = wait.min(250);
         }
@@ -135,7 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv() => {
                 match result {
                     Ok(_) => {
-                        notifications.clear_network_error();
                         notifications.server_heard(Instant::now());
                         notifications.server_acked(transport.sender.sent_state_acked_timestamp());
 
@@ -158,26 +181,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         tracing::warn!("Recv error: {e}");
-                        notifications.set_network_error(e.to_string());
+                        if !transport.shutdown_in_progress() {
+                            notifications.set_network_error(e.to_string());
+                        }
                     }
+                }
+            }
+            () = shutdown_signals.recv() => {
+                if !transport.has_remote_addr() {
+                    break Ok(());
+                }
+                if !transport.shutdown_in_progress() {
+                    tracing::info!("Signal received, shutting down");
+                    notifications
+                        .set_notification("Signal received, shutting down...".to_string(), true);
+                    transport.start_shutdown();
                 }
             }
             _ = tokio::time::sleep(wait) => {}
         }
 
         // Quit once our shutdown has been acknowledged, or we give up on it.
-        if transport.shutdown_in_progress()
-            && (transport.shutdown_acknowledged() || transport.shutdown_ack_timed_out())
-        {
+        if transport.shutdown_in_progress() && transport.shutdown_acknowledged() {
+            clean_shutdown = true;
+            break Ok(());
+        }
+        if transport.shutdown_in_progress() && transport.shutdown_ack_timed_out() {
             break Ok(());
         }
         // The server asked to shut down and we have acknowledged it.
         if transport.counterparty_shutdown_ack_sent() {
             tracing::info!("Server sent shutdown");
+            clean_shutdown = true;
             break Ok(());
         }
 
-        if transport.get_remote_state_num() == 0
+        let still_connecting = transport.get_remote_state_num() == 0;
+        if still_connecting
             && started.elapsed() > CONNECT_TIMEOUT
             && !transport.shutdown_in_progress()
         {
@@ -186,10 +226,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             connect_failed = true;
             break Ok(());
         }
+        // Say so if the server hasn't answered yet, as stock mosh does.
+        if still_connecting
+            && !transport.shutdown_in_progress()
+            && started.elapsed() > CONNECTING_NOTICE_AFTER
+        {
+            notifications.set_notification(connecting_notification.clone(), false);
+        } else if !still_connecting && notifications.notification() == connecting_notification {
+            notifications.set_notification(String::new(), false);
+        }
 
-        if let Err(e) = transport.tick().await {
-            tracing::warn!("Send error: {e}");
-            notifications.set_network_error(e.to_string());
+        match transport.tick().await {
+            Ok(()) => notifications.clear_network_error(),
+            Err(e) => {
+                tracing::warn!("Send error: {e}");
+                notifications.set_network_error(e.to_string());
+            }
         }
 
         let now = Instant::now();
@@ -208,14 +260,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = terminal::disable_raw_mode();
     #[cfg(windows)]
     restore_console_mode(original_console_mode);
-    println!("morsh is exiting.");
 
     if connect_failed {
+        println!("[morsh is exiting.]");
         eprint!("{}", connect_failure_hint(server_addr));
         std::process::exit(1);
     }
+    // Never connected: there is no server session to worry about.
+    if result.is_ok() && !clean_shutdown && transport.get_remote_state_num() != 0 {
+        eprint!("{UNCLEAN_SHUTDOWN}");
+    }
+    println!("[morsh is exiting.]");
 
     result
+}
+
+/// Signals that ask the client to end the session, as they do stock
+/// mosh-client: SIGTERM, SIGINT and SIGHUP.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    signals: [Option<tokio::signal::unix::Signal>; 3],
+}
+
+impl ShutdownSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let listen = |kind: SignalKind| {
+                signal(kind)
+                    .inspect_err(|e| tracing::warn!("Failed to listen for {kind:?}: {e}"))
+                    .ok()
+            };
+            Self {
+                signals: [
+                    listen(SignalKind::terminate()),
+                    listen(SignalKind::interrupt()),
+                    listen(SignalKind::hangup()),
+                ],
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Wait for any of the signals. Cancel-safe.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            async fn one(signal: &mut Option<tokio::signal::unix::Signal>) {
+                if let Some(signal) = signal {
+                    if signal.recv().await.is_some() {
+                        return;
+                    }
+                }
+                std::future::pending().await
+            }
+            let [a, b, c] = &mut self.signals;
+            tokio::select! {
+                () = one(a) => {}
+                () = one(b) => {}
+                () = one(c) => {}
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
 }
 
 /// Message shown when the server never answers. SSH already worked, so the
