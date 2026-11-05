@@ -114,7 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Entering event loop");
     let started = Instant::now();
-    let mut connect_failed = false;
     // Like stock mosh: true once the session ended by agreement with the
     // server, rather than by giving up on it.
     let mut clean_shutdown = false;
@@ -159,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv() => {
                 match result {
                     Ok(_) => {
-                        notifications.server_heard(Instant::now());
+                        notifications.server_heard(transport.get_latest_remote_state().timestamp);
                         notifications.server_acked(transport.sender.sent_state_acked_timestamp());
 
                         prediction.set_local_frame_acked(transport.sender.sent_state_acked());
@@ -223,7 +222,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             tracing::info!("Timed out waiting for server");
             notifications.set_notification("Timed out waiting for server...".to_string(), true);
-            connect_failed = true;
             break Ok(());
         }
         // Say so if the server hasn't answered yet, as stock mosh does.
@@ -261,25 +259,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     restore_console_mode(original_console_mode);
 
-    if connect_failed {
-        println!("[morsh is exiting.]");
-        eprint!("{}", connect_failure_hint(server_addr));
-        std::process::exit(1);
-    }
-    // Never connected: there is no server session to worry about.
-    if result.is_ok() && !clean_shutdown && transport.get_remote_state_num() != 0 {
+    // As stock mosh-client's `STMClient::shutdown` and `main`.
+    if transport.get_remote_state_num() == 0 {
+        eprint!("{}", connect_failure_hint(server_addr, started.elapsed()));
+    } else if !clean_shutdown {
         eprint!("{UNCLEAN_SHUTDOWN}");
+    }
+    if let Err(e) = &result {
+        eprint!("Error: {e}\r\n");
     }
     println!("[morsh is exiting.]");
 
-    result
+    if result.is_err() || !clean_shutdown {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Signals that ask the client to end the session, as they do stock
-/// mosh-client: SIGTERM, SIGINT and SIGHUP.
+/// mosh-client: SIGTERM, SIGINT, SIGHUP and SIGPIPE.
 struct ShutdownSignals {
     #[cfg(unix)]
-    signals: [Option<tokio::signal::unix::Signal>; 3],
+    signals: [Option<tokio::signal::unix::Signal>; 4],
 }
 
 impl ShutdownSignals {
@@ -297,6 +298,7 @@ impl ShutdownSignals {
                     listen(SignalKind::terminate()),
                     listen(SignalKind::interrupt()),
                     listen(SignalKind::hangup()),
+                    listen(SignalKind::pipe()),
                 ],
             }
         }
@@ -316,11 +318,12 @@ impl ShutdownSignals {
                 }
                 std::future::pending().await
             }
-            let [a, b, c] = &mut self.signals;
+            let [a, b, c, d] = &mut self.signals;
             tokio::select! {
                 () = one(a) => {}
                 () = one(b) => {}
                 () = one(c) => {}
+                () = one(d) => {}
             }
         }
         #[cfg(not(unix))]
@@ -330,9 +333,9 @@ impl ShutdownSignals {
 
 /// Message shown when the server never answers. SSH already worked, so the
 /// server is almost certainly running and UDP is being blocked on the way.
-fn connect_failure_hint(server_addr: SocketAddr) -> String {
+fn connect_failure_hint(server_addr: SocketAddr, waited: Duration) -> String {
     let port = server_addr.port();
-    let waited = CONNECT_TIMEOUT.as_secs();
+    let waited = waited.as_secs();
     format!(
         "morsh: no response from server at {server_addr} (UDP) after {waited}s.\n\
          \n\

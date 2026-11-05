@@ -125,7 +125,6 @@ impl NotificationEngine {
     pub fn set_network_error(&mut self, msg: String) {
         self.message = msg;
         self.message_is_network_error = true;
-        self.show_quit_keystroke = true;
         self.message_expiration = Some(Instant::now() + ACK_INTERVAL + Duration::from_millis(100));
     }
 
@@ -494,6 +493,22 @@ mod tests {
         engine.clear_network_error();
         engine.adjust_message_at(Instant::now() + Duration::from_millis(1100));
         assert_eq!(engine.notification(), "");
+    }
+
+    #[test]
+    fn network_error_keeps_quit_keystroke_setting() {
+        // Stock mosh's set_network_error leaves show_quit_keystroke alone.
+        let mut engine = engine_with_quit_key();
+        engine.show_escape_help();
+        engine.set_network_error("Network is unreachable".to_string());
+        assert_eq!(engine.get_text(), "morsh: Network is unreachable");
+
+        engine.set_notification(String::new(), true);
+        engine.set_network_error("Network is unreachable".to_string());
+        assert_eq!(
+            engine.get_text(),
+            "morsh: Network is unreachable [To quit: Ctrl-^ .]"
+        );
     }
 
     #[test]
