@@ -11,6 +11,10 @@
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, State, Transport};
 use std::net::SocketAddr;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
@@ -49,6 +53,10 @@ impl State for Stream {
 struct Impairment {
     /// Drop every Nth packet in each direction (0 = never).
     drop_every: usize,
+    /// Ensure short fragmented workloads actually encounter loss.
+    drop_first: bool,
+    /// Propagation latency per direction, without blocking later packets.
+    delay_ms: u64,
     /// Send every Nth packet twice (0 = never).
     duplicate_every: usize,
     /// Hold back every Nth packet and release it after the following one,
@@ -73,11 +81,27 @@ struct Direction {
 ///
 /// Deterministic rather than random: a test that fails needs to fail the same
 /// way twice.
-async fn spawn_proxy(server: SocketAddr, imp: Impairment) -> SocketAddr {
+#[derive(Default)]
+struct Metrics {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    dropped: AtomicU64,
+    forwarded: AtomicU64,
+    max_datagram: AtomicU64,
+}
+
+async fn spawn_proxy(
+    server: SocketAddr,
+    imp: Impairment,
+) -> (SocketAddr, Arc<Metrics>, tokio::task::JoinHandle<()>) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
 
-    tokio::spawn(async move {
+    let sock = Arc::new(sock);
+    let metrics = Arc::new(Metrics::default());
+    let counters = metrics.clone();
+    let task = tokio::spawn(async move {
+        let mut deliveries = tokio::task::JoinSet::new();
         let mut client: Option<SocketAddr> = None;
         let mut to_server = Direction::default();
         let mut to_client = Direction::default();
@@ -88,6 +112,11 @@ async fn spawn_proxy(server: SocketAddr, imp: Impairment) -> SocketAddr {
                 return;
             };
             let data = buf[..len].to_vec();
+            counters.packets.fetch_add(1, Ordering::Relaxed);
+            counters.bytes.fetch_add(len as u64, Ordering::Relaxed);
+            counters
+                .max_datagram
+                .fetch_max(len as u64, Ordering::Relaxed);
 
             let heading_to_server = from != server;
             if heading_to_server {
@@ -109,7 +138,8 @@ async fn spawn_proxy(server: SocketAddr, imp: Impairment) -> SocketAddr {
             dir.count += 1;
             let nth = |every: usize| every > 0 && dir.count % every == 0;
 
-            if nth(imp.drop_every) {
+            if (imp.drop_first && dir.count == 1) || nth(imp.drop_every) {
+                counters.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if nth(imp.reorder_every) && dir.held.is_none() {
@@ -117,20 +147,34 @@ async fn spawn_proxy(server: SocketAddr, imp: Impairment) -> SocketAddr {
                 continue;
             }
 
-            let _ = sock.send_to(&data, dest).await;
+            let mut batch = vec![data.clone()];
             if nth(imp.duplicate_every) {
-                let _ = sock.send_to(&data, dest).await;
+                batch.push(data);
             }
             if let Some(held) = dir.held.take() {
-                let _ = sock.send_to(&held, dest).await;
+                batch.push(held);
             }
+            let socket = sock.clone();
+            let counts = counters.clone();
+            deliveries.spawn(async move {
+                if imp.delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(imp.delay_ms)).await;
+                }
+                for packet in batch {
+                    socket.send_to(&packet, dest).await.unwrap();
+                    counts.forwarded.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            while deliveries.try_join_next().is_some() {}
         }
     });
 
-    addr
+    (addr, metrics, task)
 }
 
 struct Link {
+    metrics: Arc<Metrics>,
+    proxy_task: tokio::task::JoinHandle<()>,
     client: Transport<Stream, Stream>,
     server: Transport<Stream, Stream>,
     /// What the server has read out of the client's stream so far.
@@ -148,12 +192,14 @@ impl Link {
             .unwrap();
         let server_addr = server_conn.local_addr().unwrap();
 
-        let proxy_addr = spawn_proxy(server_addr, imp).await;
+        let (proxy_addr, metrics, proxy_task) = spawn_proxy(server_addr, imp).await;
 
         let mut client_conn = Connection::new_client(Session::new(key)).await.unwrap();
         client_conn.set_remote_addr(proxy_addr);
 
         Self {
+            metrics,
+            proxy_task,
             client: Transport::new_client(client_conn, Stream::default(), Stream::default()),
             server: Transport::new_server(server_conn, Stream::default(), Stream::default()),
             server_received: Vec::new(),
@@ -249,9 +295,7 @@ async fn clean_link_converges() {
     let typed = payload(b'a', 64);
     link.client_sends(&typed);
 
-    let converged = link
-        .run_until(BUDGET, |l| l.server_received == typed)
-        .await;
+    let converged = link.run_until(BUDGET, |l| l.server_received == typed).await;
 
     assert!(
         converged,
@@ -307,9 +351,7 @@ async fn thirty_percent_loss_still_converges() {
     let typed = payload(b'q', 128);
     link.exchange_in_chunks(&typed, &[], 8).await;
 
-    let converged = link
-        .run_until(BUDGET, |l| l.server_received == typed)
-        .await;
+    let converged = link.run_until(BUDGET, |l| l.server_received == typed).await;
 
     assert!(
         converged,
@@ -379,18 +421,18 @@ async fn reordered_packets_still_converge() {
 async fn loss_duplication_and_reordering_together() {
     let mut link = Link::new(Impairment {
         drop_every: 11,
+        drop_first: true,
         duplicate_every: 5,
         reorder_every: 7,
+        delay_ms: 10,
     })
     .await;
 
     // Large enough that some instructions have to be fragmented.
-    let typed = payload(b'm', 4096);
+    let typed = noise(8 * 1024);
     link.exchange_in_chunks(&typed, &[], 8).await;
 
-    let converged = link
-        .run_until(BUDGET, |l| l.server_received == typed)
-        .await;
+    let converged = link.run_until(BUDGET, |l| l.server_received == typed).await;
 
     assert!(
         converged,
@@ -398,6 +440,29 @@ async fn loss_duplication_and_reordering_together() {
         link.server_received.len(),
         typed.len()
     );
+    let largest = link.metrics.max_datagram.load(Ordering::Relaxed);
+    assert!(largest > 1000);
+    assert!(largest <= morsh_network::constants::MTU_IPV4 as u64);
+    assert!(link.metrics.dropped.load(Ordering::Relaxed) > 0);
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.proxy_task.abort();
+    }
+}
+
+/// Fixed xorshift32 stream: incompressible enough to exercise real fragmentation.
+fn noise(len: usize) -> Vec<u8> {
+    let mut seed = 0x1234abcd_u32;
+    (0..len)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect()
 }
 
 /// Input that keeps arriving while the link is lossy must all get through, in
@@ -418,9 +483,7 @@ async fn continuous_typing_over_a_lossy_link_converges() {
         link.run_until(Duration::from_millis(150), |_| false).await;
     }
 
-    let converged = link
-        .run_until(BUDGET, |l| l.server_received == typed)
-        .await;
+    let converged = link.run_until(BUDGET, |l| l.server_received == typed).await;
 
     assert!(
         converged,
@@ -452,9 +515,78 @@ async fn session_survives_a_client_port_hop() {
     expected.extend_from_slice(&second);
 
     assert!(
-        link.run_until(BUDGET, |l| l.server_received == expected).await,
+        link.run_until(BUDGET, |l| l.server_received == expected)
+            .await,
         "session did not survive the port hop: server saw {} of {} bytes",
         link.server_received.len(),
         expected.len()
     );
+}
+
+/// Real scheduling and OS timing are informational; correctness remains asserted.
+#[tokio::test]
+#[ignore = "informational network performance run"]
+async fn wire_performance_report() {
+    println!("scenario,packets,udp_bytes,dropped,forwarded,contact_ms,transfer_ms,payload_bytes_per_second,roam_ms");
+    for (name, imp) in [
+        ("clean", Impairment::none()),
+        (
+            "40ms_rtt",
+            Impairment {
+                delay_ms: 20,
+                ..Impairment::none()
+            },
+        ),
+        (
+            "loss_reorder_40ms_rtt",
+            Impairment {
+                delay_ms: 20,
+                drop_every: 10,
+                drop_first: false,
+                reorder_every: 7,
+                duplicate_every: 5,
+            },
+        ),
+    ] {
+        let mut link = Link::new(imp).await;
+        let start = Instant::now();
+        link.client_sends(b"contact");
+        assert!(
+            link.run_until(BUDGET, |l| l.server_received == b"contact")
+                .await
+        );
+        let contact = start.elapsed();
+        let data = noise(16 * 1024);
+        let start = Instant::now();
+        link.exchange_in_chunks(&data, &data, 16).await;
+        let mut expected = b"contact".to_vec();
+        expected.extend_from_slice(&data);
+        assert!(
+            link.run_until(BUDGET, |l| l.server_received == expected
+                && l.client_received == data)
+                .await
+        );
+        let transfer = start.elapsed();
+        let start = Instant::now();
+        link.client.hop_port().await.unwrap();
+        link.client_sends(b"roamed");
+        expected.extend_from_slice(b"roamed");
+        assert!(
+            link.run_until(BUDGET, |l| l.server_received == expected)
+                .await
+        );
+        let roam = start.elapsed();
+        let m = &link.metrics;
+        println!(
+            "{name},{},{},{},{},{:.2},{:.2},{:.0},{:.2}",
+            m.packets.load(Ordering::Relaxed),
+            m.bytes.load(Ordering::Relaxed),
+            m.dropped.load(Ordering::Relaxed),
+            m.forwarded.load(Ordering::Relaxed),
+            contact.as_secs_f64() * 1000.0,
+            transfer.as_secs_f64() * 1000.0,
+            (data.len() * 2) as f64 / transfer.as_secs_f64(),
+            roam.as_secs_f64() * 1000.0
+        );
+    }
 }

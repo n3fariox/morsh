@@ -192,6 +192,13 @@ runtime:
   when a state deep in the receive history is written to — restores cells,
   cursor, title, and input modes, but not scrollback or the scrolling region.
 
+## Testing and benchmarks
+
+See [testing commands and benchmark interpretation](docs/testing.md) and the
+[testing survey and plan](docs/testing-plan.md). Offline stock wire fixtures and
+structural byte/packet budgets run with `cargo test --workspace`; performance
+timings are reported separately.
+
 ## Disclaimer
 
 This codebase was heavily AI-generated (by [opencode](https://opencode.ai) / Claude) and is not audited for correctness or security. Use at your own risk.

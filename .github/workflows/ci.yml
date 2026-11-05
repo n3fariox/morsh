@@ -144,6 +144,38 @@ jobs:
           GHOSTTY_SOURCE_DIR: ${{ github.workspace }}/third_party/ghostty
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
 
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Install stock mosh and protoc
+        run: sudo apt-get update -qq && sudo apt-get install -y mosh protobuf-compiler
+      - name: Bidirectional stock interop (PTY input and output)
+        run: ./scripts/interop.sh
+      - name: Informational performance report
+        run: |
+          rustc -Vv > performance-environment.txt
+          zig version >> performance-environment.txt
+          uname -a >> performance-environment.txt
+          lscpu >> performance-environment.txt
+          mosh-server --version >> performance-environment.txt 2>&1
+          cargo bench -p morsh-statesync --bench performance > tui-performance.csv
+          cargo test -p morsh-network --test transport_integration wire_performance_report -- --ignored --nocapture > wire-performance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-reports
+          path: |
+            tui-performance.csv
+            wire-performance.txt
+            performance-environment.txt
+
   universal-smoke:
     needs: build
     runs-on: macos-15
