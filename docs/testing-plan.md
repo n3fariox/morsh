@@ -31,3 +31,13 @@ Later work: a virtual-clock transport simulator (production transport currently
 uses std::time::Instant), more stock versions, captured multi-fragment stock
 sessions, sustained real PTY keystroke latency distributions, and controlled
 hardware baselines. None of these first steps establishes full compatibility.
+
+
+Follow-up: ultrawide split-pane coverage
+
+Add 320–1024-column scenarios with two populated panes and a fixed status row.
+Check either pane redrawing/scrolling independently, Unicode at the divider,
+wide cursor addresses, resizing, and sparse wire-size budgets. Compare snapshot,
+diff, emulation and local key-to-render CPU costs with a normal-size terminal;
+keep elapsed-time measurements informational. Use synthetic VT workloads so CI
+does not depend on the runner's terminal size or tmux installation.

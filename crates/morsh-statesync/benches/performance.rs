@@ -1,4 +1,7 @@
 //! Fixed-work benchmarks without a benchmark framework. Times are informational, never gates.
+#[path = "../test_support/split_terminal.rs"]
+mod split_terminal;
+
 use morsh_crypto::{Message, Nonce, Session};
 use morsh_network::{constants::*, fragment::Fragmenter, State};
 use morsh_proto::transport::Instruction;
@@ -6,7 +9,14 @@ use morsh_statesync::{Complete, UserEvent, UserStream};
 use morsh_terminal::{DisplayDiff, KeyMap, MoshTerminal};
 use std::{hint::black_box, time::Instant};
 
-fn measure(name: &str, units: usize, mut work: impl FnMut()) {
+fn measure(name: &str, units: usize, work: impl FnMut()) {
+    measure_iterations(name, units, 20, work);
+}
+
+fn measure_iterations(name: &str, units: usize, iterations: usize, mut work: impl FnMut()) {
+    if std::env::var("MORSH_BENCH_FILTER").is_ok_and(|filter| !name.contains(&filter)) {
+        return;
+    }
     // Warm caches/native allocator before recording independent fixed-work batches.
     for _ in 0..5 {
         work();
@@ -14,14 +24,14 @@ fn measure(name: &str, units: usize, mut work: impl FnMut()) {
     let mut samples = Vec::new();
     for _ in 0..21 {
         let start = Instant::now();
-        for _ in 0..20 {
+        for _ in 0..iterations {
             work();
         }
-        samples.push(start.elapsed().as_nanos() as f64 / 20.0);
+        samples.push(start.elapsed().as_nanos() as f64 / iterations as f64);
     }
     samples.sort_by(f64::total_cmp);
     println!(
-        "{name},21,20,{units},{:.0},{:.0},{:.2}",
+        "{name},21,{iterations},{units},{:.0},{:.0},{:.2}",
         samples[10],
         samples[19],
         units as f64 * 1e9 / samples[10]
@@ -177,4 +187,84 @@ fn main() {
                 .unwrap(),
         );
     });
+    ultrawide_benchmarks();
+}
+
+fn ultrawide_benchmarks() {
+    use split_terminal::{initial_screen, pane_bounds, scroll_pane, update_pane, Side};
+    for (cols, rows) in [(120, 40), (320, 80), (512, 100), (1024, 128)] {
+        let cells = cols as usize * rows as usize;
+        let mut state = Complete::new(cols, rows).unwrap();
+        state.act(&initial_screen(cols, rows)).unwrap();
+        let old = state.snapshot();
+        // Right-pane traffic exercises cursor addresses beyond column 255.
+        let update = update_pane(cols, rows, Side::Right, 1);
+        state.act(&update).unwrap();
+        let new = state.snapshot();
+        let (_, pane_width) = pane_bounds(cols, Side::Right);
+        let pane_cells = pane_width as usize * (rows as usize - 1);
+        measure_iterations(
+            &format!("split_{cols}x{rows}_diff_half_pane_cells"),
+            pane_cells,
+            3,
+            || {
+                black_box(DisplayDiff::diff(black_box(&old), black_box(&new)));
+            },
+        );
+        let mut terminal = MoshTerminal::new(cols, rows, 0).unwrap();
+        terminal.write(&initial_screen(cols, rows));
+        measure_iterations(
+            &format!("split_{cols}x{rows}_emulate_half_pane_bytes"),
+            update.len(),
+            3,
+            || {
+                terminal.write(black_box(&update));
+            },
+        );
+        measure_iterations(
+            &format!("split_{cols}x{rows}_snapshot_cells"),
+            cells,
+            3,
+            || {
+                black_box(terminal.snapshot().unwrap());
+            },
+        );
+        measure_iterations(
+            &format!("split_{cols}x{rows}_diff_idle_cells"),
+            cells,
+            3,
+            || {
+                black_box(DisplayDiff::diff(black_box(&new), black_box(&new)));
+            },
+        );
+        terminal.write(&initial_screen(cols, rows));
+        terminal.write(&scroll_pane(cols, rows, Side::Left));
+        let scrolled = terminal.snapshot().unwrap();
+        let (_, left_width) = pane_bounds(cols, Side::Left);
+        measure_iterations(
+            &format!("split_{cols}x{rows}_diff_pane_scroll_cells"),
+            left_width as usize * (rows as usize - 1),
+            3,
+            || {
+                black_box(DisplayDiff::diff(black_box(&old), black_box(&scrolled)));
+            },
+        );
+        let mut keymap = KeyMap::new().unwrap();
+        let mut key = false;
+        let (right, _) = pane_bounds(cols, Side::Right);
+        measure_iterations(
+            &format!("split_{cols}x{rows}_local_key_to_render"),
+            1,
+            3,
+            || {
+                key = !key;
+                let echo = keymap.encode_char(black_box(if key { 'x' } else { 'y' }));
+                let before = state.clone();
+                let mut output = format!("\x1b[20;{}H", right + 10).into_bytes();
+                output.extend_from_slice(&echo);
+                state.act(&output).unwrap();
+                black_box(state.diff_from(&before));
+            },
+        );
+    }
 }

@@ -38,6 +38,48 @@ keystroke tail latency. Units name bytes, cells, or local operations. Black-box
 barriers retain computed results. Terminal instances are reused to model steady
 state. Timing runs in Cargo's optimized bench profile and has no speed threshold.
 
+Wide-terminal coverage models two independently addressed tmux-style panes,
+a divider and an unchanged status row. CI tests use 320x80, 512x100, 513x100 and
+1024x128 terminals, exercise both active halves, pane-local scrolling, combining
+text/wide glyphs at pane edges, cursor positions beyond column 255, and resize
+round trips. Tests require exact reconstructed screens and unchanged neighboring
+cells; sparse edits must stay below 512 protobuf bytes and 256 UDP payload bytes
+in one packet. Half-pane redraws have an output-size budget that rejects a
+full-screen repaint. `--nocapture` reports VT/protobuf bytes and packet/UDP bytes
+for every redraw, with fixed maximum-length chaff.
+
+```sh
+cargo test -p morsh-statesync --test ultrawide -- --nocapture
+MORSH_BENCH_FILTER=split_ cargo bench -p morsh-statesync --bench performance
+MORSH_BENCH_FILTER=split_1024x128 cargo bench -p morsh-statesync --bench performance
+```
+
+The `split_` CSV workloads compare 120x40, 320x80, 512x100 and 1024x128 screens.
+They separately time pane emulation, snapshots, half-pane diffs, idle diffs,
+pane-local scrolling, and a key echo in the right pane including snapshot and
+state-diff generation. These larger workloads use 21 samples of **3** iterations
+(the CSV records the batch size), keeping CI runtime bounded. The optional
+`MORSH_BENCH_FILTER` is a substring match on workload names. This distinguishes
+small rendered/wire updates from CPU costs that still scale with the whole
+screen. Traces are synthetic, so these checks do not require tmux installed and
+do not claim to test tmux itself. Geometry is measured in character cells;
+monitor pixels and display scaling do not uniquely determine terminal geometry.
+
+An illustrative optimized run on Linux x86_64 (Ryzen 5 5600, Rust 1.98.1,
+Ghostty ReleaseSafe) produced these median milliseconds per operation:
+
+| Geometry | Snapshot | Half-pane diff | Local key to render |
+|---|---:|---:|---:|
+| 120x40 | 0.34 | 0.18 | 0.59 |
+| 320x80 | 1.76 | 0.93 | 3.26 |
+| 512x100 | 3.60 | 1.83 | 6.57 |
+| 1024x128 | 9.57 | 4.77 | 16.89 |
+
+These are examples, not portable thresholds. The current snapshot refresh and
+`DisplayDiff::diff` clone/scan screen cells even for small updates; this makes
+whole-screen CPU cost visible despite sparse output. The idle-diff workload
+explicitly calls the renderer and does not measure the client's idle CPU usage.
+
 Compare the same commit/compiler/native library, idle hardware, CPU settings,
 and workload across runs. Record `rustc -Vv`, `zig version`, OS and CPU with
 saved reports. Use several runs before calling a small change a regression.
@@ -79,7 +121,7 @@ multiple full-size fragments); a deterministic fragment-level regression also
 checks recovery after an incomplete instruction. Larger sustained streams and
 burst-loss recovery remain follow-up work.
 
-Validation on Linux with stock mosh 1.4.0: 217 workspace tests passed, the one
+Initial validation on Linux with stock mosh 1.4.0: 217 workspace tests passed, the one
 informational wire test was ignored by default and passed when requested,
 Clippy passed with warnings denied, and all five local interop pairings/launch
 cases passed. Missing-stock skips were also exercised. The optional localhost
@@ -87,3 +129,8 @@ SSH case skipped because passwordless SSH was unavailable. The optimized CSV
 benchmark completed; host contention makes these timings unsuitable as a
 hardware baseline. CI artifacts include compiler, Zig, OS, CPU and stock version
 metadata alongside the performance reports.
+
+Ultrawide follow-up validation: 221 workspace tests passed (including the four
+new split-pane tests), Clippy passed with warnings denied, and the full optimized
+benchmark plus the filtered 1024x128 benchmark completed. New Rust files passed
+rustfmt checking. Timing and size budgets remain separate.
