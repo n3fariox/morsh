@@ -69,6 +69,7 @@ impl Complete {
         if self.terminal.is_none() {
             let (cols, rows) = (self.screen.cols, self.screen.rows_count);
             let mut term = MoshTerminal::new(cols, rows, 0)?;
+            term.write(DisplayDiff::grapheme_mode(&self.screen).as_bytes());
             term.write(DisplayDiff::full_redraw(&self.screen).as_bytes());
             self.terminal = Some(term);
         }
@@ -204,7 +205,11 @@ impl State for Complete {
                 });
             }
 
-            let update = DisplayDiff::diff(&existing.screen, &self.screen);
+            let mut update = String::new();
+            if existing.screen.grapheme_cluster != self.screen.grapheme_cluster {
+                update.push_str(&DisplayDiff::grapheme_mode(&self.screen));
+            }
+            update.push_str(&DisplayDiff::diff(&existing.screen, &self.screen));
             if !update.is_empty() {
                 output.instruction.push(HostInstruction {
                     hostbytes: Some(HostBytes {
@@ -325,6 +330,52 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(String::from_utf8_lossy(bytes).contains("Hi"));
+    }
+
+    const CLUSTER: &str = "\x1b[?2027h👍🏽x";
+
+    #[test]
+    #[serial]
+    fn grapheme_mode_reaches_the_peer_before_the_text() {
+        let mut server = Complete::new(20, 3).unwrap();
+        let mut client = Complete::new(20, 3).unwrap();
+        let blank = server.clone();
+        server.act(CLUSTER.as_bytes()).unwrap();
+
+        client.apply_string(&server.diff_from(&blank)).unwrap();
+
+        assert!(client.screen().grapheme_cluster);
+        assert_eq!(client.screen().rows, server.screen().rows);
+    }
+
+    #[test]
+    #[serial]
+    fn grapheme_mode_can_be_turned_off_again() {
+        let mut server = Complete::new(20, 3).unwrap();
+        let mut client = Complete::new(20, 3).unwrap();
+        let blank = server.clone();
+        server.act(b"\x1b[?2027h").unwrap();
+        client.apply_string(&server.diff_from(&blank)).unwrap();
+
+        let enabled = server.clone();
+        server.act(b"\x1b[?2027l").unwrap();
+        client.apply_string(&server.diff_from(&enabled)).unwrap();
+
+        assert!(!client.screen().grapheme_cluster);
+    }
+
+    #[test]
+    #[serial]
+    fn grapheme_mode_survives_rebuilding_the_emulator() {
+        let mut original = Complete::new(20, 3).unwrap();
+        original.act(CLUSTER.as_bytes()).unwrap();
+
+        let mut rebuilt = original.clone();
+        rebuilt.act(" y".as_bytes()).unwrap();
+        original.act(" y".as_bytes()).unwrap();
+
+        assert!(rebuilt.screen().grapheme_cluster);
+        assert_eq!(rebuilt.screen().rows, original.screen().rows);
     }
 
     #[test]

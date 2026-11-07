@@ -209,6 +209,7 @@ impl MoshTerminal {
             mouse_encoding: self.mouse_encoding(),
             mouse_focus_event: self.mode(Mode::FOCUS_EVENT),
             mouse_alternate_scroll: self.mode(Mode::ALT_SCROLL),
+            grapheme_cluster: self.mode(Mode::GRAPHEME_CLUSTER),
             fg,
             bg,
             palette,

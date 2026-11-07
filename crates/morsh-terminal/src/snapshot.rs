@@ -78,6 +78,20 @@ impl CellData {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
+
+    /// The `char` this cell shows, if one narrow `char` describes it fully.
+    /// `None` for either half of a wide glyph and for multi-codepoint clusters.
+    pub fn single_char(&self) -> Option<char> {
+        if self.wide || self.spacer {
+            return None;
+        }
+        let mut chars = self.text.chars();
+        match (chars.next(), chars.next()) {
+            (None, _) => Some(' '),
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// Which mouse-reporting mode the host has requested.
@@ -133,6 +147,10 @@ pub struct ScreenSnapshot {
     pub mouse_focus_event: bool,
     /// DEC 1007: alternate scroll.
     pub mouse_alternate_scroll: bool,
+    /// DEC 2027: grapheme clustering. Unlike the modes above this one is kept
+    /// between emulators and never reaches the user's terminal, which may have
+    /// its own default that we couldn't restore on exit.
+    pub grapheme_cluster: bool,
     pub fg: RgbColor,
     pub bg: RgbColor,
     pub palette: [RgbColor; 256],
@@ -155,6 +173,7 @@ impl ScreenSnapshot {
             mouse_encoding: MouseEncoding::Default,
             mouse_focus_event: false,
             mouse_alternate_scroll: false,
+            grapheme_cluster: false,
             fg: RgbColor { r: 255, g: 255, b: 255 },
             bg: RgbColor { r: 0, g: 0, b: 0 },
             palette: default_palette(),
