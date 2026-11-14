@@ -6,7 +6,7 @@ use morsh_proto::transport::Instruction as TransportInstruction;
 use std::net::SocketAddr;
 use std::task::Poll;
 use std::time::{Duration, Instant};
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(unix))]
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
@@ -136,24 +136,46 @@ fn disable_pmtu_discovery(socket: &std::net::UdpSocket) {
     }
 }
 
-/// Explicit Congestion Notification on received datagrams, as in mosh's
-/// `recv_one`: `IP_RECVTOS` delivers each datagram's TOS byte, and a
-/// Congestion Experienced mark makes us echo the peer's timestamp 500 ms
-/// stale, which gradually slows it to its minimum frame rate.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// Receiving with `recvmsg`, as mosh's `recv_one` does on every Unix: it
+/// reports truncation (`MSG_TRUNC`), and with `IP_RECVTOS` it delivers each
+/// datagram's TOS byte, for Explicit Congestion Notification: a Congestion
+/// Experienced mark makes us echo the peer's timestamp 500 ms stale, which
+/// gradually slows it to its minimum frame rate.
+#[cfg(unix)]
 mod ecn {
     use std::io;
     use std::net::SocketAddr;
     use std::os::fd::AsRawFd;
 
+    /// The cmsg type `IP_RECVTOS` delivers on platforms where it is not
+    /// `IP_TOS` (the BSDs, macOS); Linux reports `IP_TOS`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ))]
+    const RECVTOS_CMSG: Option<libc::c_int> = Some(libc::IP_RECVTOS);
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )))]
+    const RECVTOS_CMSG: Option<libc::c_int> = None;
+
+    /// Ask for each datagram's TOS byte, where the platform supports it.
     pub fn enable(socket: &std::net::UdpSocket) {
+        let Some(option) = RECVTOS_CMSG else {
+            return;
+        };
         let on: libc::c_int = 1;
         // SAFETY: a valid fd and a correctly sized c_int option value.
         let rc = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
                 libc::IPPROTO_IP,
-                libc::IP_RECVTOS,
+                option,
                 (&on as *const libc::c_int).cast(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
@@ -180,7 +202,7 @@ mod ecn {
             msg.msg_name = (&mut storage as *mut libc::sockaddr_storage).cast();
             msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
+            msg.msg_iovlen = 1 as _;
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen = std::mem::size_of_val(&control) as _;
 
@@ -196,7 +218,8 @@ mod ecn {
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
                 if (*cmsg).cmsg_level == libc::IPPROTO_IP
-                    && ((*cmsg).cmsg_type == libc::IP_TOS || (*cmsg).cmsg_type == libc::IP_RECVTOS)
+                    && ((*cmsg).cmsg_type == libc::IP_TOS
+                        || Some((*cmsg).cmsg_type) == RECVTOS_CMSG)
                 {
                     congestion = *libc::CMSG_DATA(cmsg) & 0x03 == 0x03;
                 }
@@ -240,10 +263,9 @@ fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
         .map_err(|e| format!("Failed to set nonblocking: {e}"))?;
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        disable_pmtu_discovery(&std_socket);
-        ecn::enable(&std_socket);
-    }
+    disable_pmtu_discovery(&std_socket);
+    #[cfg(unix)]
+    ecn::enable(&std_socket);
 
     let sock_ref = socket2::SockRef::from(&std_socket);
     let _ = sock_ref.set_tos(0x02);
@@ -319,7 +341,8 @@ impl Connection {
             mtu,
             saved_timestamp: None,
             send_buf: Vec::with_capacity(RECEIVE_MTU),
-            recv_buf: vec![0; RECEIVE_MTU].into_boxed_slice(),
+            // One spare byte lets the non-Unix receive path detect truncation.
+            recv_buf: vec![0; RECEIVE_MTU + 1].into_boxed_slice(),
         }
     }
 
@@ -528,9 +551,10 @@ impl Connection {
         data: &[u8],
         peer: SocketAddr,
     ) -> Result<Option<TransportInstruction>, String> {
-        let Some(dest) = self.recv_buf.get_mut(..data.len()) else {
+        if data.len() > RECEIVE_MTU {
             return Err(format!("Received oversize datagram ({} bytes)", data.len()));
-        };
+        }
+        let dest = &mut self.recv_buf[..data.len()];
         dest.copy_from_slice(data);
         self.process_received(data.len(), peer, false)
     }
@@ -721,13 +745,15 @@ impl Connection {
     }
 }
 
-/// Poll one socket for a datagram.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// Poll one socket for a datagram. `buf` is `RECEIVE_MTU + 1` bytes.
+#[cfg(unix)]
 fn poll_recv(
     socket: &UdpSocket,
     cx: &mut std::task::Context<'_>,
     buf: &mut [u8],
 ) -> Poll<std::io::Result<(usize, SocketAddr, bool)>> {
+    // recvmsg reports truncation itself, so offer exactly RECEIVE_MTU.
+    let buf = &mut buf[..RECEIVE_MTU];
     loop {
         if let Err(e) = std::task::ready!(socket.poll_recv_ready(cx)) {
             return Poll::Ready(Err(e));
@@ -742,16 +768,20 @@ fn poll_recv(
 }
 
 /// Poll one socket for a datagram (no ECN information on this platform).
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// `buf` is `RECEIVE_MTU + 1` bytes: without `MSG_TRUNC`, a datagram that
+/// fills it was larger than `RECEIVE_MTU` and is rejected, as mosh does.
+#[cfg(not(unix))]
 fn poll_recv(
     socket: &UdpSocket,
     cx: &mut std::task::Context<'_>,
     buf: &mut [u8],
 ) -> Poll<std::io::Result<(usize, SocketAddr, bool)>> {
     let mut read = ReadBuf::new(buf);
-    socket
-        .poll_recv_from(cx, &mut read)
-        .map_ok(|peer| (read.filled().len(), peer, false))
+    let peer = std::task::ready!(socket.poll_recv_from(cx, &mut read))?;
+    if read.filled().len() > RECEIVE_MTU {
+        return Poll::Ready(Err(std::io::Error::other("Received oversize datagram")));
+    }
+    Poll::Ready(Ok((read.filled().len(), peer, false)))
 }
 
 /// Timestamp diff accounting for 16-bit wrapping.
@@ -1196,7 +1226,6 @@ mod tests {
 
     /// Mosh rejects a datagram larger than its receive buffer rather than
     /// processing a truncated copy.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn oversize_datagram_is_reported_as_such() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1212,6 +1241,62 @@ mod tests {
             .expect("datagram should arrive")
             .unwrap_err();
         assert!(err.contains("oversize"), "{err}");
+    }
+
+    /// A client datagram of exactly `len` bytes whose first `RECEIVE_MTU`
+    /// bytes, if it is longer, are an authentic packet on their own.
+    fn authentic_prefix_datagram(k: [u8; 16], len: usize) -> Vec<u8> {
+        // nonce 8 + timestamps 4 + fragment header 10 + payload + tag 16
+        let payload = len.min(RECEIVE_MTU) - (8 + 4 + FRAG_HEADER_LEN + 16);
+        let frag = Fragment {
+            id: 1,
+            final_flag: true,
+            fragment_num: 0,
+            payload: vec![0; payload],
+        };
+        let mut text = vec![0xFF; 4];
+        text.extend_from_slice(&frag.to_bytes());
+        let mut wire =
+            Session::new(k).encrypt(&morsh_crypto::Message::new(Nonce::from_val(0), text));
+        assert_eq!(wire.len(), len.min(RECEIVE_MTU));
+        wire.resize(len, 0);
+        wire
+    }
+
+    async fn receive_one(k: [u8; 16], datagram: &[u8]) -> Result<(), String> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(datagram, server.local_addr().unwrap())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server.recv())
+            .await
+            .expect("datagram should arrive")
+            .map(|_| ())
+    }
+
+    /// Review repro: one byte past RECEIVE_MTU, where the first
+    /// RECEIVE_MTU bytes authenticate. Reading a truncated copy would accept
+    /// it; mosh rejects it.
+    #[tokio::test]
+    async fn truncated_authentic_prefix_is_rejected() {
+        let k = key();
+        let err = receive_one(k, &authentic_prefix_datagram(k, RECEIVE_MTU + 1))
+            .await
+            .unwrap_err();
+        assert!(err.contains("oversize"), "{err}");
+    }
+
+    /// A datagram of exactly RECEIVE_MTU bytes is not truncated: it
+    /// authenticates (and then fails only because its payload is not zlib).
+    #[tokio::test]
+    async fn datagram_of_exactly_receive_mtu_is_read_whole() {
+        let k = key();
+        let err = receive_one(k, &authentic_prefix_datagram(k, RECEIVE_MTU))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Zlib"), "{err}");
     }
 
     /// Garbage must not authenticate.
