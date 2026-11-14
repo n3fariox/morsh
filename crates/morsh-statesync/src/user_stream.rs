@@ -103,8 +103,7 @@ impl UserStream {
                         self.events.push(UserEvent::UserByte(byte));
                     }
                 }
-            }
-            if let Some(ref resize) = inst.resize {
+            } else if let Some(ref resize) = inst.resize {
                 let w = resize.width.unwrap_or(80);
                 let h = resize.height.unwrap_or(24);
                 self.events.push(UserEvent::Resize { width: w, height: h });
@@ -174,6 +173,31 @@ impl State for UserStream {
 mod tests {
     use super::*;
     use morsh_network::State;
+
+    /// Protobuf extensions may coexist; stock mosh gives keystroke priority
+    /// over resize within a single instruction (statesync/user.cc).
+    #[test]
+    fn keystroke_extension_takes_precedence_over_resize() {
+        for keys in [None, Some(Vec::new()), Some(b"xy".to_vec())] {
+            let message = UserMessage {
+                instruction: vec![ClientInstruction {
+                    keystroke: Some(Keystroke { keys: keys.clone() }),
+                    resize: Some(ResizeMessage {
+                        width: Some(132),
+                        height: Some(43),
+                    }),
+                }],
+            };
+            let mut stream = UserStream::new();
+            stream.apply_string(&message.encode_to_vec()).unwrap();
+            let expected: Vec<_> = keys
+                .unwrap_or_default()
+                .into_iter()
+                .map(UserEvent::UserByte)
+                .collect();
+            assert_eq!(stream.events(), expected);
+        }
+    }
 
     #[test]
     fn push_and_length() {

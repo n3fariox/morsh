@@ -53,7 +53,7 @@ impl CellStyle {
 }
 
 /// A single terminal cell with content and style.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CellData {
     pub text: String,
     /// This cell holds a double-width glyph and owns the column to its right.
@@ -62,6 +62,25 @@ pub struct CellData {
     /// drawn here: writing the wide glyph already covered it.
     pub spacer: bool,
     pub style: CellStyle,
+}
+
+impl Clone for CellData {
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            wide: self.wide,
+            spacer: self.spacer,
+            style: self.style,
+        }
+    }
+
+    /// Reuse text storage when copying a cell.
+    fn clone_from(&mut self, source: &Self) {
+        self.text.clone_from(&source.text);
+        self.wide = source.wide;
+        self.spacer = source.spacer;
+        self.style = source.style;
+    }
 }
 
 impl CellData {
@@ -127,7 +146,7 @@ pub enum MouseEncoding {
 /// grid — the window title and the input modes are part of the terminal's
 /// observable state, and a client that never learns about them can never show
 /// a title or run a mouse-driven program.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ScreenSnapshot {
     pub rows: Vec<Vec<CellData>>,
     pub cols: u16,
@@ -154,6 +173,49 @@ pub struct ScreenSnapshot {
     pub fg: RgbColor,
     pub bg: RgbColor,
     pub palette: [RgbColor; 256],
+}
+
+impl Clone for ScreenSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            rows: self.rows.clone(),
+            cols: self.cols,
+            rows_count: self.rows_count,
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+            cursor_visible: self.cursor_visible,
+            title: self.title.clone(),
+            bracketed_paste: self.bracketed_paste,
+            mouse_reporting: self.mouse_reporting,
+            mouse_encoding: self.mouse_encoding,
+            mouse_focus_event: self.mouse_focus_event,
+            mouse_alternate_scroll: self.mouse_alternate_scroll,
+            grapheme_cluster: self.grapheme_cluster,
+            fg: self.fg,
+            bg: self.bg,
+            palette: self.palette,
+        }
+    }
+
+    /// Reuse row and cell storage when copying a frame.
+    fn clone_from(&mut self, source: &Self) {
+        self.rows.clone_from(&source.rows);
+        self.cols = source.cols;
+        self.rows_count = source.rows_count;
+        self.cursor_x = source.cursor_x;
+        self.cursor_y = source.cursor_y;
+        self.cursor_visible = source.cursor_visible;
+        self.title.clone_from(&source.title);
+        self.bracketed_paste = source.bracketed_paste;
+        self.mouse_reporting = source.mouse_reporting;
+        self.mouse_encoding = source.mouse_encoding;
+        self.mouse_focus_event = source.mouse_focus_event;
+        self.mouse_alternate_scroll = source.mouse_alternate_scroll;
+        self.grapheme_cluster = source.grapheme_cluster;
+        self.fg = source.fg;
+        self.bg = source.bg;
+        self.palette = source.palette;
+    }
 }
 
 impl ScreenSnapshot {
@@ -233,4 +295,49 @@ fn default_palette() -> [RgbColor; 256] {
         palette[(232 + i) as usize] = RgbColor { r: v, g: v, b: v };
     }
     palette
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_from_copies_all_state_and_keeps_storage_independent() {
+        let mut source = ScreenSnapshot::new(12, 3);
+        source.cursor_x = 2;
+        source.cursor_y = 1;
+        source.cursor_visible = false;
+        source.title = "a new title".into();
+        source.bracketed_paste = true;
+        source.mouse_reporting = MouseReporting::AnyEvent;
+        source.mouse_encoding = MouseEncoding::Sgr;
+        source.mouse_focus_event = true;
+        source.mouse_alternate_scroll = true;
+        source.grapheme_cluster = true;
+        source.fg = RgbColor { r: 1, g: 2, b: 3 };
+        source.bg = RgbColor { r: 4, g: 5, b: 6 };
+        source.palette[42] = source.fg;
+        source.rows[0][0].text = "👍🏽".into();
+        source.rows[0][0].wide = true;
+        source.rows[0][0].style.bold = true;
+        source.rows[0][1].spacer = true;
+        source.rows[1][2].text = "e\u{301}".into();
+
+        let mut reused = ScreenSnapshot::new(4, 1);
+        reused.clone_from(&source);
+        assert_eq!(reused, source);
+        assert_eq!(source.clone(), source);
+
+        // Shrink, grow a cluster, clear a title, and replace all mode state.
+        let mut changed = ScreenSnapshot::new(3, 1);
+        changed.rows[0][0].text = "👨\u{200d}👩\u{200d}👧".into();
+        source.clone_from(&changed);
+        assert_eq!(source, changed);
+        assert_eq!(reused.rows[0][0].text, "👍🏽");
+        assert_eq!(reused.title, "a new title");
+        reused.clone_from(&source);
+        assert_eq!(reused, changed);
+        reused.rows[0][0].text.clear();
+        assert!(!source.rows[0][0].text.is_empty());
+    }
 }

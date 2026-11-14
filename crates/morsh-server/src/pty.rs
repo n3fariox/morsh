@@ -14,6 +14,25 @@ pub struct MorshPty {
     pub writer: Box<dyn std::io::Write + Send>,
 }
 
+/// Coalesce ready output without waiting for the reader. Bound each batch so
+/// continuous PTY output cannot starve network input and shutdown signals.
+pub fn batch_output(
+    mut data: Vec<u8>,
+    rx: &mut mpsc::Receiver<PtyEvent>,
+) -> (Vec<u8>, Option<ExitStatus>) {
+    for _ in 1..16 {
+        if data.len() >= 64 * 1024 {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(PtyEvent::Output(next)) => data.extend_from_slice(&next),
+            Ok(PtyEvent::Exited(status)) => return (data, Some(status)),
+            Err(_) => break,
+        }
+    }
+    (data, None)
+}
+
 pub fn spawn_pty(
     pty_size: PtySize,
     shell: &str,
@@ -39,6 +58,14 @@ pub fn spawn_pty(
     for (name, value) in locale_vars {
         cmd.env(name, value);
     }
+
+    tracing::info!(
+        cols = pty_size.cols,
+        rows = pty_size.rows,
+        columns_env = ?cmd.get_env("COLUMNS"),
+        lines_env = ?cmd.get_env("LINES"),
+        "Creating child PTY"
+    );
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
@@ -159,4 +186,51 @@ pub fn spawn_pty(
         master: pair.master,
         writer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_precedes_exit_in_a_batch() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(PtyEvent::Output(b"second".to_vec()))
+            .ok()
+            .unwrap();
+        tx.try_send(PtyEvent::Exited(ExitStatus::with_exit_code(7)))
+            .ok()
+            .unwrap();
+        let (data, exit) = batch_output(b"first".to_vec(), &mut rx);
+        assert_eq!(data, b"firstsecond");
+        assert_eq!(exit.unwrap().exit_code(), 7);
+    }
+
+    #[test]
+    fn continuous_output_leaves_room_for_other_events() {
+        let (tx, mut rx) = mpsc::channel(64);
+        for _ in 0..64 {
+            tx.try_send(PtyEvent::Output(vec![b'x'; 4096]))
+                .ok()
+                .unwrap();
+        }
+        let (data, exit) = batch_output(Vec::new(), &mut rx);
+        assert!(data.len() <= 64 * 1024);
+        assert!(exit.is_none());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn partial_escape_sequences_keep_their_order() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(PtyEvent::Output(b"[31mred".to_vec()))
+            .ok()
+            .unwrap();
+        tx.try_send(PtyEvent::Output(b"\x1b[0m".to_vec()))
+            .ok()
+            .unwrap();
+        let (data, exit) = batch_output(vec![0x1b], &mut rx);
+        assert_eq!(data, b"\x1b[31mred\x1b[0m");
+        assert!(exit.is_none());
+    }
 }

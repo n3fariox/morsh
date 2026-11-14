@@ -63,6 +63,14 @@ fn main() {
     measure("snapshot_cells", 4800, || {
         black_box(terminal.snapshot().unwrap());
     });
+    measure("snapshot_clone_cells", 4800, || {
+        black_box(black_box(&new).clone());
+    });
+    let mut reused_snapshot = new.clone();
+    measure("snapshot_clone_from_cells", 4800, || {
+        reused_snapshot.clone_from(black_box(&new));
+        black_box(&reused_snapshot);
+    });
     measure("diff_unchanged_cells", 4800, || {
         black_box(DisplayDiff::diff(black_box(&new), black_box(&new)));
     });
@@ -192,7 +200,7 @@ fn main() {
 
 fn ultrawide_benchmarks() {
     use split_terminal::{initial_screen, pane_bounds, scroll_pane, update_pane, Side};
-    for (cols, rows) in [(120, 40), (320, 80), (512, 100), (1024, 128)] {
+    for (cols, rows) in [(120, 40), (200, 60), (320, 80), (512, 100), (1024, 128)] {
         let cells = cols as usize * rows as usize;
         let mut state = Complete::new(cols, rows).unwrap();
         state.act(&initial_screen(cols, rows)).unwrap();
@@ -209,6 +217,24 @@ fn ultrawide_benchmarks() {
             3,
             || {
                 black_box(DisplayDiff::diff(black_box(&old), black_box(&new)));
+            },
+        );
+        measure_iterations(
+            &format!("split_{cols}x{rows}_snapshot_clone_cells"),
+            cells,
+            3,
+            || {
+                black_box(black_box(&new).clone());
+            },
+        );
+        let mut reused_snapshot = new.clone();
+        measure_iterations(
+            &format!("split_{cols}x{rows}_snapshot_clone_from_cells"),
+            cells,
+            3,
+            || {
+                reused_snapshot.clone_from(black_box(&new));
+                black_box(&reused_snapshot);
             },
         );
         let mut terminal = MoshTerminal::new(cols, rows, 0).unwrap();
