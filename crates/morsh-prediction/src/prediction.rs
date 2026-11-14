@@ -215,14 +215,16 @@ impl PredictionEngine {
     }
 
     /// Predicted cursor position to show on screen, if predictions are being
-    /// displayed and the prediction isn't tentative.
+    /// displayed: the latest one that isn't tentative, as mosh applies its
+    /// cursor predictions in order and skips the tentative ones.
     pub fn display_cursor(&self) -> Option<(usize, usize)> {
         if !self.should_display() {
             return None;
         }
         self.cursors
-            .last()
-            .filter(|c| c.active && !c.is_tentative(self.confirmed_epoch))
+            .iter()
+            .rev()
+            .find(|c| c.active && !c.is_tentative(self.confirmed_epoch))
             .map(|c| (c.row, c.col))
     }
 
@@ -345,6 +347,11 @@ impl PredictionEngine {
         let now = Instant::now();
         let epoch = self.prediction_epoch;
 
+        // The move belongs to the new epoch, so it is shown only once
+        // confirmed; until then the cursor stays where it was.
+        if let Some((row, col)) = self.cursor_pos() {
+            self.init_cursor(row, col);
+        }
         if let Some(cursor) = self.cursors.last_mut() {
             cursor.col = 0;
             if cursor.row + 1 < num_rows {
@@ -944,6 +951,26 @@ mod tests {
         let epoch = engine.prediction_epoch;
         engine.cull(&after);
         assert!(engine.confirmed_epoch() < epoch);
+    }
+
+    /// Typing in the last column may or may not wrap, depending on the
+    /// application, so the wrapped cursor is tentative: until the server
+    /// confirms it, the cursor is shown where it was, as in mosh.
+    #[test]
+    fn the_cursor_waits_in_the_last_column_until_a_wrap_is_confirmed() {
+        let mut engine = engine();
+        let mut screen = screen(10, 3, 0, 8, "");
+        engine.new_user_byte('a', &screen);
+        engine.set_local_frame_sent(1);
+        engine.set_local_frame_late_acked(1);
+        screen.rows[0][8].text = "a".to_string();
+        screen.cursor_x = 9;
+        engine.cull(&screen);
+        assert_eq!(engine.display_cursor(), None, "no prediction left to show");
+
+        engine.new_user_byte('b', &screen);
+        assert_eq!(engine.cursor_pos(), Some((1, 0)));
+        assert_eq!(engine.display_cursor(), Some((0, 9)));
     }
 
     /// Mosh's glitch trigger: a prediction pending for a quarter second is
