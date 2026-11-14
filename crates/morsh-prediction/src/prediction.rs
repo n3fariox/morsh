@@ -136,7 +136,9 @@ impl PredictionEngine {
 
     /// Whether predictions are currently active (showing something).
     fn is_active(&self) -> bool {
-        self.overlay.rows().any(|r| r.cells.iter().any(|c| c.active))
+        self.overlay
+            .rows()
+            .any(|r| r.cells.iter().any(|c| c.active))
     }
 
     /// Whether timing-based triggers are still relevant.
@@ -158,9 +160,7 @@ impl PredictionEngine {
         match self.display_preference {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
-            DisplayPreference::Adaptive => {
-                self.srtt_trigger || self.glitch_trigger > 0
-            }
+            DisplayPreference::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
         }
     }
 
@@ -185,9 +185,10 @@ impl PredictionEngine {
 
     /// Initialize cursor prediction if none exists.
     fn init_cursor(&mut self, cursor_row: usize, cursor_col: usize) {
-        let dominated = self.cursors.last().is_some_and(|c| {
-            c.tentative_until_epoch == self.prediction_epoch
-        });
+        let dominated = self
+            .cursors
+            .last()
+            .is_some_and(|c| c.tentative_until_epoch == self.prediction_epoch);
 
         if self.cursors.is_empty() || !dominated {
             self.cursors.push(ConditionalCursorMove::new(
@@ -204,7 +205,10 @@ impl PredictionEngine {
 
     /// Get the current cursor position from the cursor predictions.
     pub fn cursor_pos(&self) -> Option<(usize, usize)> {
-        self.cursors.last().filter(|c| c.active).map(|c| (c.row, c.col))
+        self.cursors
+            .last()
+            .filter(|c| c.active)
+            .map(|c| (c.row, c.col))
     }
 
     /// Predicted cursor position to show on screen, if predictions are being
@@ -686,8 +690,15 @@ impl PredictionEngine {
         }
 
         // Remove non-pending cursors
-        self.cursors
-            .retain(|c| c.get_validity(cursor_row, cursor_col, num_rows, num_cols, self.local_frame_late_acked) == Validity::Pending);
+        self.cursors.retain(|c| {
+            c.get_validity(
+                cursor_row,
+                cursor_col,
+                num_rows,
+                num_cols,
+                self.local_frame_late_acked,
+            ) == Validity::Pending
+        });
 
         if should_reset {
             self.reset();
@@ -775,7 +786,9 @@ mod tests {
         // Next key starts from the server's cursor (a new line), not the old one
         engine.new_user_byte('h', 7, 2, 80, 24, |_, _| Some(' '));
         assert_eq!(engine.cursor_pos(), Some((7, 3)));
-        let cell = engine.overlay().rows()
+        let cell = engine
+            .overlay()
+            .rows()
             .flat_map(|r| r.cells.iter().map(move |c| (r.row_num, c)))
             .find(|(_, c)| c.active && c.replacement == 'h')
             .map(|(row, c)| (row, c.col, c.is_tentative(engine.confirmed_epoch())));
@@ -783,13 +796,21 @@ mod tests {
     }
 
     fn predicted_row(engine: &PredictionEngine, row: usize) -> String {
-        engine.overlay().rows().find(|r| r.row_num == row).map(|r| {
-            r.cells.iter().map(|c| match (c.active, c.unknown) {
-                (false, _) => '.',
-                (true, true) => '?',
-                (true, false) => c.replacement,
-            }).collect()
-        }).unwrap_or_default()
+        engine
+            .overlay()
+            .rows()
+            .find(|r| r.row_num == row)
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| match (c.active, c.unknown) {
+                        (false, _) => '.',
+                        (true, true) => '?',
+                        (true, false) => c.replacement,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]
@@ -957,7 +978,10 @@ mod tests {
 
         // "hello" shifted one column right, rather than being blanked.
         let shifted: String = (3..8).map(|i| row.cells[i].replacement).collect();
-        assert_eq!(shifted, "hello", "prior contents were not shifted rightward");
+        assert_eq!(
+            shifted, "hello",
+            "prior contents were not shifted rightward"
+        );
         for i in 3..8 {
             assert!(
                 !row.cells[i].unknown,

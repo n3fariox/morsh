@@ -84,7 +84,14 @@ impl ConditionalOverlayCell {
     }
 
     /// Check validity against the actual cell content.
-    pub fn get_validity(&self, actual: char, row_height: usize, col_width: usize, _early_ack: u64, late_ack: u64) -> Validity {
+    pub fn get_validity(
+        &self,
+        actual: char,
+        row_height: usize,
+        col_width: usize,
+        _early_ack: u64,
+        late_ack: u64,
+    ) -> Validity {
         if !self.active {
             return Validity::Inactive;
         }
@@ -148,7 +155,14 @@ impl ConditionalCursorMove {
     }
 
     /// Check validity against actual cursor position.
-    pub fn get_validity(&self, actual_row: usize, actual_col: usize, row_height: usize, col_width: usize, late_ack: u64) -> Validity {
+    pub fn get_validity(
+        &self,
+        actual_row: usize,
+        actual_col: usize,
+        row_height: usize,
+        col_width: usize,
+        late_ack: u64,
+    ) -> Validity {
         if !self.active {
             return Validity::Inactive;
         }
@@ -201,7 +215,12 @@ impl Overlay {
     }
 
     /// Get or create a row with the given number.
-    pub fn get_or_make_row(&mut self, row_num: usize, num_cols: usize, epoch: u64) -> &mut OverlayRow {
+    pub fn get_or_make_row(
+        &mut self,
+        row_num: usize,
+        num_cols: usize,
+        epoch: u64,
+    ) -> &mut OverlayRow {
         self.rows
             .entry(row_num)
             .or_insert_with(|| OverlayRow::new(row_num, num_cols, epoch))
@@ -257,7 +276,11 @@ impl Overlay {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() || self.rows.values().all(|r| r.cells.iter().all(|c| !c.active))
+        self.rows.is_empty()
+            || self
+                .rows
+                .values()
+                .all(|r| r.cells.iter().all(|c| !c.active))
     }
 }
 
@@ -276,7 +299,10 @@ mod tests {
         cell.expire(10, Instant::now());
 
         assert_eq!(cell.get_validity('A', 24, 80, 0, 10), Validity::Correct);
-        assert_eq!(cell.get_validity('B', 24, 80, 0, 10), Validity::IncorrectOrExpired);
+        assert_eq!(
+            cell.get_validity('B', 24, 80, 0, 10),
+            Validity::IncorrectOrExpired
+        );
     }
 
     #[test]
@@ -309,7 +335,10 @@ mod tests {
         assert_eq!(cursor.get_validity(5, 10, 24, 80, 10), Validity::Correct);
 
         // After ack, doesn't match
-        assert_eq!(cursor.get_validity(5, 11, 24, 80, 10), Validity::IncorrectOrExpired);
+        assert_eq!(
+            cursor.get_validity(5, 11, 24, 80, 10),
+            Validity::IncorrectOrExpired
+        );
     }
 
     #[test]

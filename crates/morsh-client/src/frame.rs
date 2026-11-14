@@ -160,14 +160,21 @@ mod tests {
             .cursor_pos()
             .unwrap_or((screen.cursor_y as usize, screen.cursor_x as usize));
         engine.new_user_byte(key, row, col, COLS as usize, ROWS as usize, |r, c| {
-            screen.cell(c as u16, r as u16).map_or(Some(' '), CellData::single_char)
+            screen
+                .cell(c as u16, r as u16)
+                .map_or(Some(' '), CellData::single_char)
         });
     }
 
     /// Type `key` on `line`, then let the server catch up with `server_edit`,
     /// driving a second terminal the way the client drives the user's. Returns
     /// the rows the server has and the rows the user ends up looking at.
-    fn after_catch_up(line: &str, cursor: &str, key: char, server_edit: &str) -> (ScreenSnapshot, ScreenSnapshot) {
+    fn after_catch_up(
+        line: &str,
+        cursor: &str,
+        key: char,
+        server_edit: &str,
+    ) -> (ScreenSnapshot, ScreenSnapshot) {
         let mut server = MoshTerminal::new(COLS, ROWS, 0).unwrap();
         server.write(line.as_bytes());
         server.write(cursor.as_bytes());
