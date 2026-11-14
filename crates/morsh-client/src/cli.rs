@@ -3,6 +3,7 @@
 //! The grammar is deliberately tiny — `morsh-client <host:port>` plus the two
 //! informational flags — because the wrapper builds the argv, not a human.
 
+use morsh_prediction::DisplayPreference;
 use std::net::SocketAddr;
 
 pub const USAGE: &str = "Usage: morsh-client <server-ip:port>";
@@ -18,7 +19,25 @@ Options:
 
 Environment:
   MORSH_KEY                Base64 encryption key (from morsh-server output)
-  MOSH_PREDICTION_DISPLAY  always | never | adaptive (default)";
+  MOSH_PREDICTION_DISPLAY  always | never | adaptive (default) | experimental
+  MOSH_PREDICTION_OVERWRITE  yes: predict typing as overwriting, not inserting";
+
+/// `MOSH_PREDICTION_DISPLAY`, read as stock mosh-client reads it: unset is
+/// adaptive, and a value it doesn't know is an error.
+pub fn prediction_display(value: Option<&str>) -> Result<DisplayPreference, String> {
+    match value {
+        None | Some("adaptive") => Ok(DisplayPreference::Adaptive),
+        Some("always") => Ok(DisplayPreference::Always),
+        Some("never") => Ok(DisplayPreference::Never),
+        Some("experimental") => Ok(DisplayPreference::Experimental),
+        Some(other) => Err(format!("Unknown prediction mode {other}.")),
+    }
+}
+
+/// `MOSH_PREDICTION_OVERWRITE`: exactly "yes" turns it on, as in mosh.
+pub fn prediction_overwrite(value: Option<&str>) -> bool {
+    value == Some("yes")
+}
 
 /// What the caller should do with the argv it was given.
 #[derive(Debug)]
@@ -100,5 +119,31 @@ mod tests {
             parse(&argv(&["--version"])),
             ParseOutcome::Version
         ));
+    }
+
+    #[test]
+    fn prediction_settings_follow_mosh() {
+        assert_eq!(prediction_display(None), Ok(DisplayPreference::Adaptive));
+        for (value, mode) in [
+            ("adaptive", DisplayPreference::Adaptive),
+            ("always", DisplayPreference::Always),
+            ("never", DisplayPreference::Never),
+            ("experimental", DisplayPreference::Experimental),
+        ] {
+            assert_eq!(prediction_display(Some(value)), Ok(mode));
+        }
+        assert_eq!(
+            prediction_display(Some("Always")),
+            Err("Unknown prediction mode Always.".to_string())
+        );
+        assert_eq!(
+            prediction_display(Some("")),
+            Err("Unknown prediction mode .".to_string())
+        );
+
+        assert!(prediction_overwrite(Some("yes")));
+        for value in [None, Some("no"), Some("YES"), Some("")] {
+            assert!(!prediction_overwrite(value));
+        }
     }
 }
