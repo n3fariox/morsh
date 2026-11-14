@@ -263,12 +263,23 @@ fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Compression finish error: {e}"))
 }
 
+/// Largest instruction we will inflate. Mosh's `Compressor` uses a fixed
+/// 2048*2048-byte buffer ("effective limit on terminal size") and rejects
+/// anything that does not fit; without a cap, a few kilobytes of zlib from
+/// the peer could inflate to gigabytes.
+pub const MAX_INSTRUCTION_LEN: usize = 2048 * 2048;
+
 fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    let mut decoder = flate2::read::ZlibDecoder::new(data).take(MAX_INSTRUCTION_LEN as u64 + 1);
     let mut output = Vec::new();
     decoder
         .read_to_end(&mut output)
         .map_err(|e| format!("Zlib decompression error: {e} (data_len={})", data.len()))?;
+    if output.len() > MAX_INSTRUCTION_LEN {
+        return Err(format!(
+            "Instruction inflates beyond {MAX_INSTRUCTION_LEN} bytes"
+        ));
+    }
     Ok(output)
 }
 
@@ -450,6 +461,34 @@ mod tests {
         // Only the most recent instruction is still held.
         assert_eq!(assembler.current_id, Some(fragger.next_instruction_id));
         assert!(assembler.fragments.len() <= 40);
+    }
+
+    /// A zlib bomb: a few kilobytes that inflate past mosh's 4 MiB limit.
+    #[test]
+    fn oversized_inflation_is_rejected() {
+        let bomb = compress(&vec![0u8; MAX_INSTRUCTION_LEN + 1]).unwrap();
+        assert!(bomb.len() < 64 * 1024, "{} bytes", bomb.len());
+        let mut assembler = FragmentAssembly::new();
+        let mut result = Ok(None);
+        for (i, chunk) in bomb.chunks(1000).enumerate() {
+            result = assembler.add_fragment(Fragment {
+                id: 1,
+                final_flag: (i + 1) * 1000 >= bomb.len(),
+                fragment_num: i as u16,
+                payload: chunk.to_vec(),
+            });
+        }
+        let err = result.unwrap_err();
+        assert!(err.contains("inflates beyond"), "{err}");
+    }
+
+    #[test]
+    fn instruction_at_the_limit_is_accepted() {
+        let data = vec![0u8; MAX_INSTRUCTION_LEN];
+        assert_eq!(
+            decompress(&compress(&data).unwrap()).unwrap().len(),
+            data.len()
+        );
     }
 
     #[test]
