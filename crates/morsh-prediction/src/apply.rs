@@ -1,7 +1,7 @@
 //! Folding predictions into the frame about to be painted.
 
 use crate::PredictionEngine;
-use morsh_terminal::ScreenSnapshot;
+use morsh_terminal::{CellData, ScreenSnapshot};
 
 impl PredictionEngine {
     /// Overlay the speculative cells and cursor onto `frame`.
@@ -16,7 +16,6 @@ impl PredictionEngine {
         }
 
         let flagging = self.is_flagging();
-        let late_acked = self.local_frame_late_acked();
         // Tentative cells (typed after Enter, Up, etc.) aren't shown until the
         // server confirms a prediction from that epoch.
         let confirmed_epoch = self.confirmed_epoch();
@@ -32,27 +31,36 @@ impl PredictionEngine {
                 if !cell.active || cell.is_tentative(confirmed_epoch) || cell.col + 1 >= cols {
                     continue;
                 }
-                let pending = late_acked < cell.expiration_frame;
-                if !cell.unknown {
-                    split_wide_glyph(frame, cell.col as u16, row.row_num as u16);
-                }
-                let Some(target) = frame.cell_mut(cell.col as u16, row.row_num as u16) else {
+                let (col, row_num) = (cell.col as u16, row.row_num as u16);
+                let Some(shown) = frame.cell(col, row_num).map(CellData::single_char) else {
                     continue;
                 };
+                // Underline only what the prediction changes; a blank over
+                // a blank changes nothing.
+                let flag = flagging && !(cell.replacement == ' ' && shown == Some(' '));
                 if cell.unknown {
                     // An unknown prediction says "something will be here", not
                     // "a blank will be here" — painting a space over it is what
                     // made every keystroke erase the rest of the line.
-                    if flagging && pending {
-                        target.style.underline = true;
+                    if flag {
+                        if let Some(target) = frame.cell_mut(col, row_num) {
+                            target.style.underline = true;
+                        }
                     }
                     continue;
                 }
-                target.text = cell.replacement.to_string();
-                target.wide = false;
-                target.spacer = false;
-                if flagging && pending {
-                    target.style.underline = true;
+                if shown == Some(cell.replacement) {
+                    continue;
+                }
+                split_wide_glyph(frame, col, row_num);
+                if let Some(target) = frame.cell_mut(col, row_num) {
+                    target.text.clear();
+                    target.text.push(cell.replacement);
+                    target.wide = false;
+                    target.spacer = false;
+                    if flag {
+                        target.style.underline = true;
+                    }
                 }
             }
         }
@@ -93,7 +101,7 @@ fn split_wide_glyph(frame: &mut ScreenSnapshot, col: u16, row: u16) {
 mod tests {
     use super::*;
     use crate::DisplayPreference;
-    use morsh_terminal::{CellData, DisplayDiff, MoshTerminal};
+    use morsh_terminal::{DisplayDiff, MoshTerminal};
     use serial_test::serial;
 
     const COLS: u16 = 20;
@@ -199,6 +207,33 @@ mod tests {
             engine.apply(&mut predicted);
             assert_eq!(predicted, before, "{line}");
         }
+    }
+
+    /// On a slow link predictions are underlined, but only where they
+    /// change the screen (mosh's `ConditionalOverlayCell::apply`): typing at
+    /// the end of a line must not underline the blanks after it.
+    #[test]
+    fn only_cells_a_prediction_changes_are_underlined() {
+        let mut engine = confirmed_engine();
+        engine.set_send_interval(100);
+        let mut screen = ScreenSnapshot::new(COLS, ROWS);
+        for (cell, ch) in screen.rows[0].iter_mut().zip("$ aab".chars()) {
+            cell.text = ch.to_string();
+        }
+        screen.cursor_x = 2;
+        engine.cull(&screen);
+        assert!(engine.is_flagging());
+
+        engine.new_user_byte('a', &screen);
+        let mut frame = screen.clone();
+        engine.apply(&mut frame);
+        let underlined: String = frame.rows[0]
+            .iter()
+            .map(|c| if c.style.underline { '_' } else { '.' })
+            .collect();
+        // "$ aab" becomes "$ aaab": the cells that change are where the 'b'
+        // was and where it goes.
+        assert_eq!(underlined, "....__..............");
     }
 
     #[test]
