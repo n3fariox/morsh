@@ -216,8 +216,25 @@ mod ecn {
 /// On Windows, also disables SIO_UDP_CONNRESET so ICMP Port Unreachable
 /// doesn't poison subsequent recvfrom calls with WSAECONNRESET.
 fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
-    let std_socket =
-        std::net::UdpSocket::bind(addr).map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| format!("Failed to create UDP socket: {e}"))?;
+    // Mosh's `try_bind`: a socket bound to the IPv6 wildcard also accepts
+    // IPv4 (the OS default differs: on by default on BSD and Windows).
+    if let SocketAddr::V6(v6) = addr {
+        if v6.ip().is_unspecified() {
+            if let Err(e) = socket.set_only_v6(false) {
+                tracing::debug!("setsockopt(IPV6_V6ONLY, off): {e}");
+            }
+        }
+    }
+    socket
+        .bind(&addr.into())
+        .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
+    let std_socket: std::net::UdpSocket = socket.into();
     std_socket
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set nonblocking: {e}"))?;
@@ -1083,6 +1100,20 @@ mod tests {
             client.local_addr().unwrap().is_ipv6(),
             "hop keeps the family"
         );
+    }
+
+    /// Mosh's `try_bind` clears IPV6_V6ONLY on a `::` socket.
+    #[tokio::test]
+    async fn ipv6_wildcard_server_socket_is_dual_stack() {
+        let any: SocketAddr = "[::]:0".parse().unwrap();
+        let Ok(server) = Connection::new_server(any, Session::new(key())).await else {
+            eprintln!("no IPv6; skipping");
+            return;
+        };
+        let only_v6 = socket2::SockRef::from(&server.sockets[0])
+            .only_v6()
+            .unwrap();
+        assert!(!only_v6);
     }
 
     #[tokio::test]

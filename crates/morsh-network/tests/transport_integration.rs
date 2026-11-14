@@ -10,7 +10,7 @@
 
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, State, Transport};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -94,7 +94,9 @@ async fn spawn_proxy(
     server: SocketAddr,
     imp: Impairment,
 ) -> (SocketAddr, Arc<Metrics>, tokio::task::JoinHandle<()>) {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock = UdpSocket::bind(SocketAddr::new(server.ip(), 0))
+        .await
+        .unwrap();
     let addr = sock.local_addr().unwrap();
 
     let sock = Arc::new(sock);
@@ -184,18 +186,33 @@ struct Link {
 }
 
 impl Link {
+    /// IPv4 loopback, through the impairing proxy.
     async fn new(imp: Impairment) -> Self {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        Self::build(SocketAddr::new(loopback, 0), loopback, Some(imp)).await
+    }
+
+    /// Server bound to `bind`, client talking to it at `dial`, with no
+    /// proxy in between, so the server sees the client's real address.
+    async fn direct(bind: SocketAddr, dial: IpAddr) -> Self {
+        Self::build(bind, dial, None).await
+    }
+
+    async fn build(bind: SocketAddr, dial: IpAddr, proxy: Option<Impairment>) -> Self {
         let key = *Base64Key::random().data();
 
-        let server_conn = Connection::new_server("127.0.0.1:0".parse().unwrap(), Session::new(key))
+        let server_conn = Connection::new_server(bind, Session::new(key))
             .await
             .unwrap();
-        let server_addr = server_conn.local_addr().unwrap();
+        let server_addr = SocketAddr::new(dial, server_conn.local_addr().unwrap().port());
 
-        let (proxy_addr, metrics, proxy_task) = spawn_proxy(server_addr, imp).await;
+        let (remote, metrics, proxy_task) = match proxy {
+            Some(imp) => spawn_proxy(server_addr, imp).await,
+            None => (server_addr, Arc::default(), tokio::spawn(async {})),
+        };
 
         let mut client_conn = Connection::new_client(Session::new(key)).await.unwrap();
-        client_conn.set_remote_addr(proxy_addr);
+        client_conn.set_remote_addr(remote);
 
         Self {
             metrics,
@@ -520,6 +537,87 @@ async fn session_survives_a_client_port_hop() {
         "session did not survive the port hop: server saw {} of {} bytes",
         link.server_received.len(),
         expected.len()
+    );
+}
+
+fn have_ipv6_loopback() -> bool {
+    std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+}
+
+/// The whole session over IPv6, as stock mosh supports: both directions
+/// converge, and after a client port hop the server roams to the client's
+/// new address and the session carries on.
+#[tokio::test]
+async fn ipv6_session_converges_and_survives_roaming() {
+    if !have_ipv6_loopback() {
+        eprintln!("no IPv6 loopback; skipping");
+        return;
+    }
+    let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let mut link = Link::direct(SocketAddr::new(v6, 0), v6).await;
+    assert_eq!(
+        link.client.connection().mtu(),
+        morsh_network::constants::MTU_IPV6
+    );
+
+    let up = noise(4000);
+    let down = payload(b'd', 3000);
+    link.client_sends(&up);
+    link.server_sends(&down);
+    assert!(
+        link.run_until(BUDGET, |l| l.server_received == up
+            && l.client_received == down)
+            .await,
+        "did not converge over IPv6"
+    );
+    let before = link.server.connection().remote_addr().unwrap();
+    assert!(before.is_ipv6());
+
+    link.client.hop_port().await.unwrap();
+    let hopped = link.client.connection().local_addr().unwrap();
+    assert!(
+        hopped.is_ipv6(),
+        "port hop must stay in the server's family"
+    );
+
+    let more = payload(b'z', 64);
+    link.client_sends(&more);
+    let mut expected = up.clone();
+    expected.extend_from_slice(&more);
+    assert!(
+        link.run_until(BUDGET, |l| l.server_received == expected)
+            .await,
+        "session did not survive the hop over IPv6"
+    );
+    let after = link.server.connection().remote_addr().unwrap();
+    assert_eq!(
+        after.port(),
+        hopped.port(),
+        "server should roam to the new port"
+    );
+    assert_ne!(after, before);
+}
+
+/// Mosh's `try_bind` turns IPV6_V6ONLY off on a `::` socket, so one server
+/// socket serves IPv4 and IPv6 clients alike.
+#[tokio::test]
+async fn server_bound_to_the_ipv6_wildcard_serves_ipv4_clients() {
+    if !have_ipv6_loopback() {
+        eprintln!("no IPv6 loopback; skipping");
+        return;
+    }
+    let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    let mut link = Link::direct(bind, IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+
+    let up = payload(b'u', 200);
+    let down = payload(b'v', 200);
+    link.client_sends(&up);
+    link.server_sends(&down);
+    assert!(
+        link.run_until(BUDGET, |l| l.server_received == up
+            && l.client_received == down)
+            .await,
+        "dual-stack server did not converge with an IPv4 client"
     );
 }
 
