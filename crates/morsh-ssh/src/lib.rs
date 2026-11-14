@@ -52,6 +52,22 @@ impl SshSession {
         key_paths: &[std::path::PathBuf],
         host_keys: HostKeyPolicy,
     ) -> Result<Self> {
+        use std::net::ToSocketAddrs;
+        let mut addresses: Vec<_> = addr
+            .to_socket_addrs()
+            .with_context(|| format!("Failed to resolve {addr}"))?
+            .collect();
+        addresses.sort_by_key(|address| !address.is_ipv4());
+        Self::connect_addresses(addresses, user, key_paths, host_keys)
+    }
+
+    /// Connect using the caller's address filtering and preference order.
+    pub fn connect_addresses(
+        addresses: Vec<std::net::SocketAddr>,
+        user: impl Into<String> + Send,
+        key_paths: &[std::path::PathBuf],
+        host_keys: HostKeyPolicy,
+    ) -> Result<Self> {
         let user = user.into();
 
         let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
@@ -66,7 +82,7 @@ impl SshSession {
                 host_keys: Arc::new(host_keys),
             };
 
-            let socket = connect_tcp(&addr).await?;
+            let socket = connect_tcp(&addresses).await?;
             let peer = socket.peer_addr()?;
             let _ = socket.set_nodelay(true);
 
@@ -226,25 +242,20 @@ impl SshSession {
     }
 }
 
-/// Connect to the first reachable address of `host:port`, IPv4 first
-/// (mosh's default `--family=prefer-inet`).
-async fn connect_tcp(addr: &str) -> Result<tokio::net::TcpStream> {
-    let mut addrs: Vec<_> = tokio::net::lookup_host(addr)
-        .await
-        .with_context(|| format!("Failed to resolve {addr}"))?
-        .collect();
-    addrs.sort_by_key(|a| !a.is_ipv4());
-
+/// Try resolved addresses in the caller's order; do not change its family policy.
+async fn connect_tcp(addresses: &[std::net::SocketAddr]) -> Result<tokio::net::TcpStream> {
     let mut last_err = None;
-    for a in addrs {
-        match tokio::net::TcpStream::connect(a).await {
-            Ok(s) => return Ok(s),
-            Err(e) => last_err = Some(e),
+    for &address in addresses {
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_err = Some((address, error)),
         }
     }
     match last_err {
-        Some(e) => Err(e).with_context(|| format!("Failed to connect to {addr}")),
-        None => bail!("No addresses found for {addr}"),
+        Some((address, error)) => {
+            Err(error).with_context(|| format!("Failed to connect to {address}"))
+        }
+        None => bail!("No addresses found for SSH connection"),
     }
 }
 
@@ -281,5 +292,22 @@ fn load_key_with_passphrase_prompt(path: &std::path::Path) -> Result<PrivateKey>
 impl Drop for SshSession {
     fn drop(&mut self) {
         let _ = self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn caller_address_order_is_preserved() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let preferred = second.local_addr().unwrap();
+        let socket = connect_tcp(&[preferred, first.local_addr().unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(socket.peer_addr().unwrap(), preferred);
+        assert!(connect_tcp(&[]).await.is_err());
     }
 }

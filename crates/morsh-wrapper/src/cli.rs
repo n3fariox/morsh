@@ -50,6 +50,18 @@ pub(crate) struct Args {
     #[arg(long, overrides_with = "no_init")]
     init: bool,
 
+    /// Address family: inet, inet6, auto, all, prefer-inet, or prefer-inet6.
+    #[arg(long, default_value = "prefer-inet", overrides_with_all = ["ipv4", "ipv6"])]
+    family: crate::family::Family,
+
+    /// Use IPv4 only.
+    #[arg(short = '4', overrides_with_all = ["family", "ipv6"])]
+    ipv4: bool,
+
+    /// Use IPv6 only.
+    #[arg(short = '6', overrides_with_all = ["family", "ipv4"])]
+    ipv6: bool,
+
     /// Control the IP address that morsh-server binds to:
     ///   ssh  - bind to the IP from SSH_CONNECTION (default)
     ///   any  - bind to 0.0.0.0
@@ -91,6 +103,16 @@ pub(crate) struct Args {
 }
 
 impl Args {
+    pub(crate) fn family(&self) -> crate::family::Family {
+        if self.ipv4 {
+            crate::family::Family::Inet
+        } else if self.ipv6 {
+            crate::family::Family::Inet6
+        } else {
+            self.family
+        }
+    }
+
     pub(crate) fn configure_client(&self, command: &mut std::process::Command) {
         // mosh.pl preserves an inherited value unless --no-init is selected.
         if self.no_init && !self.init {
@@ -170,6 +192,39 @@ mod tests {
             if let Some((_, value)) = value {
                 assert_eq!(value.unwrap(), "1");
             }
+        }
+    }
+
+    #[test]
+    fn stock_family_options_are_accepted() {
+        for value in [
+            "inet",
+            "inet6",
+            "auto",
+            "all",
+            "prefer-inet",
+            "prefer-inet6",
+        ] {
+            assert!(Args::try_parse_from(["morsh", "--family", value, "host"]).is_ok());
+        }
+        for flag in ["-4", "-6"] {
+            assert!(Args::try_parse_from(["morsh", flag, "host"]).is_ok());
+        }
+    }
+
+    #[test]
+    fn last_family_option_wins() {
+        use crate::family::Family;
+        for (flags, expected) in [
+            (vec![], Family::PreferInet),
+            (vec!["-4", "-6"], Family::Inet6),
+            (vec!["-6", "--family", "all"], Family::All),
+            (vec!["--family", "inet6", "-4"], Family::Inet),
+            (vec!["--family", "INET6"], Family::Inet6),
+        ] {
+            let args =
+                Args::try_parse_from(["morsh"].into_iter().chain(flags).chain(["host"])).unwrap();
+            assert_eq!(args.family(), expected);
         }
     }
 
