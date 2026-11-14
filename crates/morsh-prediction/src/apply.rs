@@ -115,7 +115,7 @@ mod tests {
         engine.set_local_frame_late_acked(1);
         screen.rows[2][0].text = "Q".to_string();
         screen.cursor_x = 1;
-        engine.validate_predictions(&screen);
+        engine.cull(&screen);
         engine
     }
 

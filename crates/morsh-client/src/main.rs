@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result: Result<(), Box<dyn std::error::Error>> = loop {
         output_new_frame(
             &transport,
-            &prediction,
+            &mut prediction,
             &mut notifications,
             &mut local_framebuffer,
             &mut stdout,
@@ -163,10 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         prediction.set_local_frame_acked(transport.sender.sent_state_acked());
                         prediction.set_send_interval(transport.send_interval_ms());
-                        let remote = &transport.get_latest_remote_state().state;
-                        prediction.set_local_frame_late_acked(remote.echo_ack());
-
-                        prediction.validate_predictions(remote.screen());
+                        // The predictions are checked against the new state
+                        // when the next frame is drawn.
+                        prediction.set_local_frame_late_acked(
+                            transport.get_latest_remote_state().state.echo_ack(),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("Recv error: {e}");

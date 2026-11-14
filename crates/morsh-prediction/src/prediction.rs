@@ -135,11 +135,13 @@ impl PredictionEngine {
         self.local_frame_late_acked = frame;
     }
 
-    /// Whether predictions are currently active (showing something).
+    /// Whether anything at all is being predicted, the cursor included.
     fn is_active(&self) -> bool {
-        self.overlay
-            .rows()
-            .any(|r| r.cells.iter().any(|c| c.active))
+        !self.cursors.is_empty()
+            || self
+                .overlay
+                .rows()
+                .any(|r| r.cells.iter().any(|c| c.active))
     }
 
     /// Whether timing-based triggers are still relevant.
@@ -247,15 +249,9 @@ impl PredictionEngine {
             return;
         }
 
-        // Check for terminal resize
-        if self.last_height != num_rows || self.last_width != num_cols {
-            self.last_height = num_rows;
-            self.last_width = num_cols;
-            self.reset();
-        }
-
-        // First cull existing predictions
-        self.cull(0, 0, num_rows, num_cols);
+        // First cull existing predictions (this resets them if the screen
+        // has changed size)
+        self.cull(screen);
 
         // Only now pick the cursor: a resize above drops predictions made
         // for the old size, whose cursor may lie beyond the new one.
@@ -485,18 +481,28 @@ impl PredictionEngine {
         }
     }
 
-    /// Cull (validate) predictions against current server state.
+    /// Bring the predictions up to date with `screen`: confirm the ones it
+    /// bears out, cull the ones it contradicts, and update the triggers that
+    /// decide whether predictions are shown and underlined.
     ///
-    /// `actual_cells` maps (row, col) → actual character from the server's terminal.
-    pub fn cull(
-        &mut self,
-        _cursor_row: usize,
-        _cursor_col: usize,
-        num_rows: usize,
-        _num_cols: usize,
-    ) {
+    /// Mosh's `PredictionEngine::cull`, which runs before every frame is
+    /// drawn as well as on every keystroke: the glitch trigger depends on how
+    /// long a prediction has been pending, so it must advance even when
+    /// nothing arrives from the server.
+    pub fn cull(&mut self, screen: &ScreenSnapshot) {
+        self.cull_at(screen, Instant::now());
+    }
+
+    fn cull_at(&mut self, screen: &ScreenSnapshot, now: Instant) {
         if self.display_preference == DisplayPreference::Never {
             return;
+        }
+
+        let (num_cols, num_rows) = (screen.cols as usize, screen.rows_count as usize);
+        if self.last_height != num_rows || self.last_width != num_cols {
+            self.last_height = num_rows;
+            self.last_width = num_cols;
+            self.reset();
         }
 
         // Control srtt_trigger with hysteresis
@@ -522,32 +528,14 @@ impl PredictionEngine {
 
         // Prune out-of-bounds rows
         self.overlay.prune(num_rows);
-    }
 
-    /// Validate predictions against the server's latest screen, confirming
-    /// or culling them.
-    ///
-    /// Call this when a new server state arrives.
-    pub fn validate_predictions(&mut self, screen: &ScreenSnapshot) {
-        self.validate_predictions_with(
-            |r, c| {
-                screen
-                    .cell(c as u16, r as u16)
-                    .and_then(|d| d.text.chars().next())
-                    .unwrap_or(' ')
-            },
-            screen.cursor_y as usize,
-            screen.cursor_x as usize,
-        );
-    }
-
-    fn validate_predictions_with<F>(&mut self, get_cell: F, cursor_row: usize, cursor_col: usize)
-    where
-        F: Fn(usize, usize) -> char,
-    {
-        let num_rows = self.last_height;
-        let num_cols = self.last_width;
-        let now = Instant::now();
+        let get_cell = |r: usize, c: usize| {
+            screen
+                .cell(c as u16, r as u16)
+                .and_then(|d| d.text.chars().next())
+                .unwrap_or(' ')
+        };
+        let (cursor_row, cursor_col) = (screen.cursor_y as usize, screen.cursor_x as usize);
 
         // Validate overlay cells
         let mut should_reset = false;
@@ -670,6 +658,7 @@ impl Default for PredictionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A `cols` x `rows` screen showing `line` on row `row`, with the cursor
     /// at (`row`, `col`).
@@ -704,6 +693,14 @@ mod tests {
         screen
     }
 
+    /// Whether any overlay cell is predicting something.
+    fn has_cells(engine: &PredictionEngine) -> bool {
+        engine
+            .overlay()
+            .rows()
+            .any(|r| r.cells.iter().any(|c| c.active))
+    }
+
     fn engine() -> PredictionEngine {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
@@ -721,7 +718,7 @@ mod tests {
         let engine = PredictionEngine::new();
         assert_eq!(engine.prediction_epoch, 1);
         assert_eq!(engine.confirmed_epoch, 0);
-        assert!(!engine.is_active());
+        assert!(!has_cells(&engine));
         assert!(!engine.should_display());
     }
 
@@ -731,14 +728,14 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Never);
 
         engine.new_user_byte('A', &blank(0, 0));
-        assert!(!engine.is_active());
+        assert!(!has_cells(&engine));
     }
 
     #[test]
     fn prediction_engine_predicts_char() {
         let mut engine = engine();
         engine.new_user_byte('A', &blank(5, 10));
-        assert!(engine.is_active());
+        assert!(has_cells(&engine));
         assert_eq!(engine.cursor_pos(), Some((5, 11))); // moved right
     }
 
@@ -747,7 +744,7 @@ mod tests {
         for seq in ["\x1b[D", "\x1bOD", "\x1b[1;5D"] {
             let mut engine = engine();
             type_str(&mut engine, seq, &blank(5, 10));
-            assert!(!engine.is_active(), "{seq:?} produced overlay cells");
+            assert!(!has_cells(&engine), "{seq:?} produced overlay cells");
             assert_eq!(engine.cursor_pos(), Some((5, 9)), "{seq:?}");
         }
     }
@@ -842,7 +839,7 @@ mod tests {
         type_str(&mut engine, "\x1b[C", &blank(5, 10));
         assert_eq!(engine.cursor_pos(), Some((5, 11)));
         engine.new_user_byte('x', &blank(5, 11));
-        assert!(engine.is_active());
+        assert!(has_cells(&engine));
         assert_eq!(engine.cursor_pos(), Some((5, 12)));
     }
 
@@ -857,10 +854,10 @@ mod tests {
     fn prediction_engine_reset() {
         let mut engine = engine();
         engine.new_user_byte('A', &blank(0, 0));
-        assert!(engine.is_active());
+        assert!(has_cells(&engine));
 
         engine.reset();
-        assert!(!engine.is_active());
+        assert!(!has_cells(&engine));
     }
 
     #[test]
@@ -892,13 +889,34 @@ mod tests {
 
         // Low RTT — no trigger
         engine.set_send_interval(10);
-        engine.cull(0, 0, 24, 80);
+        engine.cull(&blank(0, 0));
         assert!(!engine.srtt_trigger);
 
         // High RTT — trigger
         engine.set_send_interval(50);
-        engine.cull(0, 0, 24, 80);
+        engine.cull(&blank(0, 0));
         assert!(engine.srtt_trigger);
+    }
+
+    /// Mosh's glitch trigger: a prediction pending for a quarter second is
+    /// shown even at low RTT, and one pending for five seconds is underlined.
+    #[test]
+    fn long_pending_predictions_are_shown_then_underlined() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Adaptive);
+        engine.set_send_interval(20);
+        let screen = blank(0, 0);
+        engine.new_user_byte('x', &screen);
+        let typed = Instant::now();
+        assert!(!engine.should_display());
+
+        engine.cull_at(&screen, typed + Duration::from_millis(300));
+        assert!(engine.should_display());
+        assert!(!engine.is_flagging());
+
+        engine.cull_at(&screen, typed + Duration::from_millis(5100));
+        engine.cull_at(&screen, typed + Duration::from_millis(5100));
+        assert!(engine.is_flagging());
     }
 
     /// The server applied our resize while a prediction near the old right
@@ -914,7 +932,7 @@ mod tests {
         for ch in "bc\x7f\x1b[C\x1b[D".chars() {
             engine.new_user_byte(ch, &narrow);
         }
-        engine.validate_predictions(&narrow);
+        engine.cull(&narrow);
         let mut frame = narrow.clone();
         engine.apply(&mut frame);
     }
@@ -928,7 +946,7 @@ mod tests {
         for ch in "a\x7f\r\x1b[C".chars() {
             engine.new_user_byte(ch, &empty);
         }
-        assert!(!engine.is_active());
+        assert!(!has_cells(&engine));
     }
 
     /// The server's cursor can sit past the last row or column in a stale
