@@ -242,31 +242,8 @@ impl PredictionEngine {
     /// multi-codepoint cluster) is treated as unknown input rather than
     /// predicted wrongly.
     pub fn new_user_byte(&mut self, ch: char, screen: &ScreenSnapshot) {
-        let (row, col) = self
-            .cursor_pos()
-            .unwrap_or((screen.cursor_y as usize, screen.cursor_x as usize));
-        self.new_user_byte_at(
-            ch,
-            row,
-            col,
-            screen.cols as usize,
-            screen.rows_count as usize,
-            |r, c| screen_char(screen, r, c),
-        );
-    }
-
-    fn new_user_byte_at<F>(
-        &mut self,
-        ch: char,
-        cursor_row: usize,
-        cursor_col: usize,
-        num_cols: usize,
-        num_rows: usize,
-        cell_at: F,
-    ) where
-        F: Fn(usize, usize) -> Option<char>,
-    {
-        if self.display_preference == DisplayPreference::Never {
+        let (num_cols, num_rows) = (screen.cols as usize, screen.rows_count as usize);
+        if self.display_preference == DisplayPreference::Never || num_cols == 0 || num_rows == 0 {
             return;
         }
 
@@ -278,7 +255,20 @@ impl PredictionEngine {
         }
 
         // First cull existing predictions
-        self.cull(cursor_row, cursor_col, num_rows, num_cols);
+        self.cull(0, 0, num_rows, num_cols);
+
+        // Only now pick the cursor: a resize above drops predictions made
+        // for the old size, whose cursor may lie beyond the new one.
+        let (cursor_row, cursor_col) = self
+            .cursor_pos()
+            .unwrap_or((screen.cursor_y as usize, screen.cursor_x as usize));
+        if cursor_row >= num_rows || cursor_col >= num_cols {
+            // Nowhere sensible to predict from.
+            self.unknown_input();
+            self.input_state = InputState::Ground;
+            return;
+        }
+        let cell_at = |r: usize, c: usize| screen_char(screen, r, c);
 
         self.init_cursor(cursor_row, cursor_col);
 
@@ -771,7 +761,13 @@ mod tests {
     /// at (`row`, `col`).
     fn screen(cols: u16, rows: u16, row: usize, col: usize, line: &str) -> ScreenSnapshot {
         let mut screen = ScreenSnapshot::new(cols, rows);
-        for (cell, ch) in screen.rows[row].iter_mut().zip(line.chars()) {
+        for (cell, ch) in screen
+            .rows
+            .get_mut(row)
+            .into_iter()
+            .flatten()
+            .zip(line.chars())
+        {
             cell.text = ch.to_string();
         }
         screen.cursor_y = row as u16;
@@ -989,6 +985,52 @@ mod tests {
         engine.set_send_interval(50);
         engine.cull(0, 0, 24, 80);
         assert!(engine.srtt_trigger);
+    }
+
+    /// The server applied our resize while a prediction near the old right
+    /// margin was still pending: the next keystroke must start from the new
+    /// screen's cursor, not index the narrower row at the old column.
+    #[test]
+    fn keystroke_after_the_screen_narrows_does_not_panic() {
+        let mut engine = engine();
+        engine.new_user_byte('a', &blank(5, 70));
+        assert_eq!(engine.cursor_pos(), Some((5, 71)));
+
+        let narrow = screen(40, 24, 5, 10, "");
+        for ch in "bc\x7f\x1b[C\x1b[D".chars() {
+            engine.new_user_byte(ch, &narrow);
+        }
+        engine.validate_predictions(&narrow);
+        let mut frame = narrow.clone();
+        engine.apply(&mut frame);
+    }
+
+    /// A zero-sized screen (a terminal reporting 0x0 while it starts up)
+    /// must not underflow the column arithmetic.
+    #[test]
+    fn keystroke_on_an_empty_screen_does_nothing() {
+        let mut engine = engine();
+        let empty = screen(0, 0, 0, 0, "");
+        for ch in "a\x7f\r\x1b[C".chars() {
+            engine.new_user_byte(ch, &empty);
+        }
+        assert!(!engine.is_active());
+    }
+
+    /// The server's cursor can sit past the last row or column in a stale
+    /// or odd frame; predicting from there must not index out of bounds.
+    #[test]
+    fn keystroke_with_the_cursor_off_screen_does_not_panic() {
+        for (row, col) in [(3, 2), (0, 10), (9, 99)] {
+            let mut engine = engine();
+            let screen = screen(10, 3, 0, 0, "abc");
+            let mut screen = screen.clone();
+            screen.cursor_y = row;
+            screen.cursor_x = col;
+            for ch in "x\x7f".chars() {
+                engine.new_user_byte(ch, &screen);
+            }
+        }
     }
 
     /// Regression: predicting an insert used to mark every cell from the
