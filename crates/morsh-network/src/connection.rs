@@ -6,6 +6,7 @@ use morsh_proto::transport::Instruction as TransportInstruction;
 use std::net::SocketAddr;
 use std::task::Poll;
 use std::time::{Duration, Instant};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
@@ -135,6 +136,81 @@ fn disable_pmtu_discovery(socket: &std::net::UdpSocket) {
     }
 }
 
+/// Explicit Congestion Notification on received datagrams, as in mosh's
+/// `recv_one`: `IP_RECVTOS` delivers each datagram's TOS byte, and a
+/// Congestion Experienced mark makes us echo the peer's timestamp 500 ms
+/// stale, which gradually slows it to its minimum frame rate.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod ecn {
+    use std::io;
+    use std::net::SocketAddr;
+    use std::os::fd::AsRawFd;
+
+    pub fn enable(socket: &std::net::UdpSocket) {
+        let on: libc::c_int = 1;
+        // SAFETY: a valid fd and a correctly sized c_int option value.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_RECVTOS,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            tracing::debug!("setsockopt(IP_RECVTOS): {}", io::Error::last_os_error());
+        }
+    }
+
+    /// One non-blocking `recvmsg`: payload length, source, and whether the
+    /// datagram was marked Congestion Experienced.
+    pub fn recv(socket: &impl AsRawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, bool)> {
+        // SAFETY: every pointer in `msg` refers to a live local of the size
+        // given alongside it, and the cmsg walk stays within `control` via
+        // the libc CMSG_* helpers.
+        unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            let mut control = [0u64; 16];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_name = (&mut storage as *mut libc::sockaddr_storage).cast();
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
+
+            let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if msg.msg_flags & libc::MSG_TRUNC != 0 {
+                return Err(io::Error::other("Received oversize datagram"));
+            }
+
+            let mut congestion = false;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::IPPROTO_IP
+                    && ((*cmsg).cmsg_type == libc::IP_TOS || (*cmsg).cmsg_type == libc::IP_RECVTOS)
+                {
+                    congestion = *libc::CMSG_DATA(cmsg) & 0x03 == 0x03;
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+
+            let peer = socket2::SockAddr::new(storage, msg.msg_namelen)
+                .as_socket()
+                .ok_or_else(|| io::Error::other("datagram from a non-IP address"))?;
+            Ok((n as usize, peer, congestion))
+        }
+    }
+}
+
 /// Create a UDP socket, set nonblocking, and apply ECN marking (ECT(0)).
 /// Cross-platform: uses IP_TOS on both Unix and Windows (Win10 1903+).
 /// On Windows, also disables SIO_UDP_CONNRESET so ICMP Port Unreachable
@@ -147,7 +223,10 @@ fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
         .map_err(|e| format!("Failed to set nonblocking: {e}"))?;
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    disable_pmtu_discovery(&std_socket);
+    {
+        disable_pmtu_discovery(&std_socket);
+        ecn::enable(&std_socket);
+    }
 
     let sock_ref = socket2::SockRef::from(&std_socket);
     let _ = sock_ref.set_tos(0x02);
@@ -397,12 +476,13 @@ impl Connection {
     /// arriving on a socket opened by [`Connection::hop_port`] is seen even
     /// while the original socket is idle.
     pub async fn recv(&mut self) -> Result<Option<TransportInstruction>, String> {
-        let (len, peer) = self.recv_datagram().await?;
-        self.process_received(len, peer)
+        let (len, peer, congestion) = self.recv_datagram().await?;
+        self.process_received(len, peer, congestion)
     }
 
-    /// Await a datagram into `recv_buf`.
-    async fn recv_datagram(&mut self) -> Result<(usize, SocketAddr), String> {
+    /// Await a datagram into `recv_buf`: its length, source, and whether it
+    /// carried a Congestion Experienced mark.
+    async fn recv_datagram(&mut self) -> Result<(usize, SocketAddr, bool), String> {
         let Self {
             sockets, recv_buf, ..
         } = self;
@@ -411,10 +491,10 @@ impl Connection {
         }
         std::future::poll_fn(|cx| {
             for socket in sockets.iter() {
-                let mut buf = ReadBuf::new(recv_buf);
-                match socket.poll_recv_from(cx, &mut buf) {
-                    Poll::Ready(Ok(peer)) => return Poll::Ready(Ok((buf.filled().len(), peer))),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(format!("Recv error: {e}"))),
+                match poll_recv(socket, cx, recv_buf) {
+                    Poll::Ready(result) => {
+                        return Poll::Ready(result.map_err(|e| format!("Recv error: {e}")))
+                    }
                     Poll::Pending => {}
                 }
             }
@@ -435,7 +515,7 @@ impl Connection {
             return Err(format!("Received oversize datagram ({} bytes)", data.len()));
         };
         dest.copy_from_slice(data);
-        self.process_received(data.len(), peer)
+        self.process_received(data.len(), peer, false)
     }
 
     /// Process the datagram in `recv_buf[..len]`, decrypting it in place.
@@ -443,6 +523,7 @@ impl Connection {
         &mut self,
         len: usize,
         peer: SocketAddr,
+        congestion: bool,
     ) -> Result<Option<TransportInstruction>, String> {
         let (nonce, text) = self
             .session
@@ -483,7 +564,15 @@ impl Connection {
 
         let now = Instant::now();
         if timestamp != 0xFFFF {
-            self.saved_timestamp = Some((timestamp, now));
+            let mut saved = timestamp;
+            if congestion {
+                // Signal the counterparty to slow down.
+                saved = saved.wrapping_sub(CONGESTION_TIMESTAMP_PENALTY_MS as u16);
+                if self.server {
+                    tracing::info!("Received explicit congestion notification.");
+                }
+            }
+            self.saved_timestamp = Some((saved, now));
         }
 
         // The only RTT measurement: how long ago the peer echoed back a
@@ -613,6 +702,39 @@ impl Connection {
         );
         Ok(wire)
     }
+}
+
+/// Poll one socket for a datagram.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn poll_recv(
+    socket: &UdpSocket,
+    cx: &mut std::task::Context<'_>,
+    buf: &mut [u8],
+) -> Poll<std::io::Result<(usize, SocketAddr, bool)>> {
+    loop {
+        if let Err(e) = std::task::ready!(socket.poll_recv_ready(cx)) {
+            return Poll::Ready(Err(e));
+        }
+        match socket.try_io(tokio::io::Interest::READABLE, || ecn::recv(socket, buf)) {
+            // Readiness was stale and has been cleared; poll again so the
+            // waker is registered.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return Poll::Ready(result),
+        }
+    }
+}
+
+/// Poll one socket for a datagram (no ECN information on this platform).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn poll_recv(
+    socket: &UdpSocket,
+    cx: &mut std::task::Context<'_>,
+    buf: &mut [u8],
+) -> Poll<std::io::Result<(usize, SocketAddr, bool)>> {
+    let mut read = ReadBuf::new(buf);
+    socket
+        .poll_recv_from(cx, &mut read)
+        .map_ok(|peer| (read.filled().len(), peer, false))
 }
 
 /// Timestamp diff accounting for 16-bit wrapping.
@@ -1003,6 +1125,62 @@ mod tests {
         assert!(!is_emsgsize(&std::io::Error::from_raw_os_error(
             libc::EACCES
         )));
+    }
+
+    /// The saved (to-be-echoed) timestamp after the server receives a
+    /// client packet with timestamp 1234 over a socket marked with `tos`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn saved_timestamp_after_tos(tos: u32) -> u16 {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&sender).set_tos(tos).unwrap();
+        sender
+            .send_to(
+                &client_packet(k, 0, 1234, 0xFFFF),
+                server.local_addr().unwrap(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server.recv())
+            .await
+            .expect("datagram should arrive")
+            .unwrap();
+        server.saved_timestamp.unwrap().0
+    }
+
+    /// Mosh's ECN response: a Congestion Experienced mark makes the echoed
+    /// timestamp 500 ms stale, so the peer's RTT estimate (and frame
+    /// interval) rises.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn congestion_experienced_penalises_the_echoed_timestamp() {
+        assert_eq!(saved_timestamp_after_tos(0x02).await, 1234, "ECT(0) only");
+        assert_eq!(
+            saved_timestamp_after_tos(0x03).await,
+            1234 - CONGESTION_TIMESTAMP_PENALTY_MS as u16,
+            "CE must be penalised"
+        );
+    }
+
+    /// Mosh rejects a datagram larger than its receive buffer rather than
+    /// processing a truncated copy.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn oversize_datagram_is_reported_as_such() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(key()))
+            .await
+            .unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(&[0u8; RECEIVE_MTU + 1], server.local_addr().unwrap())
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), server.recv())
+            .await
+            .expect("datagram should arrive")
+            .unwrap_err();
+        assert!(err.contains("oversize"), "{err}");
     }
 
     /// Garbage must not authenticate.
