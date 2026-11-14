@@ -1733,6 +1733,7 @@ dependencies = [
  "clap",
  "morsh-log",
  "morsh-ssh",
+ "shell-words",
  "tracing",
 ]
 

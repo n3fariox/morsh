@@ -4,90 +4,14 @@ use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
 mod banner;
+mod cli;
+mod ssh_command;
+use cli::Args;
+#[cfg(feature = "russh")]
+use cli::SshMode;
 mod fake_proxy;
 mod ssh_config;
 use ssh_config::SshConfig;
-
-/// Which SSH backend to use for connecting to the remote host.
-#[cfg_attr(not(feature = "russh"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SshMode {
-    /// Use the system ssh command, or russh when no ssh is installed.
-    Auto,
-    /// Use the system ssh command.
-    System,
-    /// Use russh (pure Rust). Error if no private key is available.
-    Russh,
-}
-
-impl std::str::FromStr for SshMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "auto" => Ok(SshMode::Auto),
-            "russh" => Ok(SshMode::Russh),
-            "system" => Ok(SshMode::System),
-            other => Err(format!(
-                "unknown SSH mode '{other}'. Use 'auto', 'russh', or 'system'"
-            )),
-        }
-    }
-}
-
-/// Morsh: mobile (rust) shell - connects to a remote host via SSH and starts a morsh-server.
-#[derive(Parser, Debug)]
-#[command(name = "morsh", about = "Remote, stateless, mobile (rust) shell")]
-struct Args {
-    /// SSH command to use (default: "ssh")
-    #[arg(long = "ssh", default_value = "ssh")]
-    ssh_command: String,
-
-    /// UDP port range for morsh-server (e.g., "60000:61000")
-    #[arg(long = "port")]
-    port_range: Option<String>,
-
-    /// Predict the future (enable prediction engine)
-    #[arg(long = "predict", default_value = "adaptive", value_parser = ["adaptive", "always", "never"])]
-    predict: String,
-
-    /// Control the IP address that morsh-server binds to:
-    ///   ssh  - bind to the IP from SSH_CONNECTION (default)
-    ///   any  - bind to 0.0.0.0
-    ///   IP   - bind to the specified IP address
-    #[arg(long = "bind-server", default_value = "ssh")]
-    bind_server: String,
-
-    /// Path on the remote host for morsh-server debug logs
-    #[arg(long = "server-log-file")]
-    server_log_file: Option<String>,
-
-    /// Run morsh-server in foreground (don't daemonize)
-    #[arg(long = "no-daemonize", short = 'D')]
-    no_daemonize: bool,
-
-    /// Path to morsh-server on the remote host (default: morsh-server, looked up in PATH)
-    #[arg(long = "server", short = 'S', default_value = "morsh-server")]
-    server_path: String,
-
-    /// SSH backend: "auto" (system ssh, or russh when no ssh is installed),
-    /// "system" (system ssh command), or "russh" (pure Rust).
-    /// Only available when compiled with the "russh" feature.
-    #[cfg(feature = "russh")]
-    #[arg(long = "ssh-mode", default_value = "auto")]
-    ssh_mode: SshMode,
-
-    /// Remote user@host
-    host: String,
-
-    /// Command to run on remote (default: shell)
-    command: Vec<String>,
-
-    /// Shell on the remote host that interprets the launch command.
-    /// auto (detect), posix (sh/bash), cmd (Windows cmd.exe), or powershell (pwsh).
-    /// Default: auto.
-    #[arg(long = "remote-shell", default_value = "auto")]
-    remote_shell: String,
-}
 
 /// Shell used on the remote host to interpret the launch command.
 #[derive(Clone, Copy, PartialEq)]
@@ -134,7 +58,9 @@ fn resolve_remote_shell_system(ssh_command: &str, host: &str, cfg: Option<&SshCo
         }
     }
 
-    let mut args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
+    let Ok(mut args) = ssh_command::parse(ssh_command) else {
+        return RemoteShell::Posix;
+    };
     args.push(host.to_string());
     args.push("uname -s".to_string());
 
@@ -457,7 +383,7 @@ fn try_launch_server(
     cfg: Option<&SshConfig>,
     remote_cmd: &str,
 ) -> Option<ConnectInfo> {
-    let mut ssh_args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
+    let mut ssh_args = ssh_command::parse(ssh_command).ok()?;
 
     // mosh's default `--experimental-remote-ip=proxy`: make ssh connect
     // through `morsh --fake-proxy`, which reports the address it reached.
@@ -620,10 +546,10 @@ fn resolve_host(hostname: &str) -> String {
 /// Can the ssh command be run at all?
 #[cfg(feature = "russh")]
 fn ssh_installed(ssh_command: &str) -> bool {
-    let Some(program) = ssh_command.split_whitespace().next() else {
+    let Ok(args) = ssh_command::parse(ssh_command) else {
         return false;
     };
-    Command::new(program)
+    Command::new(&args[0])
         .arg("-V")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
