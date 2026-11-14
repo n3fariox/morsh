@@ -85,11 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|&(c, r)| c > 0 && r > 0)
         .unwrap_or((80, 24));
 
-    let mut user_stream = UserStream::new();
-    user_stream.push_resize(cols as i32, rows as i32);
-
-    let mut transport: ClientTransport =
-        Transport::new_client(connection, user_stream, Complete::new(cols, rows)?);
+    let mut transport = new_transport(connection, cols, rows)?;
 
     let mut prediction = PredictionEngine::new();
     tracing::info!("Prediction display: {display_preference:?}");
@@ -290,6 +286,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The client's transport, with the window size as the first thing to tell
+/// the server.
+fn new_transport(connection: Connection, cols: u16, rows: u16) -> Result<ClientTransport, String> {
+    // In this order, as stock mosh-client does: the transport takes its
+    // starting state as what the server already has, so a resize pushed
+    // before it is built would never be sent.
+    let mut transport =
+        Transport::new_client(connection, UserStream::new(), Complete::new(cols, rows)?);
+    transport
+        .get_current_state_mut()
+        .push_resize(cols as i32, rows as i32);
+    Ok(transport)
+}
+
 /// The alternate screen was entered afresh and is blank: model it so, and
 /// the next frame repaints everything.
 #[cfg(unix)]
@@ -385,4 +395,49 @@ fn connect_failure_hint(server_addr: SocketAddr, waited: Duration) -> String {
          \x20 firewalld:    sudo firewall-cmd --permanent --add-port=60000-61000/udp && sudo firewall-cmd --reload\n\
          \x20 nftables:     sudo nft add rule inet filter input udp dport 60000-61000 accept\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use morsh_statesync::UserEvent;
+
+    /// The server sizes the session's pty from the client's first resize,
+    /// and has nothing else to go on: it must be in the first diff sent.
+    #[tokio::test]
+    async fn the_window_size_reaches_the_server() {
+        let key = *Base64Key::random().data();
+        let server_conn = Connection::new_server("127.0.0.1:0".parse().unwrap(), Session::new(key))
+            .await
+            .unwrap();
+        let server_addr = server_conn.local_addr().unwrap();
+        let mut server: Transport<Complete, UserStream> = Transport::new_server(
+            server_conn,
+            Complete::new(80, 24).unwrap(),
+            UserStream::new(),
+        );
+
+        let mut client_conn = Connection::new_client(Session::new(key)).await.unwrap();
+        client_conn.set_remote_addr(server_addr);
+        let mut client = new_transport(client_conn, 180, 52).unwrap();
+
+        let resize = UserEvent::Resize {
+            width: 180,
+            height: 52,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            client.tick().await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(50), server.recv()).await;
+            if server
+                .get_latest_remote_state()
+                .state
+                .events()
+                .contains(&resize)
+            {
+                return;
+            }
+        }
+        panic!("the server never heard the window size");
+    }
 }
