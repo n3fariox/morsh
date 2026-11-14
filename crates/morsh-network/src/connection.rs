@@ -176,13 +176,9 @@ impl Connection {
         &self.rtt
     }
 
-    pub fn rtt_mut(&mut self) -> &mut RttEstimator {
-        &mut self.rtt
-    }
-
-    /// Smoothed round-trip time in milliseconds.
-    pub fn srtt_ms(&self) -> u64 {
-        self.rtt.srtt_ms()
+    /// Smoothed round-trip time in milliseconds, mosh's `get_SRTT()`.
+    pub fn srtt(&self) -> f64 {
+        self.rtt.srtt()
     }
 
     /// Retransmission timeout, mosh's `Connection::timeout()`.
@@ -297,13 +293,13 @@ impl Connection {
 
         // The only RTT measurement: how long ago the peer echoed back a
         // timestamp of ours. `timestamp_diff` keeps the 16-bit wraparound
-        // signed, so a measurement across a rollover is not read as ~65 s.
+        // signed, so a measurement across a rollover is not read as ~65 s,
+        // and the estimator discards negative and oversized samples. Zero is
+        // a real sample on a LAN, as in mosh.
         if timestamp_reply != 0xFFFF {
             let rtt = timestamp_diff(timestamp16(), timestamp_reply);
-            if rtt > 0 && rtt < 5000 {
-                self.rtt.update(rtt as u64);
-                tracing::debug!("RTT measurement: {rtt}ms");
-            }
+            self.rtt.update(f64::from(rtt));
+            tracing::debug!("RTT measurement: {rtt}ms");
         }
 
         let now = Instant::now();
@@ -358,10 +354,6 @@ impl Connection {
 
     pub fn time_since_last_heard(&self, now: Instant) -> std::time::Duration {
         now.duration_since(self.last_heard)
-    }
-
-    pub fn record_rtt(&mut self, rtt_ms: u64) {
-        self.rtt.update(rtt_ms);
     }
 
     /// Get the current send sequence number (for testing).
