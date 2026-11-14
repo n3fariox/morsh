@@ -1,5 +1,6 @@
 mod cli;
 mod daemon;
+mod lifecycle;
 mod pty;
 mod server;
 

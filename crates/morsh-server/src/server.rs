@@ -1,3 +1,4 @@
+use crate::lifecycle::{ShutdownSignal, Signals, Timeouts};
 use crate::pty::{self, MorshPty, PtyEvent};
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, RecvOutcome, State, Transport};
@@ -36,10 +37,14 @@ pub async fn run_server(
         command_args.len()
     );
 
+    let mut signals = Signals::new()?;
+    let timeouts = Timeouts::from_env();
     let mut transport = bind_transport(bind_port, desired_ip, &key).await?;
     tracing::info!("UDP transport ready, waiting for client on port {bind_port}");
 
-    let pty_size = wait_for_client(&mut transport).await?;
+    let Some(pty_size) = wait_for_client(&mut transport, &mut signals, &timeouts).await? else {
+        return Ok(());
+    };
 
     tracing::info!(
         "Client connected, spawning shell (remote_state_num={})",
@@ -62,7 +67,7 @@ pub async fn run_server(
         last_remote_num,
     };
 
-    handler.run().await
+    handler.run(&mut signals, &timeouts).await
 }
 
 async fn bind_transport(
@@ -106,7 +111,9 @@ async fn bind_transport(
 /// asks for. Mosh releases the login shell at the same point.
 async fn wait_for_client(
     transport: &mut ServerTransport,
-) -> Result<PtySize, Box<dyn std::error::Error>> {
+    signals: &mut Signals,
+    timeouts: &Timeouts,
+) -> Result<Option<PtySize>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + TIMEOUT_IF_NO_CLIENT;
     let mut pty_size = PtySize {
         rows: 24,
@@ -116,7 +123,11 @@ async fn wait_for_client(
     };
 
     while transport.get_remote_state_num() == 0 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let last_state = transport.get_latest_remote_state().timestamp;
+        if timeouts.expired(last_state) {
+            return Err("Network idle timeout before client connected".into());
+        }
+        let mut remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
                 "No connection within {} seconds",
@@ -125,7 +136,15 @@ async fn wait_for_client(
             .into());
         }
 
+        if let Some(network_wait) = timeouts.remaining(last_state) {
+            remaining = remaining.min(network_wait);
+        }
         tokio::select! {
+            signal = signals.recv() => {
+                if matches!(signal, ShutdownSignal::Terminate) || timeouts.signal_expired(last_state) {
+                    return Ok(None);
+                }
+            }
             result = transport.recv() => match result {
                 Ok(RecvOutcome::NewState { num }) => {
                     tracing::info!("Client's first state: {num}");
@@ -156,17 +175,38 @@ async fn wait_for_client(
         }
     }
 
-    Ok(pty_size)
+    Ok(Some(pty_size))
 }
 
 impl Handler {
-    async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run(
+        &mut self,
+        signals: &mut Signals,
+        timeouts: &Timeouts,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Entering serve loop");
 
         let result = loop {
-            let wait = self.wait_time();
+            let mut wait = self.wait_time();
+            if let Some(network_wait) =
+                timeouts.remaining(self.transport.get_latest_remote_state().timestamp)
+            {
+                if !self.transport.shutdown_in_progress() {
+                    wait = wait.min(network_wait);
+                }
+            }
 
             tokio::select! {
+                signal = signals.recv() => {
+                    if matches!(signal, ShutdownSignal::Terminate)
+                        || timeouts.signal_expired(self.transport.get_latest_remote_state().timestamp)
+                    {
+                        if self.transport.shutdown_in_progress() {
+                            break Ok(());
+                        }
+                        self.transport.start_shutdown();
+                    }
+                }
                 // `mpsc::Receiver::recv` and `Transport::recv` are both
                 // cancel-safe, so losing this race never drops an event.
                 Some(pty_event) = self.pty.rx.recv() => {
@@ -182,6 +222,13 @@ impl Handler {
 
             if self.handle_client_input().is_break() {
                 break Ok(());
+            }
+
+            if !self.transport.shutdown_in_progress()
+                && timeouts.expired(self.transport.get_latest_remote_state().timestamp)
+            {
+                tracing::info!("Network idle timeout");
+                self.transport.start_shutdown();
             }
 
             if self.housekeeping().is_break() {
