@@ -166,17 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let remote = &transport.get_latest_remote_state().state;
                         prediction.set_local_frame_late_acked(remote.echo_ack());
 
-                        let screen = remote.snapshot();
-                        prediction.validate_predictions(
-                            |r, c| {
-                                screen
-                                    .cell(c as u16, r as u16)
-                                    .and_then(|d| d.text.chars().next())
-                                    .unwrap_or(' ')
-                            },
-                            screen.cursor_y as usize,
-                            screen.cursor_x as usize,
-                        );
+                        prediction.validate_predictions(remote.screen());
                     }
                     Err(e) => {
                         tracing::warn!("Recv error: {e}");

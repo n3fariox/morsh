@@ -1,3 +1,4 @@
+mod apply;
 pub mod notification;
 pub mod overlay;
 pub mod prediction;

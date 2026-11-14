@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 morsh-crypto = { path = "../morsh-crypto" }
 morsh-terminal = { path = "../morsh-terminal" }
+
+[dev-dependencies]
+serial_test = "3"
