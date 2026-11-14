@@ -6,6 +6,7 @@ use russh::keys::{self, *};
 use russh::*;
 
 mod host_keys;
+mod output;
 pub use host_keys::{HostKeyPolicy, StrictHostKeyChecking};
 
 /// A blocking SSH session that executes commands on a remote host.
@@ -120,7 +121,7 @@ impl SshSession {
         let session = self
             .session
             .as_mut()
-            .expect("SshSession used after disconnect");
+            .context("SSH session is disconnected")?;
 
         self.rt.block_on(async move {
             let mut channel = session
@@ -155,7 +156,7 @@ impl SshSession {
                 }
             }
 
-            let code = code.expect("Child exited without exit status");
+            let code = output::exit_status(code)?;
             let output = output.trim_end_matches('\n').to_string();
             Ok::<_, anyhow::Error>((code, output))
         })
@@ -172,7 +173,7 @@ impl SshSession {
         let session = self
             .session
             .as_ref()
-            .expect("SshSession used after disconnect");
+            .context("SSH session is disconnected")?;
 
         self.rt.block_on(async move {
             let mut channel = session
@@ -186,6 +187,7 @@ impl SshSession {
                 .context("Failed to exec SSH command")?;
 
             let mut code = None;
+            let mut lines = output::Lines::default();
 
             loop {
                 let Some(msg) = channel.wait().await else {
@@ -193,9 +195,7 @@ impl SshSession {
                 };
                 match msg {
                     ChannelMsg::Data { data } => {
-                        for line in String::from_utf8_lossy(&data).lines() {
-                            handler(line.to_string());
-                        }
+                        lines.push(&data, &mut handler);
                     }
                     ChannelMsg::ExtendedData { data, .. } => {
                         std::io::Write::write_all(&mut std::io::stderr(), &data).ok();
@@ -207,7 +207,8 @@ impl SshSession {
                 }
             }
 
-            Ok::<u32, anyhow::Error>(code.expect("Child exited without exit status"))
+            lines.finish(&mut handler);
+            output::exit_status(code)
         })
     }
 
