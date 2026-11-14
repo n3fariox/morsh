@@ -32,10 +32,10 @@ pub struct Connection {
     /// here is security-sensitive: a replayed packet could otherwise corrupt
     /// the RTT estimate or re-target the server at an attacker's address.
     expected_receiver_seq: u64,
-    /// Last received timestamp for RTT calculation (stock mosh compatible).
-    saved_timestamp: u16,
-    /// When the saved_timestamp was received.
-    saved_timestamp_received_at: Instant,
+    /// The peer's most recent timestamp and when it arrived, waiting to be
+    /// echoed back exactly once (mosh's `saved_timestamp` /
+    /// `saved_timestamp_received_at`).
+    saved_timestamp: Option<(u16, Instant)>,
 }
 
 /// Current time in milliseconds as a 16-bit value (mod 65536), never 0xFFFF.
@@ -134,8 +134,7 @@ impl Connection {
             last_heard: now,
             send_seq: 0,
             expected_receiver_seq: 0,
-            saved_timestamp: 0,
-            saved_timestamp_received_at: now,
+            saved_timestamp: None,
         }
     }
 
@@ -287,8 +286,7 @@ impl Connection {
         let timestamp_reply = u16::from_be_bytes([msg.text[2], msg.text[3]]);
 
         if timestamp != 0xFFFF {
-            self.saved_timestamp = timestamp;
-            self.saved_timestamp_received_at = Instant::now();
+            self.saved_timestamp = Some((timestamp, Instant::now()));
         }
 
         // The only RTT measurement: how long ago the peer echoed back a
@@ -361,6 +359,24 @@ impl Connection {
         self.send_seq
     }
 
+    /// The `timestamp_reply` for the next outgoing packet. Mosh's
+    /// `new_packet`: a timestamp received in the last second is echoed once,
+    /// advanced by how long we held it, and then forgotten, so only the first
+    /// packet after a receive carries an RTT sample for the peer.
+    fn take_timestamp_reply(&mut self, now: Instant) -> u16 {
+        match self.saved_timestamp.take() {
+            Some((ts, at)) => {
+                let held = now.saturating_duration_since(at).as_millis();
+                if held < 1000 {
+                    ts.wrapping_add(held as u16)
+                } else {
+                    0xFFFF
+                }
+            }
+            None => 0xFFFF,
+        }
+    }
+
     /// Encrypt a fragment (public for testing).
     /// Stock mosh message format: [timestamp 2B BE] [timestamp_reply 2B BE] [fragment data]
     pub fn encrypt_fragment(&mut self, frag: &Fragment) -> Result<Vec<u8>, String> {
@@ -369,14 +385,7 @@ impl Connection {
         // timestamp = current ms mod 65536 (never 0xFFFF)
         // timestamp_reply = 0xFFFF (no reply), or corrected echo of received timestamp
         let ts = timestamp16();
-        let ts_reply = {
-            let elapsed = Instant::now().duration_since(self.saved_timestamp_received_at);
-            if elapsed.as_millis() < 1000 && self.saved_timestamp != 0 {
-                self.saved_timestamp.wrapping_add(elapsed.as_millis() as u16)
-            } else {
-                0xFFFF
-            }
-        };
+        let ts_reply = self.take_timestamp_reply(Instant::now());
 
         let mut plaintext = Vec::with_capacity(4 + frag_bytes.len());
         plaintext.extend_from_slice(&ts.to_be_bytes());
@@ -407,6 +416,7 @@ pub fn timestamp_diff(a: u16, b: u16) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fragment::Fragmenter;
     use morsh_crypto::Base64Key;
 
     #[test]
@@ -535,6 +545,102 @@ mod tests {
         }
 
         assert_eq!(server.remote_addr(), Some(roamed));
+    }
+
+    /// Encrypt a client→server packet with chosen timestamps, bypassing
+    /// `encrypt_fragment`, so tests can control what the server sees.
+    fn client_packet(k: [u8; 16], seq: u64, ts: u16, ts_reply: u16) -> Vec<u8> {
+        let frag = Fragmenter::new()
+            .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+            .unwrap()
+            .remove(0);
+        let mut text = Vec::new();
+        text.extend_from_slice(&ts.to_be_bytes());
+        text.extend_from_slice(&ts_reply.to_be_bytes());
+        text.extend_from_slice(&frag.to_bytes());
+        Session::new(k).encrypt(&morsh_crypto::Message::new(Nonce::from_val(seq), text))
+    }
+
+    /// The `timestamp_reply` field of a packet the server sent.
+    fn reply_of(k: [u8; 16], wire: &[u8]) -> u16 {
+        let msg = Session::new(k).decrypt(wire).unwrap();
+        u16::from_be_bytes([msg.text[2], msg.text[3]])
+    }
+
+    /// Mosh's `new_packet` echoes a received timestamp once and then forgets
+    /// it; repeating it on every packet for a second would feed the peer a
+    /// stream of samples for one measurement.
+    #[tokio::test]
+    async fn received_timestamp_is_echoed_exactly_once() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        server
+            .process_incoming(&client_packet(k, 0, 1234, 0xFFFF), peer)
+            .unwrap();
+
+        let frag = server
+            .fragger
+            .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+            .unwrap()
+            .remove(0);
+        let first = server.encrypt_fragment(&frag).unwrap();
+        let second = server.encrypt_fragment(&frag).unwrap();
+        let echoed = reply_of(k, &first);
+        assert!(
+            (1234..1234 + 50).contains(&echoed),
+            "echo {echoed} should be 1234 advanced by the hold time"
+        );
+        assert_eq!(reply_of(k, &second), 0xFFFF, "echoed a second time");
+    }
+
+    /// 0 is an ordinary timestamp (only 0xFFFF means "none").
+    #[tokio::test]
+    async fn timestamp_zero_is_echoed() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        server
+            .process_incoming(&client_packet(k, 0, 0, 0xFFFF), peer)
+            .unwrap();
+        let frag = server
+            .fragger
+            .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+            .unwrap()
+            .remove(0);
+        let wire = server.encrypt_fragment(&frag).unwrap();
+        assert!(reply_of(k, &wire) < 50);
+    }
+
+    /// No timestamp received yet: nothing to echo.
+    #[tokio::test]
+    async fn no_echo_before_anything_is_received() {
+        let k = key();
+        let mut client = Connection::new_client(Session::new(k)).await.unwrap();
+        let frag = client
+            .fragger
+            .make_fragments(&instruction(1), max_fragment_payload(MTU_IPV4))
+            .unwrap()
+            .remove(0);
+        let wire = client.encrypt_fragment(&frag).unwrap();
+        assert_eq!(reply_of(k, &wire), 0xFFFF);
+    }
+
+    /// An echo of our own timestamp is an RTT sample.
+    #[tokio::test]
+    async fn echoed_timestamp_updates_the_rtt_estimate() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let sent = timestamp16().wrapping_sub(80);
+        server
+            .process_incoming(&client_packet(k, 0, 0xFFFF, sent), peer)
+            .unwrap();
+        let srtt = server.srtt();
+        assert!((80.0..200.0).contains(&srtt), "srtt {srtt}");
     }
 
     /// Garbage must not authenticate.
