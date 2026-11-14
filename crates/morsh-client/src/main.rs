@@ -1,8 +1,9 @@
 mod cli;
 mod frame;
 mod input;
+mod tty;
 
-use crossterm::{cursor, execute, terminal};
+use crossterm::terminal;
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, Transport};
 use morsh_prediction::{DisplayPreference, NotificationEngine, PredictionEngine};
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 use cli::ParseOutcome;
 use frame::output_new_frame;
 use input::{handle_term_event, spawn_input_reader, EscapeConfig, TermEvent};
+use tty::Tty;
 
 /// Longest we sleep between housekeeping passes.
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -93,19 +95,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications.set_escape_key_help(escape.help());
     }
 
-    terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    #[cfg(windows)]
-    let original_console_mode = enable_delayed_wrap();
-    #[cfg(windows)]
-    let original_input_mode = input::enable_vt_input();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-
     // What we believe is currently on the user's screen. The alternate screen
-    // we just entered is blank, and a blank `Complete` is precisely our model
-    // of a blank terminal — building the baseline any other way makes the
-    // first frame repaint the whole screen with spaces.
+    // we are about to enter is blank, and a blank `Complete` is precisely our
+    // model of a blank terminal — building the baseline any other way makes
+    // the first frame repaint the whole screen with spaces.
     let mut local_framebuffer = Complete::new(cols, rows)?.snapshot();
+
+    let mut tty = Tty::enter()?;
+    let mut stdout = io::stdout();
 
     let (term_tx, mut term_rx) = mpsc::channel::<TermEvent>(64);
     spawn_input_reader(term_tx, escape);
@@ -123,13 +120,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
-        output_new_frame(
+        // Not `?`: that would leave without handing the terminal back or
+        // saying why.
+        if let Err(e) = output_new_frame(
             &transport,
             &mut prediction,
             &mut notifications,
             &mut local_framebuffer,
             &mut stdout,
-        )?;
+        ) {
+            break Err(e.into());
+        }
 
         let mut wait = transport
             .wait_time_ms()
@@ -240,14 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Cleanup
-    let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
-    // The saved input mode is the raw one, so put it back before leaving raw mode.
-    #[cfg(windows)]
-    input::restore_input_mode(original_input_mode);
-    let _ = terminal::disable_raw_mode();
-    #[cfg(windows)]
-    restore_console_mode(original_console_mode);
+    tty.restore();
 
     // As stock mosh-client's `STMClient::shutdown` and `main`.
     if transport.get_remote_state_num() == 0 {
@@ -337,38 +331,4 @@ fn connect_failure_hint(server_addr: SocketAddr, waited: Duration) -> String {
          \x20 firewalld:    sudo firewall-cmd --permanent --add-port=60000-61000/udp && sudo firewall-cmd --reload\n\
          \x20 nftables:     sudo nft add rule inet filter input udp dport 60000-61000 accept\n"
     )
-}
-
-/// Windows console: make the cursor wait at the right margin instead of
-/// wrapping as soon as the last column is written (which scrolls the screen
-/// when on the bottom row). Returns the original mode to restore on exit.
-#[cfg(windows)]
-fn enable_delayed_wrap() -> Option<u32> {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
-    };
-    unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut mode = 0;
-        if GetConsoleMode(handle, &mut mode) == 0 {
-            return None;
-        }
-        let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
-        if SetConsoleMode(handle, new_mode) == 0 {
-            tracing::warn!("Failed to set console mode {new_mode:#x}");
-            return None;
-        }
-        Some(mode)
-    }
-}
-
-#[cfg(windows)]
-fn restore_console_mode(mode: Option<u32>) {
-    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_OUTPUT_HANDLE};
-    if let Some(mode) = mode {
-        unsafe {
-            SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
-        }
-    }
 }
