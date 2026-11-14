@@ -78,3 +78,23 @@ fn snapshots_allocate_cell_text_without_per_cell_scratch_buffers() {
     );
     assert_eq!(snapshot.rows[0][0].text, "x");
 }
+
+#[test]
+fn reused_snapshot_clones_do_not_allocate_per_cell() {
+    for (cols, rows) in [(120, 40), (1024, 128)] {
+        let mut source = ScreenSnapshot::new(cols, rows);
+        for row in &mut source.rows {
+            for cell in row {
+                cell.text = "x".into();
+            }
+        }
+        let mut reused = source.clone();
+        // Reuse must also copy changed content, not merely recognize idle frames.
+        source.rows[0][0].text = "y".into();
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        reused.clone_from(&source);
+        let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+        assert_eq!(allocations, 0, "{cols}x{rows}: {allocations} allocations");
+        assert_eq!(reused, source);
+    }
+}
