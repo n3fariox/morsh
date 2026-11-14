@@ -682,7 +682,10 @@ impl<M: State, R: State> Transport<M, R> {
             }
         }
 
-        self.last_receiver_state = self.received_states.last().unwrap().state.clone();
+        // `clone_from` lets a state reuse its existing allocations (a
+        // terminal framebuffer, for `Complete`) instead of building a new one.
+        let latest = &self.received_states.last().unwrap().state;
+        self.last_receiver_state.clone_from(latest);
         ret
     }
 
