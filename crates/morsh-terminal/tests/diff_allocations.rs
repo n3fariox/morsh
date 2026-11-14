@@ -60,3 +60,21 @@ fn idle_and_sparse_diffs_have_constant_allocation_counts() {
         }
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn snapshots_allocate_cell_text_without_per_cell_scratch_buffers() {
+    let (cols, rows) = (120, 40);
+    let mut terminal = morsh_terminal::MoshTerminal::new(cols, rows, 0).unwrap();
+    terminal.write("x".repeat(cols as usize * rows as usize - 1).as_bytes());
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let snapshot = terminal.snapshot().unwrap();
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    let cells = cols as usize * rows as usize;
+    println!("snapshot: {allocations} allocations for {cells} cells");
+    assert!(
+        allocations <= cells + rows as usize + 64,
+        "{allocations} allocations for {cells} cells"
+    );
+    assert_eq!(snapshot.rows[0][0].text, "x");
+}

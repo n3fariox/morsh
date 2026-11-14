@@ -121,12 +121,12 @@ impl MoshTerminal {
             .map_err(|e| format!("RowIterator::update: {e:?}"))?;
 
         // Iterate rows — RowIteration doesn't implement Iterator, use next() manually
-        // We need to collect into a Vec first since RowIteration borrows row_iter
-        let mut row_snapshots: Vec<(bool, Vec<CellData>)> = Vec::new();
         {
             let mut ri = row_iteration;
-            while let Some(row) = ri.next() {
-                let dirty = row.dirty().unwrap_or(false);
+            while screen_rows.len() < rows as usize {
+                let Some(row) = ri.next() else {
+                    break;
+                };
                 let mut cells = Vec::with_capacity(cols as usize);
                 let cell_iteration = cell_iter
                     .update(row)
@@ -134,9 +134,22 @@ impl MoshTerminal {
                 {
                     let mut ci = cell_iteration;
                     while let Some(cell) = ci.next() {
-                        let graphemes = cell
-                            .graphemes()
-                            .map_err(|_| "Cell::graphemes failed".to_string())?;
+                        // Most cells contain at most one codepoint. Keep that
+                        // scratch storage on the stack; clusters use the full API.
+                        let len = cell
+                            .graphemes_len()
+                            .map_err(|_| "Cell::graphemes_len failed".to_string())?;
+                        let mut single = ['\0'];
+                        let cluster;
+                        let graphemes = if len <= 1 {
+                            cell.graphemes_buf(&mut single)
+                                .map_err(|_| "Cell::graphemes_buf failed".to_string())?;
+                            &single[..len]
+                        } else {
+                            cluster = cell.graphemes()
+                                .map_err(|_| "Cell::graphemes failed".to_string())?;
+                            &cluster
+                        };
                         let text: String = graphemes.iter().collect();
 
                         let style = match cell.style() {
@@ -180,21 +193,14 @@ impl MoshTerminal {
                 while cells.len() < cols as usize {
                     cells.push(CellData::empty());
                 }
-                row_snapshots.push((dirty, cells));
+                screen_rows.push(cells);
             }
-
-        }
-
-        // Take only `rows` worth of rows
-        for (_, cells) in row_snapshots.into_iter().take(rows as usize) {
-            screen_rows.push(cells);
         }
 
         // Pad if fewer rows than expected
-        let empty_row: Vec<CellData> = (0..cols).map(|_| CellData::empty()).collect();
-        while screen_rows.len() < rows as usize {
-            screen_rows.push(empty_row.clone());
-        }
+        screen_rows.resize_with(rows as usize, || {
+            (0..cols).map(|_| CellData::empty()).collect()
+        });
 
         Ok(ScreenSnapshot {
             rows: screen_rows,
