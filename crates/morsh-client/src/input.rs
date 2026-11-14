@@ -186,6 +186,16 @@ impl EscapeFilter {
     }
 }
 
+/// The local window's size, unless it is reported as empty: some terminals
+/// say 0x0 while starting up or being reattached, and a remote pty that
+/// small makes every line of output wrap at every character. (Stock mosh
+/// sends it on; the client already ignores it at startup.)
+fn window_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size()
+        .ok()
+        .filter(|&(cols, rows)| cols > 0 && rows > 0)
+}
+
 /// Pass one chunk of raw input through the escape filter and publish the
 /// result. Returns false once the receiver is gone.
 fn publish(escape: &mut EscapeFilter, bytes: &[u8], term_tx: &mpsc::Sender<TermEvent>) -> bool {
@@ -225,7 +235,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
         Ok(mut winch) => {
             tokio::spawn(async move {
                 while winch.recv().await.is_some() {
-                    if let Ok((w, h)) = crossterm::terminal::size() {
+                    if let Some((w, h)) = window_size() {
                         if resize_tx
                             .send(TermEvent::Resize(w as i32, h as i32))
                             .await
@@ -329,7 +339,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
             // The record holds the buffer size, not the window size; ask for
             // the latter.
             if resized {
-                if let Ok((w, h)) = crossterm::terminal::size() {
+                if let Some((w, h)) = window_size() {
                     if term_tx
                         .blocking_send(TermEvent::Resize(w as i32, h as i32))
                         .is_err()
