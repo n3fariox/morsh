@@ -15,6 +15,7 @@ default = ["russh"]
 russh = ["dep:morsh-ssh"]
 
 [dependencies]
+shell-words = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 morsh-log = { path = "../morsh-log" }

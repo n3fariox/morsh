@@ -32,11 +32,10 @@ pub struct SshConfig {
 /// Returns `None` when ssh is missing or too old to know `-G` (OpenSSH < 6.8);
 /// callers then fall back to treating `host` literally.
 pub fn query(ssh_command: &str, host: &str) -> Option<SshConfig> {
-    let mut args = ssh_command.split_whitespace();
-    let program = args.next()?;
+    let args = crate::ssh_command::parse(ssh_command).ok()?;
 
-    let out = Command::new(program)
-        .args(args)
+    let out = Command::new(&args[0])
+        .args(&args[1..])
         .arg("-G")
         .arg(host)
         .stdin(Stdio::null())
