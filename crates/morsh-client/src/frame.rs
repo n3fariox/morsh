@@ -8,50 +8,54 @@ use std::io::{self, Write};
 
 /// What the user should be looking at: the server's screen with
 /// predictions and the notification bar folded in. Mosh's
-/// `OverlayManager::apply`.
+/// `OverlayManager::apply`. Built in `target`, whose storage is reused.
 fn compose_frame(
     remote: &ScreenSnapshot,
     prediction: &mut PredictionEngine,
     notifications: &mut NotificationEngine,
-) -> ScreenSnapshot {
-    let mut target = remote.clone();
+    target: &mut ScreenSnapshot,
+) {
+    target.clone_from(remote);
     prediction.cull(remote);
-    prediction.apply(&mut target);
+    prediction.apply(target);
     notifications.adjust_message();
-    notifications.apply(&mut target);
-    target
+    notifications.apply(target);
 }
 
 /// Paint the difference between what is on the user's screen and what the
 /// server's latest state (plus predictions and the notification bar) says
-/// should be there.
+/// should be there. `scratch` is where the frame is built; keeping it from
+/// frame to frame saves allocating a whole screen each time.
 pub fn output_new_frame(
     transport: &ClientTransport,
     prediction: &mut PredictionEngine,
     notifications: &mut NotificationEngine,
     local_framebuffer: &mut ScreenSnapshot,
+    scratch: &mut ScreenSnapshot,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
-    let target = compose_frame(
+    compose_frame(
         transport.get_latest_remote_state().state.screen(),
         prediction,
         notifications,
+        scratch,
     );
-    paint(local_framebuffer, target, stdout)
+    paint(local_framebuffer, scratch, stdout)
 }
 
-/// Bring the user's screen from `shown` to `target`.
+/// Bring the user's screen from `shown` to `target`. Afterwards `shown` is
+/// the new frame and `target` holds the old one, for its storage.
 fn paint(
     shown: &mut ScreenSnapshot,
-    target: ScreenSnapshot,
+    target: &mut ScreenSnapshot,
     out: &mut impl Write,
 ) -> io::Result<()> {
     // Most wakeups (timers, acks, the countup) change nothing on screen,
     // and comparing frames costs a tenth of diffing them.
-    if *shown == target {
+    if shown == target {
         return Ok(());
     }
-    let diff = DisplayDiff::diff(shown, &target);
+    let diff = DisplayDiff::diff(shown, target);
     if !diff.is_empty() {
         if shown.rows != target.rows {
             // Synchronized update (ignored where unsupported) with the cursor
@@ -70,7 +74,7 @@ fn paint(
         }
         out.flush()?;
     }
-    *shown = target;
+    std::mem::swap(shown, target);
     Ok(())
 }
 
@@ -92,20 +96,21 @@ mod tests {
         prediction.set_send_interval(20);
         let mut notifications = NotificationEngine::new();
         let mut remote = ScreenSnapshot::new(20, 3);
+        let mut shown = ScreenSnapshot::new(20, 3);
         remote.cursor_y = 1;
 
         // An earlier keystroke the server echoed promptly: predictions in
         // this epoch are no longer tentative.
-        let shown = compose_frame(&remote, &mut prediction, &mut notifications);
+        compose_frame(&remote, &mut prediction, &mut notifications, &mut shown);
         prediction.new_user_byte('a', &shown);
         prediction.set_local_frame_sent(1);
         prediction.set_local_frame_late_acked(1);
         remote.rows[1][0].text = "a".to_string();
         remote.cursor_x = 1;
 
-        let shown = compose_frame(&remote, &mut prediction, &mut notifications);
+        compose_frame(&remote, &mut prediction, &mut notifications, &mut shown);
         prediction.new_user_byte('x', &shown);
-        let shown = compose_frame(&remote, &mut prediction, &mut notifications);
+        compose_frame(&remote, &mut prediction, &mut notifications, &mut shown);
         assert_eq!(
             shown.cell(1, 1).unwrap().text,
             "",
@@ -113,7 +118,7 @@ mod tests {
         );
 
         std::thread::sleep(Duration::from_millis(260));
-        let shown = compose_frame(&remote, &mut prediction, &mut notifications);
+        compose_frame(&remote, &mut prediction, &mut notifications, &mut shown);
         assert_eq!(shown.cell(1, 1).unwrap().text, "x");
     }
 
@@ -121,12 +126,12 @@ mod tests {
     fn an_unchanged_frame_writes_nothing() {
         let mut shown = ScreenSnapshot::new(20, 3);
         let mut out = Vec::new();
-        paint(&mut shown, ScreenSnapshot::new(20, 3), &mut out).unwrap();
+        paint(&mut shown, &mut ScreenSnapshot::new(20, 3), &mut out).unwrap();
         assert!(out.is_empty());
 
         let mut target = ScreenSnapshot::new(20, 3);
         target.rows[1][2].text = "x".to_string();
-        paint(&mut shown, target.clone(), &mut out).unwrap();
+        paint(&mut shown, &mut target.clone(), &mut out).unwrap();
         assert!(!out.is_empty());
         assert_eq!(shown, target);
     }

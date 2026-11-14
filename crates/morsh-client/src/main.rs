@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the first frame repaint the whole screen with spaces.
     let mut local_framebuffer = Complete::new(cols, rows)?.snapshot();
 
+    let mut scratch_frame = local_framebuffer.clone();
     let mut tty = Tty::enter()?;
     let mut stdout = io::stdout();
 
@@ -133,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut prediction,
             &mut notifications,
             &mut local_framebuffer,
+            &mut scratch_frame,
             &mut stdout,
         ) {
             break Err(e.into());

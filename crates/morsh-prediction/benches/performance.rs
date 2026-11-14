@@ -110,6 +110,18 @@ fn main() {
         }
     });
 
+    // The client now: the target frame's storage is kept between wakeups.
+    let mut target = screen.clone();
+    measure("frame_idle_reused", 1, 200, || {
+        target.clone_from(&screen);
+        idle.apply(&mut target);
+        notifications.adjust_message();
+        notifications.apply(&mut target);
+        if shown != target {
+            black_box(DisplayDiff::diff(&shown, &target));
+        }
+    });
+
     let typing = typing_engine(&screen);
     let mut shown = screen.clone();
     typing.apply(&mut shown);
