@@ -189,6 +189,25 @@ mod tests {
     }
 
     #[test]
+    fn final_bind_flag_controls_the_selected_address() {
+        for (flags, expected) in [
+            (vec!["new", "-s", "-i", "127.0.0.3"], "127.0.0.3"),
+            (vec!["new", "-i", "127.0.0.3", "-s"], "127.0.0.2"),
+            (vec!["new", "-si127.0.0.3"], "127.0.0.3"),
+            (vec!["new", "-i127.0.0.3", "-s"], "127.0.0.2"),
+        ] {
+            let flags: Vec<_> = flags.into_iter().map(String::from).collect();
+            let cli::ParseOutcome::Run(opts) = cli::parse_args(&flags) else {
+                panic!("expected valid server flags");
+            };
+            assert_eq!(
+                desired_bind_address(&opts, Some("127.0.0.2".into())).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn explicit_port_zero_uses_an_assigned_port() {
         let port = pick_port("127.0.0.1", Some((0, 0))).unwrap();
         assert_ne!(port, 0);

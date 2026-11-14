@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ impl Server {
             .env_remove("MORSH_DAEMON_CHILD")
             .env_remove("MORSH_KEY")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let mut line = String::new();
@@ -66,9 +66,21 @@ impl Drop for Server {
 fn network_timeout_applies_before_first_client() {
     let mut server = Server::start("1");
     assert!(
-        server.wait().is_some(),
-        "network timeout must not wait the default 60 seconds"
+        server
+            .wait()
+            .expect("network timeout must not wait the default 60 seconds")
+            .success(),
+        "network idle timeout must exit successfully like stock mosh"
     );
+    let mut stderr = String::new();
+    server
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("Network idle for 1 seconds."), "{stderr}");
 }
 
 #[test]

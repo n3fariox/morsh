@@ -125,7 +125,8 @@ async fn wait_for_client(
     while transport.get_remote_state_num() == 0 {
         let last_state = transport.get_latest_remote_state().timestamp;
         if timeouts.expired(last_state) {
-            return Err("Network idle timeout before client connected".into());
+            eprintln!("Network idle for {} seconds.", last_state.elapsed().as_secs());
+            return Ok(None);
         }
         let mut remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
