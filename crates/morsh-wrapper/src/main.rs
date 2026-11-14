@@ -433,9 +433,12 @@ fn try_launch_server(
     if proxy.is_some() {
         command.env("SHELL", "/bin/sh");
     }
-    let mut ssh_child = command.spawn().inspect_err(|e| {
-        eprintln!("morsh: failed to start SSH command '{}': {e}", ssh_args[0]);
-    }).ok()?;
+    let mut ssh_child = command
+        .spawn()
+        .inspect_err(|e| {
+            eprintln!("morsh: failed to start SSH command '{}': {e}", ssh_args[0]);
+        })
+        .ok()?;
 
     let stdout = ssh_child.stdout.take()?;
     let stderr = ssh_child.stderr.take()?;
@@ -665,15 +668,12 @@ fn try_launch_russh(
     let connect_info_clone = connect_info.clone();
 
     let exit_code = session
-        .exec_with_handler(
-            &remote_cmd,
-            move |line: String| {
-                tracing::debug!("russh stdout: {line}");
-                if let Some(info) = ConnectInfo::parse(&line) {
-                    *connect_info_clone.lock().unwrap() = Some(info);
-                }
-            },
-        )
+        .exec_with_handler(&remote_cmd, move |line: String| {
+            tracing::debug!("russh stdout: {line}");
+            if let Some(info) = ConnectInfo::parse(&line) {
+                *connect_info_clone.lock().unwrap() = Some(info);
+            }
+        })
         .ok()?;
 
     tracing::info!("russh: remote command exited with code {exit_code}");

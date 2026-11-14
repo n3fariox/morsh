@@ -95,7 +95,8 @@ fn main() {
     } else {
         match pick_port(
             desired_ip.as_deref().unwrap_or("0.0.0.0"),
-            opts.port_requested.then_some((opts.port_low, opts.port_high)),
+            opts.port_requested
+                .then_some((opts.port_low, opts.port_high)),
         ) {
             Ok(p) => p,
             Err(e) => {
