@@ -471,13 +471,11 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 /// as this used to — makes the padding perfectly predictable and defeats the
 /// point of sending it.
 pub fn make_chaff() -> Vec<u8> {
-    let mut prng = Prng;
-    let len = (prng.u8() as usize) % (CHAFF_MAX + 1);
-    let mut chaff = vec![0u8; len];
-    if len > 0 {
-        Prng::fill(&mut chaff);
-    }
-    chaff
+    // One CSPRNG read per packet: a length byte, then up to CHAFF_MAX bytes.
+    let mut random = [0u8; CHAFF_MAX + 1];
+    Prng::fill(&mut random);
+    let len = random[0] as usize % (CHAFF_MAX + 1);
+    random[1..=len].to_vec()
 }
 
 #[cfg(test)]
