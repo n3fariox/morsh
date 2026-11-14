@@ -1676,6 +1676,7 @@ dependencies = [
 name = "morsh-server"
 version = "0.0.7"
 dependencies = [
+ "anyhow",
  "clap",
  "libc",
  "morsh-crypto",
@@ -1734,6 +1735,7 @@ dependencies = [
  "clap",
  "morsh-log",
  "morsh-ssh",
+ "shell-words",
  "tracing",
 ]
 

@@ -6,17 +6,17 @@
 //! enough to decide whether the launch command needs a POSIX shell without a
 //! second ssh login.
 
+use crate::family::Family;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Fetch the banner line, or `None` if the server can't be reached directly
 /// or doesn't answer like an SSH server.
-pub fn fetch(host: &str, port: u16) -> Option<String> {
-    let mut addrs: Vec<_> = (host, port).to_socket_addrs().ok()?.collect();
-    addrs.sort_by_key(|a| !a.is_ipv4());
+pub fn fetch(host: &str, port: u16, family: Family) -> Option<String> {
+    let addrs = family.resolve(host, port).ok()?;
     let stream = addrs
         .iter()
         .find_map(|a| TcpStream::connect_timeout(a, TIMEOUT).ok())?;

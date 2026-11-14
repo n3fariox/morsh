@@ -1,10 +1,10 @@
+use crate::lifecycle::{ShutdownSignal, Signals, Timeouts};
 use crate::pty::{self, MorshPty, PtyEvent};
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, RecvOutcome, State, Transport};
 use morsh_statesync::{Complete, UserEvent, UserStream};
 use portable_pty::PtySize;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -36,10 +36,14 @@ pub async fn run_server(
         command_args.len()
     );
 
+    let mut signals = Signals::new()?;
+    let timeouts = Timeouts::from_env();
     let mut transport = bind_transport(bind_port, desired_ip, &key).await?;
     tracing::info!("UDP transport ready, waiting for client on port {bind_port}");
 
-    let pty_size = wait_for_client(&mut transport).await?;
+    let Some(pty_size) = wait_for_client(&mut transport, &mut signals, &timeouts).await? else {
+        return Ok(());
+    };
 
     tracing::info!(
         "Client connected, spawning shell (remote_state_num={})",
@@ -62,7 +66,7 @@ pub async fn run_server(
         last_remote_num,
     };
 
-    handler.run().await
+    handler.run(&mut signals, &timeouts).await
 }
 
 async fn bind_transport(
@@ -70,30 +74,22 @@ async fn bind_transport(
     desired_ip: Option<&str>,
     key: &Base64Key,
 ) -> Result<ServerTransport, Box<dyn std::error::Error>> {
-    let session = Session::new(*key.data());
-
-    let connection = if let Some(ip) = desired_ip {
-        let addr = SocketAddr::new(
-            ip.parse::<std::net::IpAddr>()
-                .map_err(|e| format!("Invalid bind address: {e}"))?,
-            bind_port,
-        );
-        match Connection::new_server(addr, session).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!("Failed to bind to {}: {}, trying 0.0.0.0", ip, e);
-                let fallback: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-                Connection::new_server(fallback, Session::new(*key.data()))
-                    .await
-                    .map_err(|e| format!("Failed to bind: {e}"))?
+    let mut connection = None;
+    let mut last_error = String::new();
+    for mut address in crate::bind::addresses(desired_ip) {
+        address.set_port(bind_port);
+        match Connection::new_server(address, Session::new(*key.data())).await {
+            Ok(bound) => {
+                connection = Some(bound);
+                break;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to bind to {address}: {error}");
+                last_error = error;
             }
         }
-    } else {
-        let addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-        Connection::new_server(addr, session)
-            .await
-            .map_err(|e| format!("Failed to bind: {e}"))?
-    };
+    }
+    let connection = connection.ok_or_else(|| format!("Failed to bind: {last_error}"))?;
 
     Ok(Transport::new_server(
         connection,
@@ -102,9 +98,33 @@ async fn bind_transport(
     ))
 }
 
+/// Translate a resize from the wire into the dimensions accepted by the PTY.
+fn client_pty_size(width: i32, height: i32) -> Option<PtySize> {
+    // ConPTY passes dimensions through a signed COORD. Reject invalid sizes
+    // rather than turning transient zero sizes into 1x1 or wrapping the cast.
+    let max = if cfg!(windows) {
+        i16::MAX as i32
+    } else {
+        u16::MAX as i32
+    };
+    if !(1..=max).contains(&width) || !(1..=max).contains(&height) {
+        return None;
+    }
+    Some(PtySize {
+        rows: height as u16,
+        cols: width as u16,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
 /// Block until the client's first state arrives, and take the window size it
 /// asks for. Mosh releases the login shell at the same point.
-async fn wait_for_client(transport: &mut ServerTransport) -> Result<PtySize, Box<dyn std::error::Error>> {
+async fn wait_for_client(
+    transport: &mut ServerTransport,
+    signals: &mut Signals,
+    timeouts: &Timeouts,
+) -> Result<Option<PtySize>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + TIMEOUT_IF_NO_CLIENT;
     let mut pty_size = PtySize {
         rows: 24,
@@ -114,7 +134,15 @@ async fn wait_for_client(transport: &mut ServerTransport) -> Result<PtySize, Box
     };
 
     while transport.get_remote_state_num() == 0 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let last_state = transport.get_latest_remote_state().timestamp;
+        if timeouts.expired(last_state) {
+            eprintln!(
+                "Network idle for {} seconds.",
+                last_state.elapsed().as_secs()
+            );
+            return Ok(None);
+        }
+        let mut remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
                 "No connection within {} seconds",
@@ -123,7 +151,15 @@ async fn wait_for_client(transport: &mut ServerTransport) -> Result<PtySize, Box
             .into());
         }
 
+        if let Some(network_wait) = timeouts.remaining(last_state) {
+            remaining = remaining.min(network_wait);
+        }
         tokio::select! {
+            signal = signals.recv() => {
+                if matches!(signal, ShutdownSignal::Terminate) || timeouts.signal_expired(last_state) {
+                    return Ok(None);
+                }
+            }
             result = transport.recv() => match result {
                 Ok(RecvOutcome::NewState { num }) => {
                     tracing::info!("Client's first state: {num}");
@@ -144,27 +180,47 @@ async fn wait_for_client(transport: &mut ServerTransport) -> Result<PtySize, Box
     }
     for event in stream.events() {
         if let UserEvent::Resize { width, height } = event {
-            pty_size = PtySize {
-                rows: (*height).clamp(1, u16::MAX as i32) as u16,
-                cols: (*width).clamp(1, u16::MAX as i32) as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            };
+            if let Some(size) = client_pty_size(*width, *height) {
+                pty_size = size;
+            } else {
+                tracing::warn!("Ignoring invalid initial PTY resize: {width}x{height}");
+            }
             tracing::info!("Client initial resize: {}x{}", pty_size.cols, pty_size.rows);
         }
     }
 
-    Ok(pty_size)
+    Ok(Some(pty_size))
 }
 
 impl Handler {
-    async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run(
+        &mut self,
+        signals: &mut Signals,
+        timeouts: &Timeouts,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Entering serve loop");
 
         let result = loop {
-            let wait = self.wait_time();
+            let mut wait = self.wait_time();
+            if let Some(network_wait) =
+                timeouts.remaining(self.transport.get_latest_remote_state().timestamp)
+            {
+                if !self.transport.shutdown_in_progress() {
+                    wait = wait.min(network_wait);
+                }
+            }
 
             tokio::select! {
+                signal = signals.recv() => {
+                    if matches!(signal, ShutdownSignal::Terminate)
+                        || timeouts.signal_expired(self.transport.get_latest_remote_state().timestamp)
+                    {
+                        if self.transport.shutdown_in_progress() {
+                            break Ok(());
+                        }
+                        self.transport.start_shutdown();
+                    }
+                }
                 // `mpsc::Receiver::recv` and `Transport::recv` are both
                 // cancel-safe, so losing this race never drops an event.
                 Some(pty_event) = self.pty.rx.recv() => {
@@ -180,6 +236,13 @@ impl Handler {
 
             if self.handle_client_input().is_break() {
                 break Ok(());
+            }
+
+            if !self.transport.shutdown_in_progress()
+                && timeouts.expired(self.transport.get_latest_remote_state().timestamp)
+            {
+                tracing::info!("Network idle timeout");
+                self.transport.start_shutdown();
             }
 
             if self.housekeeping().is_break() {
@@ -213,8 +276,12 @@ impl Handler {
                 if self.transport.shutdown_in_progress() {
                     return;
                 }
+                let (data, exit) = pty::batch_output(data, &mut self.pty.rx);
                 if let Err(e) = self.transport.get_current_state_mut().act(&data) {
                     tracing::warn!("Terminal error: {e}");
+                }
+                if let Some(status) = exit {
+                    self.handle_pty_event(PtyEvent::Exited(status));
                 }
             }
             PtyEvent::Exited(status) => {
@@ -244,7 +311,7 @@ impl Handler {
         // ends a write as the Escape key, so a byte-at-a-time Shift+Left
         // (`ESC [ 1 ; 2 D`) reached the shell as Escape plus "[1;2D".
         let mut keys = Vec::new();
-        let events: Vec<UserEvent> = stream.events().to_vec();
+        let events = stream.events();
         for (i, event) in events.iter().enumerate() {
             match event {
                 UserEvent::UserByte(byte) => keys.push(*byte),
@@ -286,15 +353,20 @@ impl Handler {
     }
 
     fn apply_resize(&mut self, width: i32, height: i32) {
-        let w = width.clamp(1, u16::MAX as i32) as u16;
-        let h = height.clamp(1, u16::MAX as i32) as u16;
+        let Some(size) = client_pty_size(width, height) else {
+            tracing::warn!("Ignoring invalid PTY resize: {width}x{height}");
+            return;
+        };
+        let (w, h) = (size.cols, size.rows);
 
-        let _ = self.pty.master.resize(PtySize {
-            rows: h,
-            cols: w,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Err(error) = self.pty.master.resize(size) {
+            tracing::warn!("Failed to resize PTY to {w}x{h}: {error}");
+            // Stock mosh shuts down on a Unix ioctl error. A transient ConPTY
+            // failure keeps the Windows session at its last successful size.
+            #[cfg(unix)]
+            self.transport.start_shutdown();
+            return;
+        }
 
         if self.transport.shutdown_in_progress() {
             return;
@@ -303,12 +375,17 @@ impl Handler {
         // threw away everything on the screen.
         if let Err(e) = self.transport.get_current_state_mut().resize(w, h) {
             tracing::warn!("Failed to resize terminal: {e}");
+            self.transport.start_shutdown();
         }
         tracing::info!("Client resize: {w}x{h}");
     }
 
     /// Everything mosh's serve loop does between reading and ticking.
     fn housekeeping(&mut self) -> ControlFlow<()> {
+        // Unix child exit can precede the reader thread delivering its final
+        // output. Only the ordered PTY EOF event may start shutdown there.
+        // ConPTY does not close its output pipe, so Windows also polls exit.
+        #[cfg(windows)]
         if let Ok(Some(status)) = self.pty.child.try_wait() {
             tracing::info!("Child process exited with status {}", status.exit_code());
             self.transport.start_shutdown();
@@ -343,5 +420,278 @@ impl Handler {
     async fn shutdown(&mut self) {
         tracing::info!("Shutting down");
         let _ = self.pty.child.kill();
+        let _ = self.pty.child.wait();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initial_client_size_reaches_the_child_before_it_runs() {
+        let key = Base64Key::random();
+        let mut server = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let mut connection = Connection::new_client(Session::new(*key.data()))
+            .await
+            .unwrap();
+        connection.set_remote_addr(server.connection().local_addr().unwrap());
+        // The protocol baseline must be empty. Enqueue the initial resize
+        // after construction so it is transmitted rather than assumed shared.
+        let mut client = Transport::new_client(
+            connection,
+            UserStream::new(),
+            Complete::new(180, 52).unwrap(),
+        );
+        client.get_current_state_mut().push_resize(80, 24);
+        client.get_current_state_mut().push_resize(180, 52);
+        client.get_current_state_mut().push_resize(0, 0);
+        let mut signals = Signals::new().unwrap();
+        let timeouts = Timeouts::default();
+        let size = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                size = wait_for_client(&mut server, &mut signals, &timeouts) => size.unwrap().unwrap(),
+                _ = async {
+                    loop {
+                        client.tick().await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => unreachable!(),
+            }
+        }).await.unwrap();
+        assert_eq!((size.cols, size.rows), (180, 52));
+
+        let mut pty = pty::spawn_pty(
+            size,
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "stty size".into()],
+            &[],
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = pty.rx.recv().await {
+                match event {
+                    PtyEvent::Output(bytes) => output.extend(bytes),
+                    PtyEvent::Exited(_) => break,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pty.child.wait().unwrap().success());
+        assert_eq!(String::from_utf8(output).unwrap().trim(), "52 180");
+    }
+
+    #[tokio::test]
+    async fn invalid_bind_address_falls_back_to_any_interface() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("not-an-ip-address"), &key)
+            .await
+            .expect("stock mosh falls back when the desired address cannot be resolved");
+        assert!(transport
+            .connection()
+            .local_addr()
+            .unwrap()
+            .ip()
+            .is_unspecified());
+    }
+
+    #[test]
+    fn invalid_resize_does_not_turn_into_a_tiny_terminal() {
+        for (width, height) in [(0, 0), (0, 24), (80, 0), (-1, 24), (80, -1)] {
+            assert!(client_pty_size(width, height).is_none(), "{width}x{height}");
+        }
+        let size = client_pty_size(180, 52).unwrap();
+        assert_eq!((size.cols, size.rows), (180, 52));
+    }
+
+    struct FailedResize;
+
+    impl portable_pty::MasterPty for FailedResize {
+        fn resize(&self, _: PtySize) -> anyhow::Result<()> {
+            anyhow::bail!("native resize failed")
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_native_resize_does_not_desynchronize_the_terminal() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let mut pty = pty::spawn_pty(
+            PtySize::default(),
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "exit".into()],
+            &[],
+        )
+        .unwrap();
+        pty.master = Box::new(FailedResize);
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        handler.apply_resize(180, 52);
+        assert!(
+            handler.transport.shutdown_in_progress(),
+            "a native resize failure must be handled"
+        );
+        assert!(
+            handler
+                .transport
+                .get_current_state()
+                .state_equal(&Complete::new(80, 24).unwrap()),
+            "the synchronized screen must not claim an unsuccessful native resize"
+        );
+        handler.shutdown().await;
+    }
+
+    #[test]
+    fn batched_output_matches_individual_terminal_updates() {
+        let chunks: &[&[u8]] = &[
+            b"hello \x1b[3",
+            b"1mred\x1b[0m\r\n",
+            "caf".as_bytes(),
+            &[0xc3],
+            &[0xa9],
+            b"\r\n\x1b[2;4Hworld",
+        ];
+        let mut individual = Complete::new(80, 24).unwrap();
+        let mut batched = Complete::new(80, 24).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        for chunk in chunks {
+            individual.act(chunk).unwrap();
+            tx.try_send(PtyEvent::Output(chunk.to_vec())).ok().unwrap();
+        }
+        let (data, exit) = pty::batch_output(Vec::new(), &mut rx);
+        batched.act(&data).unwrap();
+        assert!(exit.is_none());
+        assert!(batched.state_equal(&individual));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual PTY throughput measurement"]
+    async fn pty_output_throughput() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let mut pty = pty::spawn_pty(
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "exit".into()],
+            &[],
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        pty.rx = rx;
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        let chunk = b"abcdefghijklmno\r\n".repeat(256); // 4352 bytes
+        let start = Instant::now();
+        let mut passes = 0;
+        for _ in 0..16 {
+            for _ in 0..64 {
+                tx.try_send(PtyEvent::Output(chunk.clone())).ok().unwrap();
+            }
+            while let Ok(event) = handler.pty.rx.try_recv() {
+                handler.handle_pty_event(event);
+                passes += 1;
+            }
+        }
+        eprintln!(
+            "PTY pipeline: {} bytes, {passes} terminal updates, {:?}",
+            chunk.len() * 1024,
+            start.elapsed()
+        );
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn child_exit_does_not_discard_pending_pty_output() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let pty = pty::spawn_pty(
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "printf final-output".into()],
+            &[],
+        )
+        .unwrap();
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handler.pty.child.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Child exit may be visible before the reader thread's output is handled.
+        let _ = handler.housekeeping();
+        assert!(
+            !handler.transport.shutdown_in_progress(),
+            "must consume PTY output before starting shutdown"
+        );
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = handler.pty.rx.recv().await {
+                match &event {
+                    PtyEvent::Output(bytes) => output.extend_from_slice(bytes),
+                    PtyEvent::Exited(_) => {
+                        handler.handle_pty_event(event);
+                        break;
+                    }
+                }
+                handler.handle_pty_event(event);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, b"final-output");
+        assert!(handler.transport.shutdown_in_progress());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_size_tests {
+    use super::*;
+
+    #[test]
+    fn conpty_sizes_fit_signed_coordinates() {
+        assert!(client_pty_size(i16::MAX as i32, i16::MAX as i32).is_some());
+        assert!(client_pty_size(i16::MAX as i32 + 1, 24).is_none());
+        assert!(client_pty_size(80, i16::MAX as i32 + 1).is_none());
+        assert!(client_pty_size(0, 0).is_none());
     }
 }
