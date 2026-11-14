@@ -521,13 +521,15 @@ impl<M: State, R: State> Transport<M, R> {
 
     /// Receive and process one datagram.
     ///
-    /// Cancel-safe. The only await is [`Connection::recv_raw`]; everything
+    /// Cancel-safe. The only await is inside [`Connection::recv`]; everything
     /// that mutates receiver state runs synchronously afterwards, so dropping
     /// this future in a `select!` cannot lose a packet that has already been
     /// taken off the socket.
     pub async fn recv(&mut self) -> Result<RecvOutcome, String> {
-        let (data, peer) = self.connection.recv_raw().await?;
-        self.process_datagram(&data, peer)
+        match self.connection.recv().await? {
+            Some(inst) => self.process_instruction(inst),
+            None => Ok(RecvOutcome::Incomplete),
+        }
     }
 
     /// The synchronous half of [`Transport::recv`], split out so tests can

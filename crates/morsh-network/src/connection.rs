@@ -1,10 +1,12 @@
 use crate::constants::*;
-use crate::fragment::{Fragment, FragmentAssembly, Fragmenter};
+use crate::fragment::{Fragment, FragmentAssembly, Fragmenter, Prepared};
 use crate::rtt::RttEstimator;
-use morsh_crypto::{Nonce, Session};
+use morsh_crypto::{Nonce, Session, NONCE_WIRE_LEN};
 use morsh_proto::transport::Instruction as TransportInstruction;
 use std::net::SocketAddr;
+use std::task::Poll;
 use std::time::{Duration, Instant};
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
 /// Largest datagram we will read. Mosh uses `Session::RECEIVE_MTU` (2048).
@@ -39,6 +41,29 @@ pub struct Connection {
     /// echoed back exactly once (mosh's `saved_timestamp` /
     /// `saved_timestamp_received_at`).
     saved_timestamp: Option<(u16, Instant)>,
+    /// Reused for every outgoing datagram, so sending does not allocate.
+    send_buf: Vec<u8>,
+    /// Every incoming datagram lands here and is decrypted in place.
+    recv_buf: Box<[u8]>,
+}
+
+/// Mosh's `Packet::toMessage` framing, sealed in place: `buf` becomes
+/// `[nonce][timestamp][timestamp_reply][fragment header][payload][tag]`.
+fn frame_and_seal(
+    session: &mut Session,
+    buf: &mut Vec<u8>,
+    nonce: &Nonce,
+    timestamps: [u16; 2],
+    header: &[u8],
+    payload: &[u8],
+) {
+    buf.clear();
+    buf.resize(NONCE_WIRE_LEN, 0);
+    buf.extend_from_slice(&timestamps[0].to_be_bytes());
+    buf.extend_from_slice(&timestamps[1].to_be_bytes());
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(payload);
+    session.seal(nonce, buf);
 }
 
 /// Current time in milliseconds as a 16-bit value (mod 65536), never 0xFFFF.
@@ -197,6 +222,8 @@ impl Connection {
             expected_receiver_seq: 0,
             mtu,
             saved_timestamp: None,
+            send_buf: Vec::with_capacity(RECEIVE_MTU),
+            recv_buf: vec![0; RECEIVE_MTU].into_boxed_slice(),
         }
     }
 
@@ -284,17 +311,16 @@ impl Connection {
         let Some(remote) = self.remote_addr.filter(|_| self.has_remote_addr) else {
             return Ok(());
         };
-        let frags = self
-            .fragger
-            .make_fragments(inst, max_fragment_payload(self.mtu))?;
+        let prepared = self.prepare_instruction(inst)?;
 
         let mut error = None;
-        for frag in &frags {
-            let wire = self.encrypt_fragment(frag)?;
+        for index in 0..prepared.count {
+            self.seal_datagram(&prepared, index)?;
             let Some(socket) = self.sockets.last() else {
                 return Err("No sockets open".into());
             };
-            match socket.send_to(&wire, remote).await {
+            let wire = &self.send_buf;
+            match socket.send_to(wire, remote).await {
                 Ok(n) if n == wire.len() => {}
                 Ok(n) => error = Some(format!("sendto: short write ({n} of {})", wire.len())),
                 Err(e) => {
@@ -308,6 +334,44 @@ impl Connection {
 
         self.check_server_association(Instant::now());
         error.map_or(Ok(()), Err)
+    }
+
+    /// Serialize, compress and split `inst` for the current MTU. The first
+    /// half of [`Connection::send`]; public for benchmarks.
+    pub fn prepare_instruction(&mut self, inst: &TransportInstruction) -> Result<Prepared, String> {
+        self.fragger.prepare(inst, max_fragment_payload(self.mtu))
+    }
+
+    /// Frame and encrypt fragment `index` of a prepared instruction,
+    /// returning the datagram. Each call consumes a sequence number. The
+    /// second half of [`Connection::send`]; public for benchmarks.
+    pub fn seal_datagram(&mut self, prepared: &Prepared, index: usize) -> Result<&[u8], String> {
+        let now = Instant::now();
+        let timestamps = [timestamp16(), self.take_timestamp_reply(now)];
+        let nonce = self.next_nonce()?;
+        let (header, payload) = self.fragger.fragment(prepared, index);
+        frame_and_seal(
+            &mut self.session,
+            &mut self.send_buf,
+            &nonce,
+            timestamps,
+            &header,
+            payload,
+        );
+        Ok(&self.send_buf)
+    }
+
+    /// The nonce for the next outgoing packet: the direction bit (set for
+    /// server→client, mosh's `TO_CLIENT`) and a 63-bit sequence number that
+    /// must never repeat under one key.
+    fn next_nonce(&mut self) -> Result<Nonce, String> {
+        if self.send_seq & TO_CLIENT_BIT != 0 {
+            return Err("Sequence numbers exhausted; refusing to reuse a nonce".into());
+        }
+        let direction = if self.server { TO_CLIENT_BIT } else { 0 };
+        let nonce = Nonce::from_val(direction | self.send_seq);
+        self.send_seq += 1;
+        Ok(nonce)
     }
 
     /// Mosh's server forgets a client it has not heard from for
@@ -324,52 +388,70 @@ impl Connection {
         }
     }
 
-    /// Await one datagram on *any* open socket.
+    /// Receive one datagram on *any* open socket and process it; see
+    /// [`Connection::process_incoming`].
     ///
-    /// Cancel-safe: the only await point is `recv_from`, which tokio
-    /// guarantees loses no data if the future is dropped. All sockets are
-    /// polled concurrently, so a datagram arriving on a socket opened by
-    /// [`Connection::hop_port`] is seen even while the original socket is idle
-    /// — a sequential loop would block forever on socket 0 and never poll the
-    /// others.
-    pub async fn recv_raw(&self) -> Result<(Vec<u8>, SocketAddr), String> {
-        if self.sockets.is_empty() {
+    /// Cancel-safe: the only await point polls the sockets, and tokio's
+    /// `poll_recv_from` loses no data when it returns `Pending`; everything
+    /// after it is synchronous. All sockets are polled, so a datagram
+    /// arriving on a socket opened by [`Connection::hop_port`] is seen even
+    /// while the original socket is idle.
+    pub async fn recv(&mut self) -> Result<Option<TransportInstruction>, String> {
+        let (len, peer) = self.recv_datagram().await?;
+        self.process_received(len, peer)
+    }
+
+    /// Await a datagram into `recv_buf`.
+    async fn recv_datagram(&mut self) -> Result<(usize, SocketAddr), String> {
+        let Self {
+            sockets, recv_buf, ..
+        } = self;
+        if sockets.is_empty() {
             return Err("No sockets open".into());
         }
-
-        let mut receives = Vec::with_capacity(self.sockets.len());
-        for sock in &self.sockets {
-            receives.push(Box::pin(async move {
-                let mut buf = [0u8; RECEIVE_MTU];
-                match sock.recv_from(&mut buf).await {
-                    Ok((len, peer)) => Ok((buf[..len].to_vec(), peer)),
-                    Err(e) => Err(format!("Recv error: {e}")),
+        std::future::poll_fn(|cx| {
+            for socket in sockets.iter() {
+                let mut buf = ReadBuf::new(recv_buf);
+                match socket.poll_recv_from(cx, &mut buf) {
+                    Poll::Ready(Ok(peer)) => return Poll::Ready(Ok((buf.filled().len(), peer))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(format!("Recv error: {e}"))),
+                    Poll::Pending => {}
                 }
-            }));
-        }
-
-        let (result, _index, _remaining) = futures::future::select_all(receives).await;
-        result
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     /// Decrypt, validate, and reassemble one datagram.
     ///
     /// Returns `Ok(None)` while a fragmented instruction is still incomplete.
-    /// Purely synchronous, so callers can run it after a cancel-safe
-    /// [`Connection::recv_raw`] without risking a lost packet.
     pub fn process_incoming(
         &mut self,
         data: &[u8],
         peer: SocketAddr,
     ) -> Result<Option<TransportInstruction>, String> {
-        let msg = self
+        let Some(dest) = self.recv_buf.get_mut(..data.len()) else {
+            return Err(format!("Received oversize datagram ({} bytes)", data.len()));
+        };
+        dest.copy_from_slice(data);
+        self.process_received(data.len(), peer)
+    }
+
+    /// Process the datagram in `recv_buf[..len]`, decrypting it in place.
+    fn process_received(
+        &mut self,
+        len: usize,
+        peer: SocketAddr,
+    ) -> Result<Option<TransportInstruction>, String> {
+        let (nonce, text) = self
             .session
-            .decrypt(data)
+            .open(&mut self.recv_buf[..len])
             .map_err(|e| format!("Decryption error: {e}"))?;
 
         // Prevent malicious playback to the sender: a packet we sent must
         // never be accepted as one we received.
-        let nonce_val = msg.nonce.val();
+        let nonce_val = nonce.val();
         let to_client = nonce_val & TO_CLIENT_BIT != 0;
         if to_client == self.server {
             return Err(format!(
@@ -379,10 +461,9 @@ impl Connection {
         }
         let seq = nonce_val & !TO_CLIENT_BIT;
 
-        if msg.text.len() < 4 {
-            return Err(format!("Message too short: {} bytes", msg.text.len()));
-        }
-        let frag = Fragment::from_bytes(&msg.text[4..])?;
+        let Some((timestamps, fragment)) = text.split_first_chunk::<4>() else {
+            return Err(format!("Message too short: {} bytes", text.len()));
+        };
 
         // Out-of-order (or replayed) packets are still delivered to the state
         // synchronizer — which has its own idempotency guards — but they must
@@ -393,15 +474,16 @@ impl Connection {
                 seq,
                 self.expected_receiver_seq
             );
-            return self.assembler.add_fragment(frag);
+            return self.assembler.add_fragment_bytes(fragment);
         }
         self.expected_receiver_seq = seq + 1;
 
-        let timestamp = u16::from_be_bytes([msg.text[0], msg.text[1]]);
-        let timestamp_reply = u16::from_be_bytes([msg.text[2], msg.text[3]]);
+        let timestamp = u16::from_be_bytes([timestamps[0], timestamps[1]]);
+        let timestamp_reply = u16::from_be_bytes([timestamps[2], timestamps[3]]);
 
+        let now = Instant::now();
         if timestamp != 0xFFFF {
-            self.saved_timestamp = Some((timestamp, Instant::now()));
+            self.saved_timestamp = Some((timestamp, now));
         }
 
         // The only RTT measurement: how long ago the peer echoed back a
@@ -412,10 +494,9 @@ impl Connection {
         if timestamp_reply != 0xFFFF {
             let rtt = timestamp_diff(timestamp16(), timestamp_reply);
             self.rtt.update(f64::from(rtt));
-            tracing::debug!("RTT measurement: {rtt}ms");
+            tracing::trace!("RTT measurement: {rtt}ms");
         }
 
-        let now = Instant::now();
         self.last_heard = now;
         self.has_remote_addr = true;
 
@@ -426,8 +507,9 @@ impl Connection {
             self.remote_addr = Some(peer);
         }
 
+        let result = self.assembler.add_fragment_bytes(fragment);
         self.prune_sockets(now);
-        self.assembler.add_fragment(frag)
+        result
     }
 
     /// Check if we should hop ports (client only).
@@ -514,34 +596,22 @@ impl Connection {
         }
     }
 
-    /// Encrypt a fragment (public for testing).
+    /// Frame and encrypt a single fragment (for tests).
     /// Stock mosh message format: [timestamp 2B BE] [timestamp_reply 2B BE] [fragment data]
     pub fn encrypt_fragment(&mut self, frag: &Fragment) -> Result<Vec<u8>, String> {
-        let frag_bytes = frag.to_bytes();
-        // Build timestamps (stock mosh compatible):
-        // timestamp = current ms mod 65536 (never 0xFFFF)
-        // timestamp_reply = 0xFFFF (no reply), or corrected echo of received timestamp
-        let ts = timestamp16();
-        let ts_reply = self.take_timestamp_reply(Instant::now());
-
-        let mut plaintext = Vec::with_capacity(4 + frag_bytes.len());
-        plaintext.extend_from_slice(&ts.to_be_bytes());
-        plaintext.extend_from_slice(&ts_reply.to_be_bytes());
-        plaintext.extend_from_slice(&frag_bytes);
-
-        // Build nonce: direction bit (bit 63) + sequence number
-        // Stock mosh convention: TO_SERVER = 0, TO_CLIENT = 1 << 63
-        // Client→Server uses TO_SERVER (0), Server→Client uses TO_CLIENT (1<<63)
-        let nonce_val = if self.server {
-            TO_CLIENT_BIT | self.send_seq
-        } else {
-            self.send_seq
-        };
-        let nonce = Nonce::from_val(nonce_val);
-        self.send_seq += 1;
-        let msg = morsh_crypto::Message::new(nonce, plaintext);
-        let ciphertext = self.session.encrypt(&msg);
-        Ok(ciphertext)
+        let timestamps = [timestamp16(), self.take_timestamp_reply(Instant::now())];
+        let nonce = self.next_nonce()?;
+        let bytes = frag.to_bytes();
+        let mut wire = Vec::new();
+        frame_and_seal(
+            &mut self.session,
+            &mut wire,
+            &nonce,
+            timestamps,
+            &[],
+            &bytes,
+        );
+        Ok(wire)
     }
 }
 
@@ -879,11 +949,11 @@ mod tests {
             .send(&instruction(1))
             .await
             .expect("send to IPv6 server");
-        let (data, peer) = tokio::time::timeout(Duration::from_secs(5), server.recv_raw())
+        let inst = tokio::time::timeout(Duration::from_secs(5), server.recv())
             .await
             .expect("datagram should arrive")
+            .unwrap()
             .unwrap();
-        let inst = server.process_incoming(&data, peer).unwrap().unwrap();
         assert_eq!(inst.new_num, Some(1));
 
         client.hop_port().await.unwrap();

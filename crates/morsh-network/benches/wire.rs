@@ -100,14 +100,13 @@ fn large_diff() -> Vec<u8> {
     d
 }
 
-/// Every datagram `client` would put on the wire for `inst`.
-fn wire_for(client: &mut Connection, fragger: &mut Fragmenter, inst: &Instruction) -> Vec<Vec<u8>> {
-    fragger
-        .make_fragments(inst, max_fragment_payload(MTU_IPV4))
-        .unwrap()
-        .iter()
-        .map(|f| client.encrypt_fragment(f).unwrap())
-        .collect()
+/// Every datagram `conn` would put on the wire for `inst`, handed to
+/// `emit` one at a time exactly as `Connection::send` does.
+fn for_each_datagram(conn: &mut Connection, inst: &Instruction, mut emit: impl FnMut(&[u8])) {
+    let prepared = conn.prepare_instruction(inst).unwrap();
+    for i in 0..prepared.count {
+        emit(conn.seal_datagram(&prepared, i).unwrap());
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -132,19 +131,28 @@ async fn main() {
         // Send: fragment, compress, frame and encrypt one instruction.
         let mut client = Connection::new_client(Session::new(key)).await.unwrap();
         client.set_remote_addr(peer);
-        let mut fragger = Fragmenter::new();
+        // Building the instruction (two allocations: diff and chaff) is
+        // part of each operation, as it is in the transport.
         let mut n = 0u64;
         measure(&format!("send_{label}"), || {
             n += 1;
             let inst = instruction(n, diff.clone());
-            black_box(wire_for(&mut client, &mut fragger, black_box(&inst)));
+            for_each_datagram(&mut client, black_box(&inst), |d| {
+                black_box(d);
+            });
         });
 
         // Receive: decrypt, validate, reassemble and decode, in order.
         let mut sender = Connection::new_client(Session::new(key)).await.unwrap();
-        let mut fragger = Fragmenter::new();
+        sender.set_remote_addr(peer);
         let datagrams: Vec<Vec<Vec<u8>>> = (1..=CALLS as u64)
-            .map(|n| wire_for(&mut sender, &mut fragger, &instruction(n, diff.clone())))
+            .map(|n| {
+                let mut out = Vec::new();
+                for_each_datagram(&mut sender, &instruction(n, diff.clone()), |d| {
+                    out.push(d.to_vec())
+                });
+                out
+            })
             .collect();
         let mut server = Connection::new_server(server_addr, Session::new(key))
             .await
