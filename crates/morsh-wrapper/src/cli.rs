@@ -42,6 +42,14 @@ pub(crate) struct Args {
     #[arg(long = "predict", default_value = "adaptive", value_parser = ["adaptive", "always", "never"])]
     pub(crate) predict: String,
 
+    /// Do not send terminal initialization and restoration sequences.
+    #[arg(long, overrides_with = "init")]
+    pub(crate) no_init: bool,
+
+    /// Send terminal initialization and restoration sequences (default).
+    #[arg(long, overrides_with = "no_init")]
+    init: bool,
+
     /// Control the IP address that morsh-server binds to:
     ///   ssh  - bind to the IP from SSH_CONNECTION (default)
     ///   any  - bind to 0.0.0.0
@@ -80,6 +88,15 @@ pub(crate) struct Args {
     /// Default: auto.
     #[arg(long = "remote-shell", default_value = "auto")]
     pub(crate) remote_shell: String,
+}
+
+impl Args {
+    pub(crate) fn configure_client(&self, command: &mut std::process::Command) {
+        // mosh.pl preserves an inherited value unless --no-init is selected.
+        if self.no_init && !self.init {
+            command.env("MOSH_NO_TERM_INIT", "1");
+        }
+    }
 }
 
 fn parse_port_range(value: &str) -> Result<String, String> {
@@ -124,6 +141,35 @@ mod tests {
     fn empty_or_malformed_ssh_commands_are_rejected() {
         for value in ["", "   ", "ssh -o 'unterminated"] {
             assert!(Args::try_parse_from(["morsh", "--ssh", value, "host"]).is_err());
+        }
+    }
+
+    #[test]
+    fn stock_terminal_init_flags_are_accepted() {
+        assert!(Args::try_parse_from(["morsh", "--no-init", "host"]).is_ok());
+        assert!(Args::try_parse_from(["morsh", "--init", "host"]).is_ok());
+    }
+
+    #[test]
+    fn no_init_is_forwarded_only_to_the_client_and_last_flag_wins() {
+        for (flags, expected) in [
+            (vec![], false),
+            (vec!["--no-init"], true),
+            (vec!["--init"], false),
+            (vec!["--no-init", "--init"], false),
+            (vec!["--init", "--no-init"], true),
+        ] {
+            let args =
+                Args::try_parse_from(["morsh"].into_iter().chain(flags).chain(["host"])).unwrap();
+            let mut command = std::process::Command::new("morsh-client");
+            args.configure_client(&mut command);
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == "MOSH_NO_TERM_INIT");
+            assert_eq!(value.is_some(), expected);
+            if let Some((_, value)) = value {
+                assert_eq!(value.unwrap(), "1");
+            }
         }
     }
 

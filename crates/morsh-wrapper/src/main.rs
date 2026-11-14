@@ -150,7 +150,9 @@ fn main() {
         .and_then(|p| p.parent().map(|d| d.join("morsh-client")))
         .unwrap_or_else(|| "morsh-client".into());
 
-    let exit_status = Command::new(&client_path)
+    let mut client = Command::new(&client_path);
+    args.configure_client(&mut client);
+    let exit_status = client
         .arg(&server_addr)
         .env("MORSH_KEY", &info.key)
         .env("MOSH_PREDICTION_DISPLAY", &args.predict)
