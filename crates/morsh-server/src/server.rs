@@ -104,7 +104,9 @@ async fn bind_transport(
 
 /// Block until the client's first state arrives, and take the window size it
 /// asks for. Mosh releases the login shell at the same point.
-async fn wait_for_client(transport: &mut ServerTransport) -> Result<PtySize, Box<dyn std::error::Error>> {
+async fn wait_for_client(
+    transport: &mut ServerTransport,
+) -> Result<PtySize, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + TIMEOUT_IF_NO_CLIENT;
     let mut pty_size = PtySize {
         rows: 24,
@@ -309,6 +311,10 @@ impl Handler {
 
     /// Everything mosh's serve loop does between reading and ticking.
     fn housekeeping(&mut self) -> ControlFlow<()> {
+        // Unix child exit can precede the reader thread delivering its final
+        // output. Only the ordered PTY EOF event may start shutdown there.
+        // ConPTY does not close its output pipe, so Windows also polls exit.
+        #[cfg(windows)]
         if let Ok(Some(status)) = self.pty.child.try_wait() {
             tracing::info!("Child process exited with status {}", status.exit_code());
             self.transport.start_shutdown();
@@ -343,5 +349,65 @@ impl Handler {
     async fn shutdown(&mut self) {
         tracing::info!("Shutting down");
         let _ = self.pty.child.kill();
+        let _ = self.pty.child.wait();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn child_exit_does_not_discard_pending_pty_output() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let pty = pty::spawn_pty(
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "printf final-output".into()],
+            &[],
+        )
+        .unwrap();
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handler.pty.child.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Child exit may be visible before the reader thread's output is handled.
+        let _ = handler.housekeeping();
+        assert!(
+            !handler.transport.shutdown_in_progress(),
+            "must consume PTY output before starting shutdown"
+        );
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = handler.pty.rx.recv().await {
+                match &event {
+                    PtyEvent::Output(bytes) => output.extend_from_slice(bytes),
+                    PtyEvent::Exited(_) => {
+                        handler.handle_pty_event(event);
+                        break;
+                    }
+                }
+                handler.handle_pty_event(event);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, b"final-output");
+        assert!(handler.transport.shutdown_in_progress());
     }
 }
