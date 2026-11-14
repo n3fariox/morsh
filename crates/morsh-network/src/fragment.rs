@@ -399,51 +399,70 @@ fn compress_into(deflate: &mut Compress, input: &[u8], out: &mut Vec<u8>) -> Res
     }
 }
 
-/// Inflate a zlib stream into `out`, refusing to grow it past
+/// Inflate a zlib stream into `out`, refusing anything that inflates past
 /// [`MAX_INSTRUCTION_LEN`].
+///
+/// The bound is on bytes written, never on `out`'s capacity: the buffer is
+/// reused, so after a large instruction its capacity can exceed the limit.
+/// The window handed to the inflater never extends past
+/// `MAX_INSTRUCTION_LEN + 1` bytes, so an oversize stream is caught whether
+/// or not it reaches `StreamEnd`.
 fn decompress_into(
     inflate: &mut Decompress,
     input: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
+    const LIMIT: usize = MAX_INSTRUCTION_LEN + 1;
     let corrupt = |what: &dyn std::fmt::Display| {
         format!(
             "Zlib decompression error: {what} (data_len={})",
             input.len()
         )
     };
+    let too_big = || format!("Instruction inflates beyond {MAX_INSTRUCTION_LEN} bytes");
+
     inflate.reset(true);
     out.clear();
-    out.reserve(
-        input
-            .len()
-            .saturating_mul(4)
-            .clamp(256, MAX_INSTRUCTION_LEN),
-    );
-    loop {
+    out.resize(input.len().saturating_mul(4).clamp(256, LIMIT), 0);
+    let mut written = 0;
+    let result = loop {
+        if written == out.len() {
+            if written >= LIMIT {
+                break Err(too_big());
+            }
+            let grown = written.saturating_mul(2).min(LIMIT);
+            out.resize(grown, 0);
+        }
         let consumed = inflate.total_in() as usize;
         let produced = inflate.total_out();
-        // `Finish` makes miniz_oxide fail outright when the output buffer is
+        // `Finish` makes miniz_oxide fail outright when the output window is
         // too small on the first call; `None` resumes cleanly.
-        let status = inflate
-            .decompress_vec(&input[consumed..], out, FlushDecompress::None)
-            .map_err(|e| corrupt(&e))?;
+        let status = match inflate.decompress(
+            &input[consumed..],
+            &mut out[written..],
+            FlushDecompress::None,
+        ) {
+            Ok(status) => status,
+            Err(e) => break Err(corrupt(&e)),
+        };
+        written += (inflate.total_out() - produced) as usize;
         if status == Status::StreamEnd {
-            return Ok(());
+            break if written > MAX_INSTRUCTION_LEN {
+                Err(too_big())
+            } else {
+                Ok(())
+            };
         }
-        if out.len() == out.capacity() {
-            if out.len() >= MAX_INSTRUCTION_LEN {
-                return Err(format!(
-                    "Instruction inflates beyond {MAX_INSTRUCTION_LEN} bytes"
-                ));
-            }
-            let grow = out.len().max(256).min(MAX_INSTRUCTION_LEN - out.len());
-            out.reserve_exact(grow);
-        } else if inflate.total_in() as usize == consumed && inflate.total_out() == produced {
+        if written < out.len()
+            && inflate.total_in() as usize == consumed
+            && inflate.total_out() == produced
+        {
             // Room to write, yet no progress: the input ended mid-stream.
-            return Err(corrupt(&"truncated stream"));
+            break Err(corrupt(&"truncated stream"));
         }
-    }
+    };
+    out.truncate(written);
+    result
 }
 
 #[cfg(test)]
@@ -658,6 +677,56 @@ mod tests {
             });
         }
         let err = result.unwrap_err();
+        assert!(err.contains("inflates beyond"), "{err}");
+    }
+
+    fn pseudorandom(n: usize) -> Vec<u8> {
+        let mut x = 123_456_789u32;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// Review repro: large valid instructions grow the reused inflate buffer
+    /// past the limit, which must not let a later oversize one through.
+    #[test]
+    fn reused_inflater_still_enforces_the_limit() {
+        let mut fragger = Fragmenter::new();
+        let mut assembler = FragmentAssembly::new();
+        let mut deliver = |n: u64, diff: Vec<u8>| {
+            let mut result = Ok(None);
+            for frag in fragger.make_fragments(&inst(n - 1, n, diff), 1200).unwrap() {
+                result = assembler.add_fragment(frag);
+                if result.is_err() {
+                    break;
+                }
+            }
+            result
+        };
+        assert!(deliver(1, pseudorandom(700_000)).unwrap().is_some());
+        assert!(deliver(2, pseudorandom(1_000_000)).unwrap().is_some());
+        let err = deliver(3, vec![0; MAX_INSTRUCTION_LEN + 100_000]).unwrap_err();
+        assert!(err.contains("inflates beyond"), "{err}");
+        // And the assembler still works afterwards.
+        assert!(deliver(4, b"ok".to_vec()).unwrap().is_some());
+    }
+
+    /// Exactly at the limit is accepted, one byte over is not, even with a
+    /// warm buffer larger than the limit.
+    #[test]
+    fn limit_is_exact_with_a_reused_buffer() {
+        let mut inflate = Decompress::new(true);
+        let mut out = Vec::with_capacity(MAX_INSTRUCTION_LEN * 2);
+        let at = compress(&vec![0u8; MAX_INSTRUCTION_LEN]).unwrap();
+        let over = compress(&vec![0u8; MAX_INSTRUCTION_LEN + 1]).unwrap();
+        decompress_into(&mut inflate, &at, &mut out).unwrap();
+        assert_eq!(out.len(), MAX_INSTRUCTION_LEN);
+        let err = decompress_into(&mut inflate, &over, &mut out).unwrap_err();
         assert!(err.contains("inflates beyond"), "{err}");
     }
 
