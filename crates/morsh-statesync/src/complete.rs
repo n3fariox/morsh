@@ -86,14 +86,13 @@ impl Complete {
 
     /// Feed raw host (PTY) output into the terminal.
     ///
-    /// Mosh's `Complete::act`, which also returns what the terminal wants to
-    /// write back to the host. libghostty-vt does not surface terminal replies
-    /// through this API, so nothing is returned; queries such as DA/DSR go
-    /// unanswered, exactly as before this change.
-    pub fn act(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.terminal_mut()?.write(bytes);
+    /// Mosh's `Complete::act`: the returned bytes must be written back to the
+    /// host PTY. They answer the device attribute, status, and cursor queries
+    /// supported by stock mosh 1.4.0.
+    pub fn act(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let replies = self.terminal_mut()?.write_with_replies(bytes);
         self.refresh();
-        Ok(())
+        Ok(replies)
     }
 
     /// Resize the terminal, preserving its contents.
@@ -273,6 +272,35 @@ impl State for Complete {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn host_queries_return_stock_mosh_replies() {
+        let mut state = Complete::new(120, 40).unwrap();
+        let replies = state.act(b"\x1b[c\x1b[>c\x1b[5n\x1b[6n").unwrap();
+        assert_eq!(replies, b"\x1b[?62c\x1b[>1;10;0c\x1b[0n\x1b[1;1R");
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_queries_report_the_position_at_each_query_and_after_resize() {
+        let mut state = Complete::new(120, 40).unwrap();
+        let replies = state.act(b"\x1b[999;999H\x1b[6n\x1b[H\x1b[6n").unwrap();
+        assert_eq!(replies, b"\x1b[40;120R\x1b[1;1R");
+        state.resize(320, 80).unwrap();
+        assert_eq!(state.act(b"\x1b[999;999H\x1b[6n").unwrap(), b"\x1b[80;320R");
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_query_fragments_survive_pty_read_boundaries() {
+        let mut state = Complete::new(80, 24).unwrap();
+        for byte in b"\x1b[3;7H\x1b[6" {
+            assert!(state.act(&[*byte]).unwrap().is_empty());
+        }
+        assert_eq!(state.act(b"n").unwrap(), b"\x1b[3;7R");
+        assert!(state.act(b"text").unwrap().is_empty());
+    }
 
     #[test]
     #[serial]

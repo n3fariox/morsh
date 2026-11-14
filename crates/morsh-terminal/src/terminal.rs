@@ -1,3 +1,5 @@
+use crate::queries::{Query, QueryParser};
+use std::io::Write as _;
 use libghostty_vt::render::RenderState;
 use libghostty_vt::style::RgbColor as VtRgbColor;
 use libghostty_vt::screen::CellWide;
@@ -14,6 +16,7 @@ pub struct MoshTerminal {
     cols: u16,
     rows: u16,
     frame: u64,
+    queries: QueryParser,
 }
 
 impl MoshTerminal {
@@ -31,12 +34,38 @@ impl MoshTerminal {
             cols,
             rows,
             frame: 0,
+            queries: QueryParser::default(),
         })
     }
 
     /// Feed raw VT output bytes from the server (or PTY) into the terminal.
     pub fn write(&mut self, data: &[u8]) {
-        self.terminal.vt_write(data);
+        let _ = self.write_with_replies(data);
+    }
+
+    /// Apply host output and return the query replies stock mosh sends to the PTY.
+    /// Replies use the cursor at the query, even if later bytes move it again.
+    pub fn write_with_replies(&mut self, data: &[u8]) -> Vec<u8> {
+        let data = self.queries.normalize(data);
+        let mut replies = Vec::new();
+        let mut start = 0;
+        while let Some((end, query)) = self.queries.next_query(&data[start..]) {
+            let end = start + end;
+            self.terminal.vt_write(&data[start..end]);
+            start = end;
+            match query {
+                Query::PrimaryAttributes => replies.extend_from_slice(b"\x1b[?62c"),
+                Query::SecondaryAttributes => replies.extend_from_slice(b"\x1b[>1;10;0c"),
+                Query::Status => replies.extend_from_slice(b"\x1b[0n"),
+                Query::Cursor => {
+                    let row = u32::from(self.terminal.cursor_y().unwrap_or(0)) + 1;
+                    let col = u32::from(self.terminal.cursor_x().unwrap_or(0)) + 1;
+                    let _ = write!(replies, "\x1b[{row};{col}R");
+                }
+            }
+        }
+        self.terminal.vt_write(&data[start..]);
+        replies
     }
 
     /// Resize the terminal (cell_width_px/cell_height_px default to 0 when unknown).
