@@ -23,6 +23,8 @@ pub enum TermEvent {
     /// Show (true) or take down (false) the escape key help.
     EscapeHelp(bool),
     Quit,
+    /// The terminal has no more input to give (end of file or a read error).
+    Closed,
 }
 
 /// The escape key and how to type it literally, set from `MOSH_ESCAPE_KEY`
@@ -241,7 +243,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
                 Ok(0) => break,
                 Ok(n) => {
                     if !publish(&mut escape, &buf[..n], &term_tx) {
-                        break;
+                        return;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -251,6 +253,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
                 }
             }
         }
+        let _ = term_tx.blocking_send(TermEvent::Closed);
     });
 }
 
@@ -290,6 +293,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
                     "ReadConsoleInputW failed: {}",
                     std::io::Error::last_os_error()
                 );
+                let _ = term_tx.blocking_send(TermEvent::Closed);
                 break;
             }
 
@@ -457,16 +461,25 @@ pub fn handle_term_event(
             tracing::info!("Resize: {w}x{h}");
             false
         }
-        TermEvent::Quit => {
-            if transport.has_remote_addr() {
-                notifications.set_notification("Exiting on user request...".to_string(), true);
-                transport.start_shutdown();
-                false
-            } else {
-                true
-            }
-        }
+        TermEvent::Quit => shut_down(transport, notifications, "Exiting on user request..."),
+        // Like stock mosh, losing the terminal ends the session.
+        TermEvent::Closed => shut_down(transport, notifications, "Exiting..."),
     }
+}
+
+/// Tell the server we are leaving, saying why. Returns true if there is no
+/// server to tell, so the client should exit straight away.
+fn shut_down(
+    transport: &mut ClientTransport,
+    notifications: &mut NotificationEngine,
+    why: &str,
+) -> bool {
+    if !transport.has_remote_addr() {
+        return true;
+    }
+    notifications.set_notification(why.to_string(), true);
+    transport.start_shutdown();
+    false
 }
 
 #[cfg(test)]
