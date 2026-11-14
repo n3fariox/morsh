@@ -6,9 +6,30 @@ pub(crate) struct ConnectInfo {
     pub(crate) ip: Option<String>,
 }
 
+/// A shared stdout collector for the system and built-in SSH backends.
+#[derive(Default)]
+pub(crate) struct ConnectRecord {
+    record: Option<Result<ConnectInfo, String>>,
+}
+
+impl ConnectRecord {
+    pub(crate) fn observe(&mut self, line: &str) {
+        if self.record.is_none() && line.starts_with("MOSH CONNECT ") {
+            self.record = Some(
+                ConnectInfo::parse(line)
+                    .ok_or_else(|| format!("Bad MOSH CONNECT string: {}", line.trim_end())),
+            );
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<Option<ConnectInfo>, String> {
+        self.record.transpose()
+    }
+}
+
 impl ConnectInfo {
     pub(crate) fn read_output(mut reader: impl std::io::BufRead) -> std::io::Result<Option<Self>> {
-        let mut info = None;
+        let mut record = ConnectRecord::default();
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -16,13 +37,13 @@ impl ConnectInfo {
                 break;
             }
             let line = String::from_utf8_lossy(&line);
-            if info.is_none() {
-                info = Self::parse(&line);
-            }
+            record.observe(&line);
             // Keep draining after CONNECT: ssh may otherwise block on a full
             // stdout pipe while the caller waits for its exit status.
         }
-        Ok(info)
+        record
+            .finish()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     pub(crate) fn parse(line: &str) -> Option<Self> {
@@ -65,6 +86,52 @@ mod tests {
     fn non_utf8_login_banner_does_not_hide_connect_record() {
         let bytes = b"\xff\xfe login\nMOSH CONNECT 60001 abcdefghijklmnopqrstuv\n";
         assert!(ConnectInfo::read_output(&bytes[..]).unwrap().is_some());
+    }
+
+    #[test]
+    fn both_collectors_keep_the_first_connect_record() {
+        let lines = [
+            "MOSH CONNECT 60001 abcdefghijklmnopqrstuv",
+            "MOSH CONNECT 60002 abcdefghijklmnopqrstuv",
+        ];
+        let mut record = ConnectRecord::default();
+        for line in lines {
+            record.observe(line);
+        }
+        assert_eq!(record.finish().unwrap().unwrap().port, 60001);
+        let stdout = lines.join("\n");
+        assert_eq!(
+            ConnectInfo::read_output(stdout.as_bytes())
+                .unwrap()
+                .unwrap()
+                .port,
+            60001
+        );
+    }
+
+    #[test]
+    fn malformed_first_connect_is_an_error_even_if_a_valid_one_follows() {
+        let lines = [
+            "MOSH CONNECT broken",
+            "MOSH CONNECT 60001 abcdefghijklmnopqrstuv",
+        ];
+        let mut record = ConnectRecord::default();
+        for line in lines {
+            record.observe(line);
+        }
+        let error = record
+            .finish()
+            .err()
+            .expect("first malformed CONNECT must fail");
+        assert!(error.starts_with("Bad MOSH CONNECT string:"));
+        let stdout = lines.join("\n");
+        let mut reader = std::io::Cursor::new(stdout.as_bytes());
+        let error = ConnectInfo::read_output(&mut reader)
+            .err()
+            .expect("malformed CONNECT must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().starts_with("Bad MOSH CONNECT string:"));
+        assert_eq!(reader.position(), stdout.len() as u64, "still drain stdout");
     }
 
     const KEY: &str = "abcdefghijklmnopqrstuv";

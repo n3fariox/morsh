@@ -6,6 +6,8 @@ mod banner;
 mod cli;
 mod connect;
 use connect::ConnectInfo;
+#[cfg(feature = "russh")]
+use connect::ConnectRecord;
 mod ssh_command;
 use cli::Args;
 #[cfg(feature = "russh")]
@@ -465,6 +467,11 @@ fn try_launch_server(
 
     let mut connect_info = match ConnectInfo::read_output(reader) {
         Ok(info) => info,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let _ = ssh_child.wait();
+            eprintln!("morsh: {e}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("morsh: could not read SSH stdout: {e}");
             let _ = ssh_child.kill();
@@ -664,26 +671,37 @@ fn try_launch_russh(
     let locale_vars = collect_locale_vars();
     let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
 
-    let connect_info = std::sync::Arc::new(std::sync::Mutex::new(None::<ConnectInfo>));
+    let connect_info = std::sync::Arc::new(std::sync::Mutex::new(ConnectRecord::default()));
     let connect_info_clone = connect_info.clone();
 
-    let exit_code = session
-        .exec_with_handler(&remote_cmd, move |line: String| {
-            tracing::debug!("russh stdout: {line}");
-            if let Some(info) = ConnectInfo::parse(&line) {
-                *connect_info_clone.lock().unwrap() = Some(info);
-            }
-        })
-        .ok()?;
+    let exit_status = session.exec_with_handler(&remote_cmd, move |line: String| {
+        tracing::debug!("russh stdout: {line}");
+        connect_info_clone.lock().unwrap().observe(&line);
+    });
 
-    tracing::info!("russh: remote command exited with code {exit_code}");
-    let result = connect_info.lock().unwrap().take();
+    let record = std::mem::take(&mut *connect_info.lock().unwrap());
+    let result = finish_russh_output(record, exit_status).unwrap_or_else(|error| {
+        eprintln!("morsh: {error}");
+        std::process::exit(1);
+    });
     // We made the TCP connection ourselves, so we know where it went: the
     // russh equivalent of mosh's fake proxy.
     result.map(|info| ConnectInfo {
         ip: Some(session.peer_addr().ip().to_string()),
         ..info
     })
+}
+
+#[cfg(feature = "russh")]
+fn finish_russh_output(
+    record: ConnectRecord,
+    status: Result<u32, impl std::fmt::Display>,
+) -> Result<Option<ConnectInfo>, String> {
+    match status {
+        Ok(code) => tracing::info!("russh: remote command exited with code {code}"),
+        Err(error) => tracing::warn!("russh: remote command closed: {error}"),
+    }
+    record.finish()
 }
 
 /// User, host name and port for a direct russh connection.
@@ -778,6 +796,17 @@ mod tests {
     }
 
     /// `morsh host <cmd>` used to emit `-e`, which neither server accepts.
+    #[cfg(feature = "russh")]
+    #[test]
+    fn russh_connect_record_survives_absent_exit_status() {
+        let mut record = ConnectRecord::default();
+        record.observe("MOSH CONNECT 60001 abcdefghijklmnopqrstuv");
+        let info = finish_russh_output(record, Err("SSH channel closed without exit status"))
+            .unwrap()
+            .expect("captured CONNECT must survive a missing exit status");
+        assert_eq!(info.port, 60001);
+    }
+
     #[test]
     fn ipv6_literals_and_explicit_ports_are_kept_intact() {
         for (host, hostname, port) in [
