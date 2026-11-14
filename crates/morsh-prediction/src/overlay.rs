@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Validity of a prediction against the current server state.
@@ -71,7 +71,7 @@ impl ConditionalOverlayCell {
             self.reset();
             return;
         }
-        self.original_contents.push(self.replacement);
+        self.remember(self.replacement);
         self.active = false;
         self.expiration_frame = u64::MAX;
         self.tentative_until_epoch = u64::MAX;
@@ -90,7 +90,7 @@ impl ConditionalOverlayCell {
         replacement: Option<char>,
     ) {
         self.reset_with_orig();
-        self.original_contents.push(original);
+        self.remember(original);
         self.active = true;
         self.tentative_until_epoch = epoch;
         self.expire(frame, time);
@@ -100,18 +100,27 @@ impl ConditionalOverlayCell {
         }
     }
 
+    /// Record that the cell showed `ch` before this prediction. Only ever
+    /// asked "did it?", so each character is kept once.
+    fn remember(&mut self, ch: char) {
+        if !self.original_contents.contains(&ch) {
+            self.original_contents.push(ch);
+        }
+    }
+
     /// Mark as active with an expiration.
     pub fn expire(&mut self, frame: u64, time: Instant) {
         self.expiration_frame = frame;
         self.prediction_time = time;
     }
 
-    /// Check validity against the actual cell content: `None` for a cell no
-    /// one `char` describes (a wide glyph or a cluster), which no prediction
-    /// matches. Mosh's `ConditionalOverlayCell::get_validity`.
+    /// Check validity against the actual cell content, which `actual` reads
+    /// only once it is needed: `None` for a cell no one `char` describes (a
+    /// wide glyph or a cluster), which no prediction matches. Mosh's
+    /// `ConditionalOverlayCell::get_validity`.
     pub fn get_validity(
         &self,
-        actual: Option<char>,
+        actual: impl FnOnce() -> Option<char>,
         row_height: usize,
         col_width: usize,
         late_ack: u64,
@@ -138,7 +147,7 @@ impl ConditionalOverlayCell {
             return Validity::CorrectNoCredit;
         }
 
-        if actual == Some(self.replacement) {
+        if actual() == Some(self.replacement) {
             // Check if it matches original content (no credit)
             if self.original_contents.contains(&self.replacement) {
                 return Validity::CorrectNoCredit;
@@ -224,7 +233,8 @@ impl OverlayRow {
 /// Manages all overlay rows.
 #[derive(Debug, Clone)]
 pub struct Overlay {
-    rows: HashMap<usize, OverlayRow>,
+    /// By row number, so they iterate top to bottom, as mosh's list does.
+    rows: BTreeMap<usize, OverlayRow>,
 }
 
 impl Default for Overlay {
@@ -236,7 +246,7 @@ impl Default for Overlay {
 impl Overlay {
     pub fn new() -> Self {
         Self {
-            rows: HashMap::new(),
+            rows: BTreeMap::new(),
         }
     }
 
@@ -257,56 +267,19 @@ impl Overlay {
         self.rows.get(&row_num)
     }
 
-    /// Get a mutable reference to a row.
-    pub fn get_row_mut(&mut self, row_num: usize) -> Option<&mut OverlayRow> {
-        self.rows.get_mut(&row_num)
-    }
-
-    /// Iterate over all rows in order.
+    /// Iterate over all rows, top to bottom.
     pub fn rows(&self) -> impl Iterator<Item = &OverlayRow> {
-        let mut rows: Vec<_> = self.rows.values().collect();
-        rows.sort_by_key(|r| r.row_num);
-        rows.into_iter()
+        self.rows.values()
     }
 
-    /// Iterate over all rows mutably.
+    /// Iterate over all rows mutably, top to bottom.
     pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut OverlayRow> {
-        let mut rows: Vec<_> = self.rows.values_mut().collect();
-        rows.sort_by_key(|r| r.row_num);
-        rows.into_iter()
+        self.rows.values_mut()
     }
 
     /// Remove rows outside the terminal bounds.
     pub fn prune(&mut self, max_row: usize) {
         self.rows.retain(|&row_num, _| row_num < max_row);
-    }
-
-    /// Clear all predictions in a given epoch.
-    pub fn kill_epoch(&mut self, epoch: u64) {
-        for row in self.rows.values_mut() {
-            for cell in &mut row.cells {
-                if cell.active && cell.tentative_until_epoch <= epoch {
-                    cell.reset();
-                }
-            }
-        }
-    }
-
-    /// Reset all cells.
-    pub fn reset_all(&mut self) {
-        for row in self.rows.values_mut() {
-            for cell in &mut row.cells {
-                cell.reset();
-            }
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-            || self
-                .rows
-                .values()
-                .all(|r| r.cells.iter().all(|c| !c.active))
     }
 }
 
@@ -324,9 +297,12 @@ mod tests {
         cell.replacement = 'A';
         cell.expire(10, Instant::now());
 
-        assert_eq!(cell.get_validity(Some('A'), 24, 80, 10), Validity::Correct);
         assert_eq!(
-            cell.get_validity(Some('B'), 24, 80, 10),
+            cell.get_validity(|| Some('A'), 24, 80, 10),
+            Validity::Correct
+        );
+        assert_eq!(
+            cell.get_validity(|| Some('B'), 24, 80, 10),
             Validity::IncorrectOrExpired
         );
     }
@@ -339,14 +315,17 @@ mod tests {
         cell.expire(5, Instant::now());
 
         // late_ack < expiration_frame → Pending
-        assert_eq!(cell.get_validity(Some('X'), 24, 80, 3), Validity::Pending);
+        assert_eq!(
+            cell.get_validity(|| Some('X'), 24, 80, 3),
+            Validity::Pending
+        );
     }
 
     #[test]
     fn overlay_cell_inactive() {
         let cell = ConditionalOverlayCell::new(0, 1);
         assert_eq!(
-            cell.get_validity(Some('A'), 24, 80, 100),
+            cell.get_validity(|| Some('A'), 24, 80, 100),
             Validity::Inactive
         );
     }

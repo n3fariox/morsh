@@ -36,8 +36,6 @@ pub struct PredictionEngine {
 
     /// Frame number when we last sent a packet.
     local_frame_sent: u64,
-    /// Frame number of last acked packet.
-    local_frame_acked: u64,
     /// Frame number of last late-acked packet.
     local_frame_late_acked: u64,
 
@@ -88,7 +86,6 @@ impl PredictionEngine {
             overlay: Overlay::new(),
             cursors: Vec::new(),
             local_frame_sent: 0,
-            local_frame_acked: 0,
             local_frame_late_acked: 0,
             prediction_epoch: 1,
             confirmed_epoch: 0,
@@ -123,11 +120,6 @@ impl PredictionEngine {
     /// Record that we sent a packet.
     pub fn set_local_frame_sent(&mut self, frame: u64) {
         self.local_frame_sent = frame;
-    }
-
-    /// Record that a frame was acked.
-    pub fn set_local_frame_acked(&mut self, frame: u64) {
-        self.local_frame_acked = frame;
     }
 
     /// Record that a frame was late-acked.
@@ -546,13 +538,19 @@ impl PredictionEngine {
             let rn = row.row_num;
             for cell in &mut row.cells {
                 let validity = cell.get_validity(
-                    screen_char(screen, rn, cell.col),
+                    || screen_char(screen, rn, cell.col),
                     num_rows,
                     num_cols,
                     self.local_frame_late_acked,
                 );
 
                 match validity {
+                    // Mosh kills just the epoch of a wrong prediction that
+                    // is still tentative, and resets everything otherwise.
+                    // Here both reset: expiration frames only grow, so by
+                    // the time a tentative cell can be judged, every
+                    // earlier cell has been judged too, and the two leave
+                    // the same predictions and the same visible cursor.
                     Validity::IncorrectOrExpired => {
                         should_reset = true;
                     }
@@ -627,11 +625,6 @@ impl PredictionEngine {
     /// Get immutable access to the overlay.
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
-    }
-
-    /// Get the current late-acked frame number.
-    pub fn local_frame_late_acked(&self) -> u64 {
-        self.local_frame_late_acked
     }
 
     /// Whether flagging is active (RTT high enough to underline predictions).

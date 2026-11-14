@@ -161,7 +161,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         notifications.server_heard(transport.get_latest_remote_state().timestamp);
                         notifications.server_acked(transport.sender.sent_state_acked_timestamp());
 
-                        prediction.set_local_frame_acked(transport.sender.sent_state_acked());
                         prediction.set_send_interval(transport.send_interval_ms());
                         // The predictions are checked against the new state
                         // when the next frame is drawn.
