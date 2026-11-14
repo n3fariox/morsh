@@ -226,24 +226,28 @@ impl DisplayDiff {
 
         state_changes(&mut out, Some(old), new);
 
-        // A scrolled screen is reproduced by scrolling, not by rewriting every
-        // row. `old_rows` is then updated to reflect the shift so the row-by-row
-        // pass below diffs against what is actually on the display.
-        let mut old_rows = old.rows.clone();
+        // Compare against the rows a scroll leaves on the display without
+        // cloning the framebuffer (and every cell's String) on each frame.
+        let scroll = detect_scroll(&old.rows, new);
         let mut first_row = 0usize;
-        if let Some(scroll) = detect_scroll(&old_rows, new) {
+        let mut blank_row = Vec::new();
+        if let Some(scroll) = &scroll {
             first_row = scroll.height;
-            Self::emit_scroll(&mut out, &scroll, new, old.cursor_y);
-            Self::shift_rows(&mut old_rows, &scroll, new);
+            Self::emit_scroll(&mut out, scroll, new, old.cursor_y);
+            blank_row.resize_with(new.cols as usize, CellData::empty);
         }
 
-        let rows = new.rows_count as usize;
-        for (y, (old_row, new_row)) in old_rows[..rows]
+        for (y, new_row) in new.rows[..new.rows_count as usize]
             .iter()
-            .zip(new.rows[..rows].iter())
             .enumerate()
             .skip(first_row)
         {
+            let old_row = match &scroll {
+                // Matching shifted rows were skipped above. The rest of the
+                // scroll region was exposed by scrolling and is now blank.
+                Some(scroll) if y < scroll.height + scroll.lines => &blank_row,
+                _ => &old.rows[y],
+            };
 
             // Quick check: skip unchanged rows
             if old_row == new_row {
@@ -361,17 +365,7 @@ impl DisplayDiff {
         }
     }
 
-    fn shift_rows(old_rows: &mut [Vec<CellData>], scroll: &Scroll, new: &ScreenSnapshot) {
-        let bottom = scroll.lines + scroll.height - 1;
-        let blank: Vec<CellData> = (0..new.cols).map(|_| CellData::empty()).collect();
-        for i in 0..=bottom {
-            old_rows[i] = if i + scroll.lines <= bottom {
-                old_rows[i + scroll.lines].clone()
-            } else {
-                blank.clone()
-            };
-        }
-    }
+
 }
 
 /// Generate SGR escape sequence to enable the given style attributes.
