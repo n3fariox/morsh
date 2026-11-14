@@ -262,8 +262,12 @@ impl Handler {
                 if self.transport.shutdown_in_progress() {
                     return;
                 }
+                let (data, exit) = pty::batch_output(data, &mut self.pty.rx);
                 if let Err(e) = self.transport.get_current_state_mut().act(&data) {
                     tracing::warn!("Terminal error: {e}");
+                }
+                if let Some(status) = exit {
+                    self.handle_pty_event(PtyEvent::Exited(status));
                 }
             }
             PtyEvent::Exited(status) => {
@@ -293,7 +297,7 @@ impl Handler {
         // ends a write as the Escape key, so a byte-at-a-time Shift+Left
         // (`ESC [ 1 ; 2 D`) reached the shell as Escape plus "[1;2D".
         let mut keys = Vec::new();
-        let events: Vec<UserEvent> = stream.events().to_vec();
+        let events = stream.events();
         for (i, event) in events.iter().enumerate() {
             match event {
                 UserEvent::UserByte(byte) => keys.push(*byte),
@@ -403,6 +407,73 @@ impl Handler {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_output_matches_individual_terminal_updates() {
+        let chunks: &[&[u8]] = &[
+            b"hello \x1b[3",
+            b"1mred\x1b[0m\r\n",
+            "caf".as_bytes(),
+            &[0xc3],
+            &[0xa9],
+            b"\r\n\x1b[2;4Hworld",
+        ];
+        let mut individual = Complete::new(80, 24).unwrap();
+        let mut batched = Complete::new(80, 24).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        for chunk in chunks {
+            individual.act(chunk).unwrap();
+            tx.try_send(PtyEvent::Output(chunk.to_vec())).ok().unwrap();
+        }
+        let (data, exit) = pty::batch_output(Vec::new(), &mut rx);
+        batched.act(&data).unwrap();
+        assert!(exit.is_none());
+        assert!(batched.state_equal(&individual));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual PTY throughput measurement"]
+    async fn pty_output_throughput() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let mut pty = pty::spawn_pty(
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "exit".into()],
+            &[],
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        pty.rx = rx;
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        let chunk = b"abcdefghijklmno\r\n".repeat(256); // 4352 bytes
+        let start = Instant::now();
+        let mut passes = 0;
+        for _ in 0..16 {
+            for _ in 0..64 {
+                tx.try_send(PtyEvent::Output(chunk.clone())).ok().unwrap();
+            }
+            while let Ok(event) = handler.pty.rx.try_recv() {
+                handler.handle_pty_event(event);
+                passes += 1;
+            }
+        }
+        eprintln!(
+            "PTY pipeline: {} bytes, {passes} terminal updates, {:?}",
+            chunk.len() * 1024,
+            start.elapsed()
+        );
+        handler.shutdown().await;
+    }
 
     #[tokio::test]
     async fn child_exit_does_not_discard_pending_pty_output() {
