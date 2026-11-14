@@ -8,6 +8,9 @@ pub enum DisplayPreference {
     Always,
     Never,
     Adaptive,
+    /// Mosh's "experimental": always shown and never tentative, and a wrong
+    /// prediction is dropped on its own instead of taking the rest with it.
+    Experimental,
 }
 
 /// Where we are in parsing an escape sequence typed by the user
@@ -154,14 +157,16 @@ impl PredictionEngine {
     pub fn should_display(&self) -> bool {
         match self.display_preference {
             DisplayPreference::Never => false,
-            DisplayPreference::Always => true,
+            DisplayPreference::Always | DisplayPreference::Experimental => true,
             DisplayPreference::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
         }
     }
 
     /// Become tentative (reset epochs to prevent showing predictions until confirmed).
     fn become_tentative(&mut self) {
-        self.prediction_epoch += 1;
+        if self.display_preference != DisplayPreference::Experimental {
+            self.prediction_epoch += 1;
+        }
     }
 
     /// Input whose effect we can't predict (Enter, Ctrl-C, Up/Down, Alt+key...).
@@ -241,6 +246,9 @@ impl PredictionEngine {
         let (num_cols, num_rows) = (screen.cols as usize, screen.rows_count as usize);
         if self.display_preference == DisplayPreference::Never || num_cols == 0 || num_rows == 0 {
             return;
+        }
+        if self.display_preference == DisplayPreference::Experimental {
+            self.prediction_epoch = self.confirmed_epoch;
         }
 
         // First cull existing predictions (this resets them if the screen
@@ -551,6 +559,11 @@ impl PredictionEngine {
                     // the time a tentative cell can be judged, every
                     // earlier cell has been judged too, and the two leave
                     // the same predictions and the same visible cursor.
+                    Validity::IncorrectOrExpired
+                        if self.display_preference == DisplayPreference::Experimental =>
+                    {
+                        cell.reset();
+                    }
                     Validity::IncorrectOrExpired => {
                         should_reset = true;
                     }
@@ -601,7 +614,11 @@ impl PredictionEngine {
                     self.local_frame_late_acked,
                 );
                 if validity == Validity::IncorrectOrExpired {
-                    should_reset = true;
+                    if self.display_preference == DisplayPreference::Experimental {
+                        self.cursors.clear();
+                    } else {
+                        should_reset = true;
+                    }
                 }
             }
         }
@@ -964,6 +981,36 @@ mod tests {
         engine.new_user_byte('b', &screen);
         assert_eq!(engine.cursor_pos(), Some((1, 0)));
         assert_eq!(engine.display_cursor(), Some((0, 9)));
+    }
+
+    /// Experimental mode: nothing is ever tentative, and a wrong prediction
+    /// is dropped on its own; the other modes drop everything with it.
+    #[test]
+    fn experimental_mode_drops_only_the_wrong_prediction() {
+        for (mode, survives) in [
+            (DisplayPreference::Experimental, true),
+            (DisplayPreference::Always, false),
+        ] {
+            let mut engine = PredictionEngine::new();
+            engine.set_display_preference(mode);
+            let before = screen(20, 3, 0, 0, "");
+            type_str(&mut engine, "ab", &before);
+            engine.set_local_frame_sent(1);
+            engine.new_user_byte('c', &before);
+            if mode == DisplayPreference::Experimental {
+                let row = &engine.overlay().get_row(0).unwrap().cells;
+                assert!(row[..3]
+                    .iter()
+                    .all(|c| !c.is_tentative(engine.confirmed_epoch())));
+            }
+
+            // 'a' and 'b' are due; the server shows 'b' wrong. 'c' is pending.
+            engine.set_local_frame_late_acked(1);
+            engine.cull(&screen(20, 3, 0, 2, "aX"));
+            let c = &engine.overlay().get_row(0).map(|r| r.cells[2].clone());
+            let c_alive = c.as_ref().is_some_and(|c| c.active && c.replacement == 'c');
+            assert_eq!(c_alive, survives, "{mode:?}");
+        }
     }
 
     /// Mosh's glitch trigger: a prediction pending for a quarter second is

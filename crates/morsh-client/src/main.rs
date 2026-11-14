@@ -6,7 +6,7 @@ mod tty;
 use crossterm::terminal;
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, Transport};
-use morsh_prediction::{DisplayPreference, NotificationEngine, PredictionEngine};
+use morsh_prediction::{NotificationEngine, PredictionEngine};
 use morsh_statesync::{Complete, UserStream};
 #[cfg(unix)]
 use morsh_terminal::ScreenSnapshot;
@@ -54,6 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Same variables and values as stock mosh-client, checked up front as
+    // it does.
+    let env = |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let display_preference =
+        match cli::prediction_display(env("MOSH_PREDICTION_DISPLAY").as_deref()) {
+            Ok(mode) => mode,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        };
+    let predict_overwrite = cli::prediction_overwrite(env("MOSH_PREDICTION_OVERWRITE").as_deref());
+
     let key_str = std::env::var("MORSH_KEY").map_err(|_| {
         "MORSH_KEY environment variable not set. Run via morsh wrapper.".to_string()
     })?;
@@ -79,14 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Transport::new_client(connection, user_stream, Complete::new(cols, rows)?);
 
     let mut prediction = PredictionEngine::new();
-    // Same variable and values as stock mosh-client
-    let display_preference = match std::env::var("MOSH_PREDICTION_DISPLAY").as_deref() {
-        Ok("always") => DisplayPreference::Always,
-        Ok("never") => DisplayPreference::Never,
-        _ => DisplayPreference::Adaptive,
-    };
     tracing::info!("Prediction display: {display_preference:?}");
     prediction.set_display_preference(display_preference);
+    prediction.set_predict_overwrite(predict_overwrite);
     prediction.set_send_interval(transport.send_interval_ms());
 
     let mut notifications = NotificationEngine::new();
