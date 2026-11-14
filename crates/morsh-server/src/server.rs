@@ -5,7 +5,6 @@ use morsh_network::{Connection, RecvOutcome, State, Transport};
 use morsh_statesync::{Complete, UserEvent, UserStream};
 use portable_pty::PtySize;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -75,30 +74,22 @@ async fn bind_transport(
     desired_ip: Option<&str>,
     key: &Base64Key,
 ) -> Result<ServerTransport, Box<dyn std::error::Error>> {
-    let session = Session::new(*key.data());
-
-    let connection = if let Some(ip) = desired_ip {
-        let addr = SocketAddr::new(
-            ip.parse::<std::net::IpAddr>()
-                .map_err(|e| format!("Invalid bind address: {e}"))?,
-            bind_port,
-        );
-        match Connection::new_server(addr, session).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!("Failed to bind to {}: {}, trying 0.0.0.0", ip, e);
-                let fallback: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-                Connection::new_server(fallback, Session::new(*key.data()))
-                    .await
-                    .map_err(|e| format!("Failed to bind: {e}"))?
+    let mut connection = None;
+    let mut last_error = String::new();
+    for mut address in crate::bind::addresses(desired_ip) {
+        address.set_port(bind_port);
+        match Connection::new_server(address, Session::new(*key.data())).await {
+            Ok(bound) => {
+                connection = Some(bound);
+                break;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to bind to {address}: {error}");
+                last_error = error;
             }
         }
-    } else {
-        let addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-        Connection::new_server(addr, session)
-            .await
-            .map_err(|e| format!("Failed to bind: {e}"))?
-    };
+    }
+    let connection = connection.ok_or_else(|| format!("Failed to bind: {last_error}"))?;
 
     Ok(Transport::new_server(
         connection,
@@ -491,6 +482,20 @@ mod tests {
         .unwrap();
         assert!(pty.child.wait().unwrap().success());
         assert_eq!(String::from_utf8(output).unwrap().trim(), "52 180");
+    }
+
+    #[tokio::test]
+    async fn invalid_bind_address_falls_back_to_any_interface() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("not-an-ip-address"), &key)
+            .await
+            .expect("stock mosh falls back when the desired address cannot be resolved");
+        assert!(transport
+            .connection()
+            .local_addr()
+            .unwrap()
+            .ip()
+            .is_unspecified());
     }
 
     #[test]

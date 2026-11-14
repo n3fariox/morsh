@@ -1,10 +1,21 @@
 use crate::constants::{MAX_RTO_MS, MIN_RTO_MS};
 
-/// Round-trip time estimator following RFC 6298.
+/// Samples at or above this are discarded, e.g. when the peer was suspended
+/// with Ctrl-Z (mosh: `R < 5000`).
+const MAX_RTT_SAMPLE_MS: f64 = 5000.0;
+
+/// Round-trip time estimator (RFC 6298), a port of the `SRTT`/`RTTVAR`
+/// bookkeeping in mosh's `Connection::recv_one` and `Connection::timeout`.
+///
+/// Mosh keeps both values as `double`s and starts from a deliberately
+/// pessimistic 1000/500 ms, so the first frames go out at the slowest rate
+/// and the first retransmission timeout is the maximum one. Integer
+/// arithmetic would drift: `(3 * 1 + 0) / 4` truncates a small variance to
+/// zero, which on a fast link pins the RTO at its floor.
 #[derive(Debug, Clone)]
 pub struct RttEstimator {
-    srtt_ms: u64,
-    rttvar_ms: u64,
+    srtt: f64,
+    rttvar: f64,
     have_sample: bool,
 }
 
@@ -17,51 +28,43 @@ impl Default for RttEstimator {
 impl RttEstimator {
     pub fn new() -> Self {
         Self {
-            srtt_ms: 50,
-            rttvar_ms: 25,
+            srtt: 1000.0,
+            rttvar: 500.0,
             have_sample: false,
         }
     }
 
-    /// Record a new RTT sample (in milliseconds).
-    pub fn update(&mut self, rtt_ms: u64) {
-        // Ignore unreasonable samples (e.g., server suspended)
-        if rtt_ms == 0 || rtt_ms > 5000 {
+    /// Record a new RTT sample in milliseconds. A 0 ms sample is valid: on a
+    /// LAN the 16-bit millisecond echo routinely comes back unchanged.
+    pub fn update(&mut self, rtt_ms: f64) {
+        if !(0.0..MAX_RTT_SAMPLE_MS).contains(&rtt_ms) {
             return;
         }
 
         if !self.have_sample {
-            self.srtt_ms = rtt_ms;
-            self.rttvar_ms = rtt_ms / 2;
+            self.srtt = rtt_ms;
+            self.rttvar = rtt_ms / 2.0;
             self.have_sample = true;
         } else {
-            // alpha = 1/8, beta = 1/4
-            let diff = self.srtt_ms.abs_diff(rtt_ms);
-            self.rttvar_ms = (3 * self.rttvar_ms + diff) / 4;
-            self.srtt_ms = (7 * self.srtt_ms + rtt_ms) / 8;
+            const ALPHA: f64 = 1.0 / 8.0;
+            const BETA: f64 = 1.0 / 4.0;
+            self.rttvar = (1.0 - BETA) * self.rttvar + BETA * (self.srtt - rtt_ms).abs();
+            self.srtt = (1.0 - ALPHA) * self.srtt + ALPHA * rtt_ms;
         }
     }
 
-    /// Compute the retransmission timeout.
+    /// The retransmission timeout, mosh's `Connection::timeout()`.
     pub fn rto_ms(&self) -> u64 {
-        let rto = self.srtt_ms + 4 * self.rttvar_ms;
-        rto.clamp(MIN_RTO_MS, MAX_RTO_MS)
+        ((self.srtt + 4.0 * self.rttvar).ceil() as u64).clamp(MIN_RTO_MS, MAX_RTO_MS)
     }
 
-    /// Get the current smoothed RTT.
-    pub fn srtt_ms(&self) -> u64 {
-        self.srtt_ms
+    /// The smoothed RTT in milliseconds, mosh's `get_SRTT()`.
+    pub fn srtt(&self) -> f64 {
+        self.srtt
     }
 
-    /// Get the current RTT variance.
-    pub fn rttvar_ms(&self) -> u64 {
-        self.rttvar_ms
-    }
-
-    /// Compute adaptive send interval: ceil(SRTT / 2), clamped.
-    pub fn send_interval_ms(&self) -> u64 {
-        let interval = self.srtt_ms.div_ceil(2);
-        interval.clamp(crate::constants::SEND_INTERVAL_MIN_MS, crate::constants::SEND_INTERVAL_MAX_MS)
+    pub fn rttvar(&self) -> f64 {
+        self.rttvar
     }
 }
 
@@ -70,55 +73,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_state() {
+    fn starts_pessimistic_like_mosh() {
         let rtt = RttEstimator::new();
-        assert_eq!(rtt.srtt_ms(), 50);
-        assert_eq!(rtt.rttvar_ms(), 25);
-        assert!(rtt.rto_ms() >= MIN_RTO_MS);
+        assert_eq!(rtt.srtt(), 1000.0);
+        assert_eq!(rtt.rttvar(), 500.0);
+        assert_eq!(rtt.rto_ms(), MAX_RTO_MS);
     }
 
     #[test]
     fn first_sample() {
         let mut rtt = RttEstimator::new();
-        rtt.update(200);
-        assert_eq!(rtt.srtt_ms(), 200);
-        assert_eq!(rtt.rttvar_ms(), 100);
+        rtt.update(200.0);
+        assert_eq!(rtt.srtt(), 200.0);
+        assert_eq!(rtt.rttvar(), 100.0);
     }
 
     #[test]
-    fn converging_samples() {
+    fn smoothing_matches_mosh_floating_point() {
         let mut rtt = RttEstimator::new();
-        rtt.update(100);
-        rtt.update(120);
-        rtt.update(110);
-        // SRTT converges toward the mean (~103-104)
-        assert!(rtt.srtt_ms() >= 100 && rtt.srtt_ms() <= 110,
-            "SRTT {} out of expected range", rtt.srtt_ms());
+        rtt.update(100.0);
+        rtt.update(120.0);
+        // RTTVAR = 0.75 * 50 + 0.25 * 20; SRTT = 0.875 * 100 + 0.125 * 120
+        assert_eq!(rtt.rttvar(), 42.5);
+        assert_eq!(rtt.srtt(), 102.5);
+        assert_eq!(rtt.rto_ms(), 273); // ceil(102.5 + 170)
+    }
+
+    /// Integer arithmetic used to truncate a small variance to zero.
+    #[test]
+    fn small_variance_is_not_truncated() {
+        let mut rtt = RttEstimator::new();
+        rtt.update(1.0);
+        for _ in 0..3 {
+            rtt.update(1.0);
+        }
+        assert!(rtt.rttvar() > 0.0);
+    }
+
+    /// Mosh accepts `R == 0`; a sub-millisecond LAN echo is a real sample.
+    #[test]
+    fn zero_ms_sample_is_used() {
+        let mut rtt = RttEstimator::new();
+        rtt.update(0.0);
+        assert_eq!(rtt.srtt(), 0.0);
+        assert_eq!(rtt.rto_ms(), MIN_RTO_MS);
     }
 
     #[test]
-    fn rto_clamped() {
+    fn oversized_samples_are_ignored() {
         let mut rtt = RttEstimator::new();
-        rtt.update(10000); // way too high, ignored
-        assert_eq!(rtt.srtt_ms(), 50); // unchanged
-
-        let mut rtt2 = RttEstimator::new();
-        rtt2.update(1);
-        assert!(rtt2.rto_ms() >= MIN_RTO_MS);
-    }
-
-    #[test]
-    fn send_interval_bounds() {
-        use crate::constants::{SEND_INTERVAL_MIN_MS, SEND_INTERVAL_MAX_MS};
-        let mut rtt = RttEstimator::new();
-
-        // Low RTT → minimum send interval
-        rtt.update(10);
-        assert_eq!(rtt.send_interval_ms(), SEND_INTERVAL_MIN_MS);
-
-        // Fresh estimator with high RTT → maximum send interval
-        let mut rtt2 = RttEstimator::new();
-        rtt2.update(1000);
-        assert_eq!(rtt2.send_interval_ms(), SEND_INTERVAL_MAX_MS);
+        rtt.update(5000.0);
+        rtt.update(10000.0);
+        rtt.update(-1.0);
+        assert_eq!(rtt.srtt(), 1000.0);
+        rtt.update(4999.0);
+        assert_eq!(rtt.srtt(), 4999.0);
+        assert_eq!(rtt.rto_ms(), MAX_RTO_MS);
     }
 }

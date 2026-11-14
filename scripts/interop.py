@@ -21,7 +21,7 @@ ENV.pop("SSH_CONNECTION", None)
 COMMAND = "printf 'MORSH_READY\\r\\n'; read line; printf 'MORSH_RESPONSE_%s\\r\\n' \"$line\"; sleep 15"
 
 
-def pairing(client, server, launch_shape=False):
+def pairing(client, server, launch_shape=False, ip="127.0.0.1"):
     stock = server == "mosh-server"
     args = [server, "new", "-c", "256"]
     # OS chooses a free port for the launch-line test; no global fixed port.
@@ -32,7 +32,7 @@ def pairing(client, server, launch_shape=False):
             port = sock.getsockname()[1]
         args += ["-s", "-p", str(port), "-l", "LANG=C.UTF-8", "-l", "LC_CTYPE=C.UTF-8"]
     else:
-        args += ["-i", "127.0.0.1"]
+        args += ["-i", ip]
     if not stock:
         args += ["-D"]
     args += ["--", "/bin/sh", "-c", COMMAND]
@@ -64,8 +64,9 @@ def pairing(client, server, launch_shape=False):
                 daemon_pid = int(pid_match[1])
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-            argv = ([client, "127.0.0.1", actual_port] if client == "mosh-client"
-                    else [client, f"127.0.0.1:{actual_port}"])
+            host = f"[{ip}]" if ":" in ip else ip
+            argv = ([client, ip, actual_port] if client == "mosh-client"
+                    else [client, f"{host}:{actual_port}"])
             child = subprocess.Popen(argv, env=dict(ENV, MOSH_KEY=key, MORSH_KEY=key),
                                      stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
             os.close(slave)
@@ -163,21 +164,39 @@ def wrapper_smoke():
         os.close(master)
 
 
+def have_ipv6_loopback():
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+            sock.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
 failures = 0
-for client, server, shape in [
-    (str(BIN / "morsh-client"), str(BIN / "morsh-server"), False),
-    (str(BIN / "morsh-client"), "mosh-server", False),
-    ("mosh-client", str(BIN / "morsh-server"), False),
-    (str(BIN / "morsh-client"), str(BIN / "morsh-server"), True),
-    (str(BIN / "morsh-client"), "mosh-server", True),
+MORSH_CLIENT, MORSH_SERVER = str(BIN / "morsh-client"), str(BIN / "morsh-server")
+for client, server, shape, ip in [
+    (MORSH_CLIENT, MORSH_SERVER, False, "127.0.0.1"),
+    (MORSH_CLIENT, "mosh-server", False, "127.0.0.1"),
+    ("mosh-client", MORSH_SERVER, False, "127.0.0.1"),
+    (MORSH_CLIENT, MORSH_SERVER, True, "127.0.0.1"),
+    (MORSH_CLIENT, "mosh-server", True, "127.0.0.1"),
+    (MORSH_CLIENT, MORSH_SERVER, False, "::1"),
+    (MORSH_CLIENT, "mosh-server", False, "::1"),
+    ("mosh-client", MORSH_SERVER, False, "::1"),
 ]:
     label = f"{Path(client).name} -> {Path(server).name}" + (" (mosh launch argv)" if shape else "")
+    if ip != "127.0.0.1":
+        label += f" over {ip}"
     missing = [name for name in (client, server) if not shutil.which(name)]
     if missing:
         print(f"SKIP {label}: missing {', '.join(missing)}", flush=True)
         continue
+    if ":" in ip and not have_ipv6_loopback():
+        print(f"SKIP {label}: no IPv6 loopback", flush=True)
+        continue
     try:
-        pairing(client, server, shape)
+        pairing(client, server, shape, ip)
         print(f"PASS {label}", flush=True)
     except (AssertionError, OSError, subprocess.SubprocessError) as error:
         print(f"FAIL {label}: {error}", flush=True)
