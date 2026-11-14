@@ -18,6 +18,20 @@ fn title(out: &mut String, text: &str) {
     let _ = write!(out, "\x1b]0;{text}\x07");
 }
 
+/// Whether a terminal that clusters graphemes may give `text` a different
+/// width than we did, or fold it into the cell before it. The emulator measures
+/// per codepoint unless the host enables mode 2027, and the user's terminal may
+/// do neither the same way, so the cursor can't be trusted after such a cell.
+fn width_is_disputed(text: &str) -> bool {
+    text.chars().count() > 1 || text.chars().any(|c| ('\u{1F000}'..='\u{1FFFF}').contains(&c))
+}
+
+/// Blank the columns `cell` occupies, without moving the cursor. If the terminal
+/// folds the cell into its neighbour nothing else would clear them.
+fn erase_cell(out: &mut String, cell: &CellData) {
+    let _ = write!(out, "\x1b[{}X", if cell.wide { 2 } else { 1 });
+}
+
 /// Emit the mode changes needed to go from `old` to `new`.
 fn state_changes(out: &mut String, old: Option<&ScreenSnapshot>, new: &ScreenSnapshot) {
     let changed = |f: fn(&ScreenSnapshot) -> bool| old.map(f) != Some(f(new));
@@ -120,6 +134,15 @@ fn detect_scroll(old_rows: &[Vec<CellData>], new: &ScreenSnapshot) -> Option<Scr
 }
 
 impl DisplayDiff {
+    /// The sequence that puts an emulator in `snap`'s grapheme clustering mode.
+    /// It decides how the cells that follow are laid out, so it has to arrive
+    /// before them.
+    pub fn grapheme_mode(snap: &ScreenSnapshot) -> String {
+        let mut out = String::new();
+        mode(&mut out, 2027, snap.grapheme_cluster);
+        out
+    }
+
     /// Generate VT escape sequences to render a full snapshot from scratch.
     pub fn full_redraw(snap: &ScreenSnapshot) -> String {
         let mut out = String::with_capacity(snap.cols as usize * snap.rows_count as usize * 4);
@@ -150,6 +173,10 @@ impl DisplayDiff {
                     }
                     last_style = cell.style;
                 }
+                let disputed = width_is_disputed(&cell.text);
+                if disputed {
+                    erase_cell(&mut out, cell);
+                }
                 if cell.text.is_empty() {
                     out.push(' ');
                 } else {
@@ -157,6 +184,9 @@ impl DisplayDiff {
                 }
                 // A wide glyph already covered the column to its right.
                 x += if cell.wide { 2 } else { 1 };
+                if disputed && x < row.len() {
+                    let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
+                }
             }
             // Reset style at end of row
             if !last_style.is_default() {
@@ -258,6 +288,11 @@ impl DisplayDiff {
                     let width = if new_cell.wide { 2 } else { 1 };
                     cursor_pos = Some((y + 1, x + 1 + width));
 
+                    let disputed = width_is_disputed(&new_cell.text);
+                    if disputed {
+                        erase_cell(&mut out, new_cell);
+                        cursor_pos = None;
+                    }
                     if new_cell.text.is_empty() {
                         out.push(' ');
                     } else {
@@ -416,6 +451,7 @@ fn style_on(style: &CellStyle) -> String {
 mod tests {
     use super::*;
     use crate::snapshot::CellStyle;
+    use serial_test::serial;
 
     #[test]
     fn full_redraw_basic() {
@@ -642,6 +678,78 @@ mod tests {
         assert!(!vt.contains('\n'), "no scroll should be emitted: {vt:?}");
     }
 
+    /// Draws `text` as morsh sees it onto a terminal that clusters graphemes,
+    /// through `paint`, and returns what morsh expected next to what landed.
+    fn paint_on_clustering_terminal(
+        text: &str,
+        paint: fn(&ScreenSnapshot, &ScreenSnapshot) -> String,
+    ) -> (ScreenSnapshot, ScreenSnapshot) {
+        let mut host = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        host.write(text.as_bytes());
+        let expected = host.snapshot().unwrap();
+
+        let mut user = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        user.write(b"\x1b[?2027h");
+        let blank = user.snapshot().unwrap();
+        user.write(paint(&blank, &expected).as_bytes());
+        (expected, user.snapshot().unwrap())
+    }
+
+    fn column_of(snap: &ScreenSnapshot, text: &str) -> Option<usize> {
+        snap.rows[0].iter().position(|c| c.text == text)
+    }
+
+    /// A terminal that clusters may disagree about a sequence's width, in
+    /// either direction. Whatever it does, the text after it stays put.
+    #[test]
+    #[serial]
+    fn text_after_a_disputed_cluster_stays_in_its_column() {
+        let paints: [fn(&ScreenSnapshot, &ScreenSnapshot) -> String; 2] =
+            [DisplayDiff::diff, |_, new| DisplayDiff::full_redraw(new)];
+        for paint in paints {
+            for cluster in ["👍🏽", "👨\u{200d}👩\u{200d}👧", "🇯🇵", "❤\u{fe0f}"] {
+                let (expected, user) = paint_on_clustering_terminal(&format!("{cluster}xy"), paint);
+                assert_eq!(column_of(&user, "x"), column_of(&expected, "x"), "{cluster}");
+                assert_eq!(column_of(&user, "y"), column_of(&expected, "y"), "{cluster}");
+            }
+        }
+    }
+
+    /// Folding a cell into its neighbour leaves its columns unwritten, so
+    /// whatever was there before has to be cleared.
+    #[test]
+    #[serial]
+    fn a_folded_cell_leaves_nothing_stale_behind() {
+        let mut host = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        host.write("abcdefgh".as_bytes());
+        let old = host.snapshot().unwrap();
+        host.write("\x1b[H👍🏽".as_bytes());
+        let new = host.snapshot().unwrap();
+
+        let mut user = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        user.write(b"\x1b[?2027h");
+        let blank = user.snapshot().unwrap();
+        user.write(DisplayDiff::diff(&blank, &old).as_bytes());
+        user.write(DisplayDiff::diff(&old, &new).as_bytes());
+        let screen = user.snapshot().unwrap();
+        for stale in ["c", "d"] {
+            assert_eq!(column_of(&screen, stale), None, "{stale}");
+        }
+        assert_eq!(column_of(&screen, "e"), column_of(&new, "e"));
+    }
+
+    /// Repositioning costs bytes, so plain wide text must not pay for it.
+    #[test]
+    fn undisputed_text_is_not_repositioned() {
+        let mut new = ScreenSnapshot::new(10, 1);
+        new.rows[0][0].text = "日".to_string();
+        new.rows[0][0].wide = true;
+        new.rows[0][1].spacer = true;
+        new.rows[0][2].text = "x".to_string();
+        let vt = DisplayDiff::diff(&ScreenSnapshot::new(10, 1), &new);
+        assert!(vt.contains("日x"), "{vt:?}");
+    }
+
     /// A wide glyph covers two columns; emitting a filler space over the
     /// second one corrupts the line.
     #[test]
@@ -705,6 +813,7 @@ mod tests {
     /// cursor move (Ctrl-A -> CSI 3;3 H), which exposed vertical drift when the
     /// raw bytes were written straight to the Windows console.
     #[test]
+    #[serial]
     fn rendering_reproduces_model_across_frames() {
         use crate::MoshTerminal;
         let (cols, rows) = (40u16, 10u16);

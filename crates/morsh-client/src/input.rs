@@ -8,7 +8,7 @@
 
 use crate::ClientTransport;
 use morsh_prediction::{NotificationEngine, PredictionEngine};
-use morsh_terminal::ScreenSnapshot;
+use morsh_terminal::{CellData, ScreenSnapshot};
 use tokio::sync::mpsc;
 
 /// Ctrl-^ (Ctrl-Shift-6) — the stock mosh escape key.
@@ -449,8 +449,7 @@ pub fn handle_term_event(
                     prediction.new_user_byte(byte as char, cur_row, cur_col, cols, rows, |r, c| {
                         local_framebuffer
                             .cell(c as u16, r as u16)
-                            .and_then(|d| d.text.chars().next())
-                            .unwrap_or(' ')
+                            .map_or(Some(' '), CellData::single_char)
                     });
                 }
                 transport.sender.current_state_mut().push_key(byte);

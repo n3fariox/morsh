@@ -232,6 +232,10 @@ impl PredictionEngine {
     /// cursor position. `cell_at(row, col)` reads the character the *server*
     /// last put at a position: predicting an insert means shifting the real
     /// contents of the line rightward, so the engine has to be able to see them.
+    /// It returns `None` for a cell one narrow `char` can't describe (a wide
+    /// glyph or a multi-codepoint cluster). Overlay cells are one column wide
+    /// and hold one `char`, so a keystroke that would move or land on such a
+    /// cell is treated as unknown input rather than predicted wrongly.
     pub fn new_user_byte<F>(
         &mut self,
         ch: char,
@@ -241,7 +245,7 @@ impl PredictionEngine {
         num_rows: usize,
         cell_at: F,
     ) where
-        F: Fn(usize, usize) -> char,
+        F: Fn(usize, usize) -> Option<char>,
     {
         if self.display_preference == DisplayPreference::Never {
             return;
@@ -279,13 +283,13 @@ impl PredictionEngine {
                 // Final bytes are 0x40..=0x7E; anything else is a parameter/intermediate
                 if ('\x40'..='\x7e').contains(&ch) {
                     self.input_state = InputState::Ground;
-                    self.predict_cursor_key(ch, num_cols);
+                    self.predict_cursor_key(ch, num_cols, &cell_at);
                 }
                 return;
             }
             InputState::Ss3 => {
                 self.input_state = InputState::Ground;
-                self.predict_cursor_key(ch, num_cols);
+                self.predict_cursor_key(ch, num_cols, &cell_at);
                 return;
             }
         }
@@ -304,17 +308,23 @@ impl PredictionEngine {
     }
 
     /// Handle the final byte of a CSI/SS3 key sequence. Left/right arrows move
-    /// the predicted cursor (as stock mosh does); anything else is unknown.
-    fn predict_cursor_key(&mut self, final_byte: char, num_cols: usize) {
+    /// the predicted cursor (as stock mosh does); anything else is unknown, as
+    /// is stepping over a wide glyph, which the host may do in one keypress.
+    fn predict_cursor_key<F>(&mut self, final_byte: char, num_cols: usize, cell_at: &F)
+    where
+        F: Fn(usize, usize) -> Option<char>,
+    {
         let frame = self.local_frame_sent + 1;
         match (final_byte, self.cursors.last_mut()) {
-            ('C', Some(cursor)) => {
+            ('C', Some(cursor)) if cell_at(cursor.row, cursor.col).is_some() => {
                 if cursor.col + 1 < num_cols {
                     cursor.col += 1;
                     cursor.expiration_frame = frame;
                 }
             }
-            ('D', Some(cursor)) => {
+            ('D', Some(cursor))
+                if cursor.col == 0 || cell_at(cursor.row, cursor.col - 1).is_some() =>
+            {
                 if cursor.col > 0 {
                     cursor.col -= 1;
                     cursor.expiration_frame = frame;
@@ -363,13 +373,26 @@ impl PredictionEngine {
         num_cols: usize,
         cell_at: &F,
     ) where
-        F: Fn(usize, usize) -> char,
+        F: Fn(usize, usize) -> Option<char>,
     {
         if cursor_col == 0 {
             return;
         }
 
         let new_col = cursor_col - 1;
+        let rightmost = if self.predict_overwrite {
+            new_col
+        } else {
+            num_cols - 1
+        };
+        let Some(line) = (new_col..=rightmost)
+            .map(|col| cell_at(cursor_row, col))
+            .collect::<Option<Vec<char>>>()
+        else {
+            self.unknown_input();
+            return;
+        };
+
         let frame = self.local_frame_sent + 1;
         let now = Instant::now();
         let epoch = self.prediction_epoch;
@@ -429,7 +452,7 @@ impl PredictionEngine {
                     // Nothing predicted there: shift what the server actually
                     // has one column left.
                     cell.unknown = false;
-                    cell.replacement = cell_at(cursor_row, i + 1);
+                    cell.replacement = line[i + 1 - new_col];
                 }
             } else {
                 cell.unknown = true;
@@ -447,7 +470,7 @@ impl PredictionEngine {
         num_rows: usize,
         cell_at: &F,
     ) where
-        F: Fn(usize, usize) -> char,
+        F: Fn(usize, usize) -> Option<char>,
     {
         // If at the last column, things are tricky (wrap behavior varies by app)
         if cursor_col + 1 >= num_cols {
@@ -458,6 +481,14 @@ impl PredictionEngine {
             cursor_col
         } else {
             num_cols - 1
+        };
+
+        let Some(line) = (cursor_col..=rightmost)
+            .map(|col| cell_at(cursor_row, col))
+            .collect::<Option<Vec<char>>>()
+        else {
+            self.unknown_input();
+            return;
         };
 
         // Build the shifted cells in a temporary buffer to avoid borrow issues
@@ -505,7 +536,7 @@ impl PredictionEngine {
                     // actually has rightward. Substituting a blank here is what
                     // made every keystroke visually erase the rest of the line.
                     cell.unknown = false;
-                    cell.replacement = cell_at(cursor_row, i - 1);
+                    cell.replacement = line[i - 1 - cursor_col];
                 }
             }
 
@@ -703,7 +734,7 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Never);
 
-        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| Some(' '));
         assert!(!engine.is_active());
     }
 
@@ -712,7 +743,7 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
 
-        engine.new_user_byte('A', 5, 10, 80, 24, |_, _| ' ');
+        engine.new_user_byte('A', 5, 10, 80, 24, |_, _| Some(' '));
         assert!(engine.is_active());
 
         let cursor = engine.cursor_pos();
@@ -725,7 +756,7 @@ mod tests {
             let mut engine = PredictionEngine::new();
             engine.set_display_preference(DisplayPreference::Always);
             for ch in seq.chars() {
-                engine.new_user_byte(ch, 5, 10, 80, 24, |_, _| ' ');
+                engine.new_user_byte(ch, 5, 10, 80, 24, |_, _| Some(' '));
             }
             assert!(!engine.is_active(), "{seq:?} produced overlay cells");
             assert_eq!(engine.cursor_pos(), Some((5, 9)), "{seq:?}");
@@ -736,13 +767,13 @@ mod tests {
     fn enter_drops_predicted_cursor_and_makes_next_key_tentative() {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
-        engine.new_user_byte('l', 5, 10, 80, 24, |_, _| ' ');
-        engine.new_user_byte('\r', 5, 11, 80, 24, |_, _| ' ');
+        engine.new_user_byte('l', 5, 10, 80, 24, |_, _| Some(' '));
+        engine.new_user_byte('\r', 5, 11, 80, 24, |_, _| Some(' '));
         // Server decides where the cursor goes after Enter
         assert_eq!(engine.cursor_pos(), None);
 
         // Next key starts from the server's cursor (a new line), not the old one
-        engine.new_user_byte('h', 7, 2, 80, 24, |_, _| ' ');
+        engine.new_user_byte('h', 7, 2, 80, 24, |_, _| Some(' '));
         assert_eq!(engine.cursor_pos(), Some((7, 3)));
         let cell = engine.overlay().rows()
             .flat_map(|r| r.cells.iter().map(move |c| (r.row_num, c)))
@@ -767,7 +798,7 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Always);
         let row: Vec<char> = "$ abc     ".chars().collect();
         // Cursor on 'b'; typing 'X' should predict "$ aXbc" with the tail shifted
-        engine.new_user_byte('X', 0, 3, 10, 5, |_, col| row[col]);
+        engine.new_user_byte('X', 0, 3, 10, 5, |_, col| Some(row[col]));
         assert_eq!(predicted_row(&engine, 0), "...Xbc   ?");
     }
 
@@ -777,9 +808,51 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Always);
         let row: Vec<char> = "$ abc     ".chars().collect();
         // Cursor on 'c'; backspace removes 'b'
-        engine.new_user_byte('\x7f', 0, 4, 10, 5, |_, col| row[col]);
+        engine.new_user_byte('\x7f', 0, 4, 10, 5, |_, col| Some(row[col]));
         assert_eq!(predicted_row(&engine, 0), "...c    ??");
         assert_eq!(engine.cursor_pos(), Some((0, 3)));
+    }
+
+    /// A line as `cell_at` reports it, with `None` at the listed columns.
+    fn cell_at_with_gaps(gaps: &[usize]) -> impl Fn(usize, usize) -> Option<char> + '_ {
+        move |_, col| (!gaps.contains(&col)).then_some('a')
+    }
+
+    #[test]
+    fn insert_is_not_predicted_when_it_would_shift_a_wide_cell() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.new_user_byte('X', 0, 1, 10, 5, cell_at_with_gaps(&[5, 6]));
+        assert_eq!(engine.cursor_pos(), None);
+        assert_eq!(predicted_row(&engine, 0), "");
+    }
+
+    #[test]
+    fn insert_right_of_a_wide_cell_is_still_predicted() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.new_user_byte('X', 0, 7, 10, 5, cell_at_with_gaps(&[5, 6]));
+        assert_eq!(engine.cursor_pos(), Some((0, 8)));
+    }
+
+    #[test]
+    fn backspace_is_not_predicted_over_a_wide_cell() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.new_user_byte('\x7f', 0, 7, 10, 5, cell_at_with_gaps(&[5, 6]));
+        assert_eq!(engine.cursor_pos(), None);
+    }
+
+    #[test]
+    fn arrows_are_not_predicted_across_a_wide_cell() {
+        for (start, key) in [(5, "\x1b[C"), (7, "\x1b[D")] {
+            let mut engine = PredictionEngine::new();
+            engine.set_display_preference(DisplayPreference::Always);
+            for ch in key.chars() {
+                engine.new_user_byte(ch, 0, start, 10, 5, cell_at_with_gaps(&[5, 6]));
+            }
+            assert_eq!(engine.cursor_pos(), None, "{key:?}");
+        }
     }
 
     #[test]
@@ -787,10 +860,10 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
         for ch in "\x1b[C".chars() {
-            engine.new_user_byte(ch, 5, 10, 80, 24, |_, _| ' ');
+            engine.new_user_byte(ch, 5, 10, 80, 24, |_, _| Some(' '));
         }
         assert_eq!(engine.cursor_pos(), Some((5, 11)));
-        engine.new_user_byte('x', 5, 11, 80, 24, |_, _| ' ');
+        engine.new_user_byte('x', 5, 11, 80, 24, |_, _| Some(' '));
         assert!(engine.is_active());
         assert_eq!(engine.cursor_pos(), Some((5, 12)));
     }
@@ -801,10 +874,10 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Always);
 
         // Type a character first
-        engine.new_user_byte('A', 5, 10, 80, 24, |_, _| ' ');
+        engine.new_user_byte('A', 5, 10, 80, 24, |_, _| Some(' '));
 
         // Then backspace
-        engine.new_user_byte('\x7f', 5, 11, 80, 24, |_, _| ' ');
+        engine.new_user_byte('\x7f', 5, 11, 80, 24, |_, _| Some(' '));
 
         let cursor = engine.cursor_pos();
         assert_eq!(cursor, Some((5, 10))); // moved back left
@@ -815,7 +888,7 @@ mod tests {
         let mut engine = PredictionEngine::new();
         engine.set_display_preference(DisplayPreference::Always);
 
-        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| Some(' '));
         assert!(engine.is_active());
 
         engine.reset();
@@ -828,7 +901,7 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Always);
 
         let initial_epoch = engine.prediction_epoch;
-        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| Some(' '));
 
         // Epoch should increase after becoming tentative
         assert!(engine.prediction_epoch >= initial_epoch);
@@ -843,7 +916,7 @@ mod tests {
         assert_eq!(engine.wait_time_ms(), u64::MAX);
 
         // With active predictions and timing tests necessary
-        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| ' ');
+        engine.new_user_byte('A', 0, 0, 80, 24, |_, _| Some(' '));
         assert_eq!(engine.wait_time_ms(), 50);
     }
 
@@ -873,7 +946,7 @@ mod tests {
 
         // The server's line reads "hello" starting at column 2.
         let line: Vec<char> = "  hello".chars().collect();
-        let cell_at = move |_row: usize, col: usize| *line.get(col).unwrap_or(&' ');
+        let cell_at = move |_row: usize, col: usize| Some(*line.get(col).unwrap_or(&' '));
 
         // Type 'X' at column 2, in front of "hello".
         engine.new_user_byte('X', 0, 2, 20, 5, cell_at);
@@ -899,7 +972,7 @@ mod tests {
         engine.set_local_frame_sent(1);
 
         let line: Vec<char> = "abcdef".chars().collect();
-        let cell_at = move |_row: usize, col: usize| *line.get(col).unwrap_or(&' ');
+        let cell_at = move |_row: usize, col: usize| Some(*line.get(col).unwrap_or(&' '));
 
         // Backspace with the cursor just after 'c'.
         engine.new_user_byte('\x7f', 0, 3, 20, 5, cell_at);

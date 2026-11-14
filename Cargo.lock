@@ -1613,6 +1613,7 @@ dependencies = [
  "morsh-statesync",
  "morsh-terminal",
  "prost",
+ "serial_test",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
@@ -1722,6 +1723,7 @@ name = "morsh-terminal"
 version = "0.0.7"
 dependencies = [
  "libghostty-vt",
+ "serial_test",
 ]
 
 [[package]]
