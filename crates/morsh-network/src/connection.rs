@@ -42,11 +42,13 @@ pub struct Connection {
 }
 
 /// Current time in milliseconds as a 16-bit value (mod 65536), never 0xFFFF.
+///
+/// Monotonic, like mosh's `timestamp()`: a wall-clock step (NTP, suspend)
+/// between sending a timestamp and receiving its echo must not turn into a
+/// bogus RTT sample.
 fn timestamp16() -> u16 {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let ms = ORIGIN.get_or_init(Instant::now).elapsed().as_millis();
     let ts = (ms % 65536) as u16;
     if ts == 0xFFFF {
         0
