@@ -32,6 +32,9 @@ pub struct Connection {
     /// here is security-sensitive: a replayed packet could otherwise corrupt
     /// the RTT estimate or re-target the server at an attacker's address.
     expected_receiver_seq: u64,
+    /// Application datagram MTU (mosh's `MTU`): set from the address family,
+    /// and dropped to [`MTU_FALLBACK`] if the kernel reports `EMSGSIZE`.
+    mtu: usize,
     /// The peer's most recent timestamp and when it arrived, waiting to be
     /// echoed back exactly once (mosh's `saved_timestamp` /
     /// `saved_timestamp_received_at`).
@@ -52,6 +55,59 @@ fn timestamp16() -> u16 {
     }
 }
 
+/// Mosh's `Connection::set_MTU`: the guaranteed 1280-byte path MTU minus a
+/// family-dependent guess at the headers.
+fn mtu_for(addr: &SocketAddr) -> usize {
+    match addr {
+        SocketAddr::V4(_) => MTU_IPV4,
+        SocketAddr::V6(_) => MTU_IPV6,
+    }
+}
+
+/// The wildcard address of `addr`'s family, for a client socket.
+fn unspecified_like(addr: &SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    }
+}
+
+/// Whether a send failed because the datagram was too big for the path.
+fn is_emsgsize(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    const EMSGSIZE: i32 = libc::EMSGSIZE;
+    #[cfg(windows)]
+    const EMSGSIZE: i32 = 10040; // WSAEMSGSIZE
+    #[cfg(not(any(unix, windows)))]
+    const EMSGSIZE: i32 = -1;
+    e.raw_os_error() == Some(EMSGSIZE)
+}
+
+/// Mosh disables path MTU discovery so the kernel never sets DF: an
+/// oversize datagram is then fragmented by the network rather than dropped
+/// at a hop whose ICMP "fragmentation needed" never reaches us.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn disable_pmtu_discovery(socket: &std::net::UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let flag: libc::c_int = libc::IP_PMTUDISC_DONT;
+    // SAFETY: a valid fd and a correctly sized c_int option value.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            (&flag as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            "setsockopt(IP_MTU_DISCOVER): {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Create a UDP socket, set nonblocking, and apply ECN marking (ECT(0)).
 /// Cross-platform: uses IP_TOS on both Unix and Windows (Win10 1903+).
 /// On Windows, also disables SIO_UDP_CONNRESET so ICMP Port Unreachable
@@ -62,6 +118,9 @@ fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
     std_socket
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set nonblocking: {e}"))?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    disable_pmtu_discovery(&std_socket);
 
     let sock_ref = socket2::SockRef::from(&std_socket);
     let _ = sock_ref.set_tos(0x02);
@@ -118,7 +177,7 @@ fn disable_udp_connreset(socket: &std::net::UdpSocket) {
 }
 
 impl Connection {
-    fn build(socket: UdpSocket, session: Session, server: bool) -> Self {
+    fn build(socket: UdpSocket, session: Session, server: bool, mtu: usize) -> Self {
         let now = Instant::now();
         Self {
             sockets: vec![socket],
@@ -134,28 +193,51 @@ impl Connection {
             last_heard: now,
             send_seq: 0,
             expected_receiver_seq: 0,
+            mtu,
             saved_timestamp: None,
         }
     }
 
     /// Create a server-side connection (single socket, no port hopping).
     pub async fn new_server(bind_addr: SocketAddr, session: Session) -> Result<Self, String> {
-        Ok(Self::build(bind_udp(bind_addr)?, session, true))
-    }
-
-    /// Create a client-side connection.
-    pub async fn new_client(session: Session) -> Result<Self, String> {
         Ok(Self::build(
-            bind_udp("0.0.0.0:0".parse().unwrap())?,
+            bind_udp(bind_addr)?,
             session,
-            false,
+            true,
+            mtu_for(&bind_addr),
         ))
     }
 
-    /// Set the remote address (called on first receive for server).
+    /// Create a client-side connection. Its socket is IPv4 until
+    /// [`Connection::set_remote_addr`] names a server of another family.
+    pub async fn new_client(session: Session) -> Result<Self, String> {
+        let any: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, 0).into();
+        Ok(Self::build(bind_udp(any)?, session, false, MTU_FALLBACK))
+    }
+
+    /// Point the client at its server.
+    ///
+    /// Mosh's client creates its socket in the server's address family and
+    /// sizes its MTU from it; an IPv4 socket cannot reach an IPv6 server, so
+    /// the socket is replaced if the family differs.
     pub fn set_remote_addr(&mut self, addr: SocketAddr) {
+        self.mtu = mtu_for(&addr);
+        let family_differs = self
+            .local_addr()
+            .is_some_and(|local| local.is_ipv4() != addr.is_ipv4());
+        if family_differs {
+            match bind_udp(unspecified_like(&addr)) {
+                Ok(socket) => self.sockets = vec![socket],
+                Err(e) => tracing::warn!("Cannot open a socket for {addr}: {e}"),
+            }
+        }
         self.remote_addr = Some(addr);
         self.has_remote_addr = true;
+    }
+
+    /// Current application datagram MTU (for tests).
+    pub fn mtu(&self) -> usize {
+        self.mtu
     }
 
     pub fn has_remote(&self) -> bool {
@@ -191,22 +273,53 @@ impl Connection {
     }
 
     /// Send an encrypted, fragmented instruction to the remote.
+    ///
+    /// Like mosh's `Connection::send`, a failed `sendto` does not abort the
+    /// instruction: every fragment is still attempted (a transient error
+    /// while roaming must not strand the rest), and the last error is
+    /// returned for the caller to display.
     pub async fn send(&mut self, inst: &TransportInstruction) -> Result<(), String> {
-        let remote = self.remote_addr.ok_or("No remote address")?;
+        let Some(remote) = self.remote_addr.filter(|_| self.has_remote_addr) else {
+            return Ok(());
+        };
         let frags = self
             .fragger
-            .make_fragments(inst, max_fragment_payload(MTU_IPV4))?;
+            .make_fragments(inst, max_fragment_payload(self.mtu))?;
 
+        let mut error = None;
         for frag in &frags {
             let wire = self.encrypt_fragment(frag)?;
-            let socket = self.sockets.last().unwrap();
-            socket
-                .send_to(&wire, remote)
-                .await
-                .map_err(|e| format!("Send error: {e}"))?;
+            let Some(socket) = self.sockets.last() else {
+                return Err("No sockets open".into());
+            };
+            match socket.send_to(&wire, remote).await {
+                Ok(n) if n == wire.len() => {}
+                Ok(n) => error = Some(format!("sendto: short write ({n} of {})", wire.len())),
+                Err(e) => {
+                    if is_emsgsize(&e) {
+                        self.mtu = MTU_FALLBACK; // payload MTU of last resort
+                    }
+                    error = Some(format!("sendto: {e}"));
+                }
+            }
         }
 
-        Ok(())
+        self.check_server_association(Instant::now());
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Mosh's server forgets a client it has not heard from for
+    /// `SERVER_ASSOCIATION_TIMEOUT`, and stops sending until the client
+    /// (possibly from a new address) is heard again.
+    fn check_server_association(&mut self, now: Instant) {
+        if self.server
+            && self.has_remote_addr
+            && now.saturating_duration_since(self.last_heard)
+                > Duration::from_millis(SERVER_ASSOCIATION_TIMEOUT_MS)
+        {
+            self.has_remote_addr = false;
+            tracing::info!("Server now detached from client.");
+        }
     }
 
     /// Await one datagram on *any* open socket.
@@ -311,6 +424,7 @@ impl Connection {
             self.remote_addr = Some(peer);
         }
 
+        self.prune_sockets(now);
         self.assembler.add_fragment(frag)
     }
 
@@ -324,11 +438,18 @@ impl Connection {
 
     /// Create a new socket for port hopping.
     pub async fn hop_port(&mut self) -> Result<(), String> {
-        let socket = bind_udp("0.0.0.0:0".parse().unwrap())?;
+        let any = match &self.remote_addr {
+            Some(remote) => unspecified_like(remote),
+            None => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        };
+        // Mosh's `setup()` records the choice before the socket exists, so a
+        // failed bind still waits a full interval before the next attempt.
+        let now = Instant::now();
+        self.last_port_choice = now;
+        let socket = bind_udp(any)?;
 
         self.sockets.push(socket);
-        self.prune_sockets();
-        self.last_port_choice = Instant::now();
+        self.prune_sockets(now);
         tracing::info!("Hopped to new local port {:?}", self.local_addr());
         Ok(())
     }
@@ -344,9 +465,23 @@ impl Connection {
         self.fragger.last_ack_sent()
     }
 
-    fn prune_sockets(&mut self) {
-        while self.sockets.len() > MAX_PORTS_OPEN {
-            self.sockets.remove(0);
+    /// Mosh's `prune_sockets`: once the newest socket has been in use for
+    /// `MAX_OLD_SOCKET_AGE`, the older ones are closed (late replies to them
+    /// are no longer worth polling for); and never more than
+    /// `MAX_PORTS_OPEN` are kept.
+    fn prune_sockets(&mut self, now: Instant) {
+        if self.sockets.len() <= 1 {
+            return;
+        }
+        if now.saturating_duration_since(self.last_port_choice)
+            > Duration::from_millis(MAX_OLD_SOCKET_AGE_MS)
+        {
+            let newest = self.sockets.len() - 1;
+            self.sockets.drain(..newest);
+        }
+        if self.sockets.len() > MAX_PORTS_OPEN {
+            let excess = self.sockets.len() - MAX_PORTS_OPEN;
+            self.sockets.drain(..excess);
         }
     }
 
@@ -641,6 +776,161 @@ mod tests {
             .unwrap();
         let srtt = server.srtt();
         assert!((80.0..200.0).contains(&srtt), "srtt {srtt}");
+    }
+
+    fn ago(d: Duration) -> Instant {
+        Instant::now()
+            .checked_sub(d)
+            .expect("monotonic clock too young")
+    }
+
+    /// Mosh's server stops sending to a client it has not heard from for
+    /// SERVER_ASSOCIATION_TIMEOUT, and re-attaches when the client returns.
+    #[tokio::test]
+    async fn server_detaches_from_a_silent_client() {
+        let k = key();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = Connection::new_server(addr, Session::new(k)).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        server
+            .process_incoming(&client_packet(k, 0, 1, 0xFFFF), peer)
+            .unwrap();
+        assert!(server.has_remote());
+
+        server.last_heard = ago(Duration::from_millis(SERVER_ASSOCIATION_TIMEOUT_MS + 1000));
+        server.send(&instruction(1)).await.unwrap();
+        assert!(!server.has_remote(), "server should detach");
+
+        let seq = server.send_seq();
+        server.send(&instruction(2)).await.unwrap();
+        assert_eq!(server.send_seq(), seq, "detached server must not send");
+
+        server
+            .process_incoming(&client_packet(k, 1, 2, 0xFFFF), peer)
+            .unwrap();
+        assert!(server.has_remote(), "a fresh packet re-attaches");
+    }
+
+    /// Mosh closes the older sockets once the newest port has been in use
+    /// for MAX_OLD_SOCKET_AGE; polling them forever is wasted work.
+    #[tokio::test]
+    async fn old_sockets_are_closed_once_the_new_port_has_aged() {
+        let k = key();
+        let mut client = Connection::new_client(Session::new(k)).await.unwrap();
+        client.set_remote_addr("127.0.0.1:9".parse().unwrap());
+        client.hop_port().await.unwrap();
+        client.hop_port().await.unwrap();
+        assert_eq!(client.socket_count(), 3);
+        let newest = client.local_addr();
+
+        // A reply arrives before the new port is old enough: keep them all.
+        let server_packet = |seq: u64| {
+            let mut text = vec![0xFF, 0xFF, 0xFF, 0xFF];
+            text.extend_from_slice(
+                &Fragmenter::new()
+                    .make_fragments(&instruction(1), 500)
+                    .unwrap()[0]
+                    .to_bytes(),
+            );
+            Session::new(k).encrypt(&morsh_crypto::Message::new(
+                Nonce::from_val(TO_CLIENT_BIT | seq),
+                text,
+            ))
+        };
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        client.process_incoming(&server_packet(0), from).unwrap();
+        assert_eq!(client.socket_count(), 3);
+
+        client.last_port_choice = ago(Duration::from_millis(MAX_OLD_SOCKET_AGE_MS + 1000));
+        client.process_incoming(&server_packet(1), from).unwrap();
+        assert_eq!(client.socket_count(), 1);
+        assert_eq!(client.local_addr(), newest, "the newest socket survives");
+    }
+
+    #[tokio::test]
+    async fn at_most_max_ports_open() {
+        let mut client = Connection::new_client(Session::new(key())).await.unwrap();
+        client.set_remote_addr("127.0.0.1:9".parse().unwrap());
+        for _ in 0..MAX_PORTS_OPEN + 5 {
+            client.hop_port().await.unwrap();
+        }
+        assert_eq!(client.socket_count(), MAX_PORTS_OPEN);
+    }
+
+    /// An IPv4 socket cannot reach an IPv6 server. Mosh creates the client
+    /// socket in the server's family and uses the IPv6 MTU for it.
+    #[tokio::test]
+    async fn client_reaches_an_ipv6_server() {
+        let k = key();
+        let v6: SocketAddr = "[::1]:0".parse().unwrap();
+        let Ok(mut server) = Connection::new_server(v6, Session::new(k)).await else {
+            eprintln!("no IPv6 loopback; skipping");
+            return;
+        };
+        assert_eq!(server.mtu(), MTU_IPV6);
+        let mut client = Connection::new_client(Session::new(k)).await.unwrap();
+        client.set_remote_addr(server.local_addr().unwrap());
+        assert_eq!(client.mtu(), MTU_IPV6);
+        assert!(client.local_addr().unwrap().is_ipv6());
+
+        client
+            .send(&instruction(1))
+            .await
+            .expect("send to IPv6 server");
+        let (data, peer) = tokio::time::timeout(Duration::from_secs(5), server.recv_raw())
+            .await
+            .expect("datagram should arrive")
+            .unwrap();
+        let inst = server.process_incoming(&data, peer).unwrap().unwrap();
+        assert_eq!(inst.new_num, Some(1));
+
+        client.hop_port().await.unwrap();
+        assert!(
+            client.local_addr().unwrap().is_ipv6(),
+            "hop keeps the family"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv4_mtu_is_used_for_an_ipv4_peer() {
+        let mut client = Connection::new_client(Session::new(key())).await.unwrap();
+        client.set_remote_addr("127.0.0.1:9".parse().unwrap());
+        assert_eq!(client.mtu(), MTU_IPV4);
+    }
+
+    /// Mosh attempts every fragment even when `sendto` fails; morsh used to
+    /// give up on the instruction at the first error.
+    #[tokio::test]
+    async fn every_fragment_is_attempted_when_sendto_fails() {
+        let mut client = Connection::new_client(Session::new(key())).await.unwrap();
+        // Broadcast without SO_BROADCAST: every sendto fails (EACCES).
+        client.set_remote_addr("255.255.255.255:9".parse().unwrap());
+        let mut big = instruction(1);
+        big.diff = Some(
+            (0..20_000u32)
+                .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                .collect(),
+        );
+        let fragments = Fragmenter::new()
+            .make_fragments(&big, max_fragment_payload(client.mtu()))
+            .unwrap()
+            .len() as u64;
+        assert!(fragments > 1);
+
+        let err = client.send(&big).await.unwrap_err();
+        assert!(err.contains("sendto"), "{err}");
+        assert_eq!(client.send_seq(), fragments, "every fragment attempted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emsgsize_is_recognised() {
+        assert!(is_emsgsize(&std::io::Error::from_raw_os_error(
+            libc::EMSGSIZE
+        )));
+        assert!(!is_emsgsize(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
     }
 
     /// Garbage must not authenticate.

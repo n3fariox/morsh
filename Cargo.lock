@@ -1647,6 +1647,7 @@ version = "0.0.7"
 dependencies = [
  "flate2",
  "futures",
+ "libc",
  "morsh-crypto",
  "morsh-proto",
  "prost",
