@@ -54,6 +54,7 @@ fn parse_timeout(name: &str, value: &str) -> Option<Duration> {
 #[derive(Clone, Copy)]
 pub(crate) enum ShutdownSignal {
     Terminate,
+    #[cfg_attr(not(unix), allow(dead_code))]
     Idle,
 }
 

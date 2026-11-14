@@ -59,6 +59,14 @@ pub fn spawn_pty(
         cmd.env(name, value);
     }
 
+    tracing::info!(
+        cols = pty_size.cols,
+        rows = pty_size.rows,
+        columns_env = ?cmd.get_env("COLUMNS"),
+        lines_env = ?cmd.get_env("LINES"),
+        "Creating child PTY"
+    );
+
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(pty_size)

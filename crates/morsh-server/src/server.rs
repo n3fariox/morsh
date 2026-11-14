@@ -107,6 +107,26 @@ async fn bind_transport(
     ))
 }
 
+/// Translate a resize from the wire into the dimensions accepted by the PTY.
+fn client_pty_size(width: i32, height: i32) -> Option<PtySize> {
+    // ConPTY passes dimensions through a signed COORD. Reject invalid sizes
+    // rather than turning transient zero sizes into 1x1 or wrapping the cast.
+    let max = if cfg!(windows) {
+        i16::MAX as i32
+    } else {
+        u16::MAX as i32
+    };
+    if !(1..=max).contains(&width) || !(1..=max).contains(&height) {
+        return None;
+    }
+    Some(PtySize {
+        rows: height as u16,
+        cols: width as u16,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
 /// Block until the client's first state arrives, and take the window size it
 /// asks for. Mosh releases the login shell at the same point.
 async fn wait_for_client(
@@ -125,7 +145,10 @@ async fn wait_for_client(
     while transport.get_remote_state_num() == 0 {
         let last_state = transport.get_latest_remote_state().timestamp;
         if timeouts.expired(last_state) {
-            eprintln!("Network idle for {} seconds.", last_state.elapsed().as_secs());
+            eprintln!(
+                "Network idle for {} seconds.",
+                last_state.elapsed().as_secs()
+            );
             return Ok(None);
         }
         let mut remaining = deadline.saturating_duration_since(Instant::now());
@@ -166,12 +189,11 @@ async fn wait_for_client(
     }
     for event in stream.events() {
         if let UserEvent::Resize { width, height } = event {
-            pty_size = PtySize {
-                rows: (*height).clamp(1, u16::MAX as i32) as u16,
-                cols: (*width).clamp(1, u16::MAX as i32) as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            };
+            if let Some(size) = client_pty_size(*width, *height) {
+                pty_size = size;
+            } else {
+                tracing::warn!("Ignoring invalid initial PTY resize: {width}x{height}");
+            }
             tracing::info!("Client initial resize: {}x{}", pty_size.cols, pty_size.rows);
         }
     }
@@ -340,15 +362,20 @@ impl Handler {
     }
 
     fn apply_resize(&mut self, width: i32, height: i32) {
-        let w = width.clamp(1, u16::MAX as i32) as u16;
-        let h = height.clamp(1, u16::MAX as i32) as u16;
+        let Some(size) = client_pty_size(width, height) else {
+            tracing::warn!("Ignoring invalid PTY resize: {width}x{height}");
+            return;
+        };
+        let (w, h) = (size.cols, size.rows);
 
-        let _ = self.pty.master.resize(PtySize {
-            rows: h,
-            cols: w,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Err(error) = self.pty.master.resize(size) {
+            tracing::warn!("Failed to resize PTY to {w}x{h}: {error}");
+            // Stock mosh shuts down on a Unix ioctl error. A transient ConPTY
+            // failure keeps the Windows session at its last successful size.
+            #[cfg(unix)]
+            self.transport.start_shutdown();
+            return;
+        }
 
         if self.transport.shutdown_in_progress() {
             return;
@@ -357,6 +384,7 @@ impl Handler {
         // threw away everything on the screen.
         if let Err(e) = self.transport.get_current_state_mut().resize(w, h) {
             tracing::warn!("Failed to resize terminal: {e}");
+            self.transport.start_shutdown();
         }
         tracing::info!("Client resize: {w}x{h}");
     }
@@ -408,6 +436,125 @@ impl Handler {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_client_size_reaches_the_child_before_it_runs() {
+        let key = Base64Key::random();
+        let mut server = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let mut connection = Connection::new_client(Session::new(*key.data()))
+            .await
+            .unwrap();
+        connection.set_remote_addr(server.connection().local_addr().unwrap());
+        // The protocol baseline must be empty. Enqueue the initial resize
+        // after construction so it is transmitted rather than assumed shared.
+        let mut client = Transport::new_client(
+            connection,
+            UserStream::new(),
+            Complete::new(180, 52).unwrap(),
+        );
+        client.get_current_state_mut().push_resize(80, 24);
+        client.get_current_state_mut().push_resize(180, 52);
+        client.get_current_state_mut().push_resize(0, 0);
+        let mut signals = Signals::new().unwrap();
+        let timeouts = Timeouts::default();
+        let size = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                size = wait_for_client(&mut server, &mut signals, &timeouts) => size.unwrap().unwrap(),
+                _ = async {
+                    loop {
+                        client.tick().await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => unreachable!(),
+            }
+        }).await.unwrap();
+        assert_eq!((size.cols, size.rows), (180, 52));
+
+        let mut pty = pty::spawn_pty(
+            size,
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "stty size".into()],
+            &[],
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = pty.rx.recv().await {
+                match event {
+                    PtyEvent::Output(bytes) => output.extend(bytes),
+                    PtyEvent::Exited(_) => break,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pty.child.wait().unwrap().success());
+        assert_eq!(String::from_utf8(output).unwrap().trim(), "52 180");
+    }
+
+    #[test]
+    fn invalid_resize_does_not_turn_into_a_tiny_terminal() {
+        for (width, height) in [(0, 0), (0, 24), (80, 0), (-1, 24), (80, -1)] {
+            assert!(client_pty_size(width, height).is_none(), "{width}x{height}");
+        }
+        let size = client_pty_size(180, 52).unwrap();
+        assert_eq!((size.cols, size.rows), (180, 52));
+    }
+
+    struct FailedResize;
+
+    impl portable_pty::MasterPty for FailedResize {
+        fn resize(&self, _: PtySize) -> anyhow::Result<()> {
+            anyhow::bail!("native resize failed")
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_native_resize_does_not_desynchronize_the_terminal() {
+        let key = Base64Key::random();
+        let transport = bind_transport(0, Some("127.0.0.1"), &key).await.unwrap();
+        let mut pty = pty::spawn_pty(
+            PtySize::default(),
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), "exit".into()],
+            &[],
+        )
+        .unwrap();
+        pty.master = Box::new(FailedResize);
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        handler.apply_resize(180, 52);
+        assert!(
+            handler.transport.shutdown_in_progress(),
+            "a native resize failure must be handled"
+        );
+        assert!(
+            handler
+                .transport
+                .get_current_state()
+                .state_equal(&Complete::new(80, 24).unwrap()),
+            "the synchronized screen must not claim an unsuccessful native resize"
+        );
+        handler.shutdown().await;
+    }
 
     #[test]
     fn batched_output_matches_individual_terminal_updates() {
@@ -528,5 +675,18 @@ mod tests {
         .unwrap();
         assert_eq!(output, b"final-output");
         assert!(handler.transport.shutdown_in_progress());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_size_tests {
+    use super::*;
+
+    #[test]
+    fn conpty_sizes_fit_signed_coordinates() {
+        assert!(client_pty_size(i16::MAX as i32, i16::MAX as i32).is_some());
+        assert!(client_pty_size(i16::MAX as i32 + 1, 24).is_none());
+        assert!(client_pty_size(80, i16::MAX as i32 + 1).is_none());
+        assert!(client_pty_size(0, 0).is_none());
     }
 }
