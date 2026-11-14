@@ -78,10 +78,19 @@ impl ConditionalOverlayCell {
     }
 
     /// Start a new prediction in this cell: `Some` character, or `None` for
-    /// "something unknown will be here". What the cell predicted before is
-    /// kept for credit tracking.
-    pub fn predict(&mut self, epoch: u64, frame: u64, time: Instant, replacement: Option<char>) {
+    /// "something unknown will be here". What the cell predicted before, and
+    /// the `original` character the screen shows there, are kept for credit
+    /// tracking: matching either proves nothing.
+    pub fn predict(
+        &mut self,
+        epoch: u64,
+        frame: u64,
+        time: Instant,
+        original: char,
+        replacement: Option<char>,
+    ) {
         self.reset_with_orig();
+        self.original_contents.push(original);
         self.active = true;
         self.tentative_until_epoch = epoch;
         self.expire(frame, time);
@@ -97,13 +106,14 @@ impl ConditionalOverlayCell {
         self.prediction_time = time;
     }
 
-    /// Check validity against the actual cell content.
+    /// Check validity against the actual cell content: `None` for a cell no
+    /// one `char` describes (a wide glyph or a cluster), which no prediction
+    /// matches. Mosh's `ConditionalOverlayCell::get_validity`.
     pub fn get_validity(
         &self,
-        actual: char,
+        actual: Option<char>,
         row_height: usize,
         col_width: usize,
-        _early_ack: u64,
         late_ack: u64,
     ) -> Validity {
         if !self.active {
@@ -122,13 +132,15 @@ impl ConditionalOverlayCell {
             return Validity::CorrectNoCredit;
         }
 
-        if self.replacement == ' ' && actual == ' ' {
+        if self.replacement == ' ' {
+            // Too easy to match, and too easy to miss (an autosuggestion
+            // filling the end of the line), to count either way.
             return Validity::CorrectNoCredit;
         }
 
-        if actual == self.replacement {
+        if actual == Some(self.replacement) {
             // Check if it matches original content (no credit)
-            if self.original_contents.contains(&actual) {
+            if self.original_contents.contains(&self.replacement) {
                 return Validity::CorrectNoCredit;
             }
             return Validity::Correct;
@@ -312,9 +324,9 @@ mod tests {
         cell.replacement = 'A';
         cell.expire(10, Instant::now());
 
-        assert_eq!(cell.get_validity('A', 24, 80, 0, 10), Validity::Correct);
+        assert_eq!(cell.get_validity(Some('A'), 24, 80, 10), Validity::Correct);
         assert_eq!(
-            cell.get_validity('B', 24, 80, 0, 10),
+            cell.get_validity(Some('B'), 24, 80, 10),
             Validity::IncorrectOrExpired
         );
     }
@@ -327,13 +339,16 @@ mod tests {
         cell.expire(5, Instant::now());
 
         // late_ack < expiration_frame → Pending
-        assert_eq!(cell.get_validity('X', 24, 80, 0, 3), Validity::Pending);
+        assert_eq!(cell.get_validity(Some('X'), 24, 80, 3), Validity::Pending);
     }
 
     #[test]
     fn overlay_cell_inactive() {
         let cell = ConditionalOverlayCell::new(0, 1);
-        assert_eq!(cell.get_validity('A', 24, 80, 0, 100), Validity::Inactive);
+        assert_eq!(
+            cell.get_validity(Some('A'), 24, 80, 100),
+            Validity::Inactive
+        );
     }
 
     #[test]

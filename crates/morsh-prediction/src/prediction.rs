@@ -407,7 +407,7 @@ impl PredictionEngine {
         let cells = &mut self.overlay.get_or_make_row(row, num_cols, epoch).cells;
         if self.predict_overwrite {
             // Just clear the cell to the left
-            cells[new_col].predict(epoch, frame, now, Some(' '));
+            cells[new_col].predict(epoch, frame, now, line[0], Some(' '));
             return;
         }
         // Left to right, so each cell reads its right-hand neighbour before
@@ -425,7 +425,7 @@ impl PredictionEngine {
             } else {
                 None
             };
-            cells[i].predict(epoch, frame, now, shifted);
+            cells[i].predict(epoch, frame, now, line[i - new_col], shifted);
         }
     }
 
@@ -465,9 +465,9 @@ impl PredictionEngine {
                 // made every keystroke visually erase the rest of the line.
                 (false, false, _) => Some(line[i - 1 - col]),
             };
-            cells[i].predict(epoch, frame, now, shifted);
+            cells[i].predict(epoch, frame, now, line[i - col], shifted);
         }
-        cells[col].predict(epoch, frame, now, Some(ch));
+        cells[col].predict(epoch, frame, now, line[0], Some(ch));
 
         // Move the cursor right, or wrap.
         if col + 1 < num_cols {
@@ -529,12 +529,6 @@ impl PredictionEngine {
         // Prune out-of-bounds rows
         self.overlay.prune(num_rows);
 
-        let get_cell = |r: usize, c: usize| {
-            screen
-                .cell(c as u16, r as u16)
-                .and_then(|d| d.text.chars().next())
-                .unwrap_or(' ')
-        };
         let (cursor_row, cursor_col) = (screen.cursor_y as usize, screen.cursor_x as usize);
 
         // Validate overlay cells
@@ -544,12 +538,10 @@ impl PredictionEngine {
         for row in self.overlay.rows_mut() {
             let rn = row.row_num;
             for cell in &mut row.cells {
-                let actual = get_cell(rn, cell.col);
                 let validity = cell.get_validity(
-                    actual,
+                    screen_char(screen, rn, cell.col),
                     num_rows,
                     num_cols,
-                    self.local_frame_acked,
                     self.local_frame_late_acked,
                 );
 
@@ -896,6 +888,62 @@ mod tests {
         engine.set_send_interval(50);
         engine.cull(&blank(0, 0));
         assert!(engine.srtt_trigger);
+    }
+
+    /// A shell that shows an autosuggestion after the cursor fills cells the
+    /// prediction shifted blanks into. Like mosh, a predicted blank is too
+    /// easy to match to earn credit, and too easy to miss to count against
+    /// the prediction: typing carries on displayed rather than tentative.
+    #[test]
+    fn text_where_a_blank_was_predicted_is_not_a_misprediction() {
+        let mut engine = engine();
+        engine.new_user_byte('x', &screen(20, 3, 0, 2, "$ "));
+        engine.set_local_frame_sent(1);
+        engine.set_local_frame_late_acked(1);
+        let echoed = screen(20, 3, 0, 3, "$ xyz");
+        engine.cull(&echoed);
+
+        engine.new_user_byte('y', &echoed);
+        let y = &engine.overlay().get_row(0).unwrap().cells[3];
+        assert_eq!((y.active, y.replacement), (true, 'y'));
+        assert!(
+            !y.is_tentative(engine.confirmed_epoch()),
+            "next keystroke hidden"
+        );
+    }
+
+    /// A prediction that matches what the screen already showed proves
+    /// nothing, so it confirms nothing (mosh's `original_contents`).
+    #[test]
+    fn a_prediction_matching_the_old_contents_earns_no_credit() {
+        let mut engine = engine();
+        // After Enter, predictions are tentative until one is confirmed.
+        let before = screen(20, 3, 1, 0, "a");
+        type_str(&mut engine, "\r", &before);
+        engine.new_user_byte('a', &before);
+        engine.set_local_frame_sent(1);
+        engine.set_local_frame_late_acked(1);
+        // The host ignored the keystroke; the 'a' was there all along.
+        let mut after = before.clone();
+        after.rows[1][0].text = "a".to_string();
+        after.cursor_x = 1;
+        let epoch = engine.prediction_epoch;
+        engine.cull(&after);
+        assert!(engine.confirmed_epoch() < epoch);
+    }
+
+    /// A cluster is not the plain character it starts with.
+    #[test]
+    fn a_cluster_does_not_confirm_its_first_character() {
+        let mut engine = engine();
+        type_str(&mut engine, "\re", &blank(0, 0));
+        engine.set_local_frame_sent(1);
+        engine.set_local_frame_late_acked(1);
+        let mut after = blank(0, 1);
+        after.rows[0][0].text = "e\u{301}".to_string();
+        let epoch = engine.prediction_epoch;
+        engine.cull(&after);
+        assert!(engine.confirmed_epoch() < epoch);
     }
 
     /// Mosh's glitch trigger: a prediction pending for a quarter second is
