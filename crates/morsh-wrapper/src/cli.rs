@@ -43,7 +43,7 @@ pub(crate) struct Args {
     pub(crate) predict: String,
 
     /// Do not send terminal initialization and restoration sequences.
-    #[arg(long, overrides_with = "init")]
+    #[arg(long, alias = "noinit", overrides_with = "init")]
     pub(crate) no_init: bool,
 
     /// Send terminal initialization and restoration sequences (default).
@@ -169,6 +169,7 @@ mod tests {
     #[test]
     fn stock_terminal_init_flags_are_accepted() {
         assert!(Args::try_parse_from(["morsh", "--no-init", "host"]).is_ok());
+        assert!(Args::try_parse_from(["morsh", "--noinit", "host"]).is_ok());
         assert!(Args::try_parse_from(["morsh", "--init", "host"]).is_ok());
     }
 
@@ -177,6 +178,7 @@ mod tests {
         for (flags, expected) in [
             (vec![], false),
             (vec!["--no-init"], true),
+            (vec!["--noinit"], true),
             (vec!["--init"], false),
             (vec!["--no-init", "--init"], false),
             (vec!["--init", "--no-init"], true),
