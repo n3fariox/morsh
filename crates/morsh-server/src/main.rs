@@ -24,13 +24,21 @@ fn get_ssh_connection_ip() -> Option<String> {
     None
 }
 
+fn desired_bind_address(opts: &cli::CliOptions, ssh_ip: Option<String>) -> Option<String> {
+    if opts.use_ssh_connection {
+        opts.bind_addr.clone().or(ssh_ip)
+    } else {
+        opts.bind_addr.clone()
+    }
+}
+
 /// Find a free UDP port on `ip` within the requested range.
 ///
-/// `low == 0` means no range was requested, so use mosh's default
+/// No requested range means mosh's default
 /// 60001-60999 rather than an OS-assigned ephemeral port that firewall rules
 /// for mosh won't cover.  Mirrors mosh, which walks the range and takes the
 /// first port it can bind.
-fn pick_port(ip: &str, low: u16, high: u16) -> Result<u16, String> {
+fn pick_port(ip: &str, range: Option<(u16, u16)>) -> Result<u16, String> {
     let addr_for = |port: u16| -> SocketAddr {
         match ip.parse::<std::net::IpAddr>() {
             Ok(parsed) => SocketAddr::new(parsed, port),
@@ -38,11 +46,7 @@ fn pick_port(ip: &str, low: u16, high: u16) -> Result<u16, String> {
         }
     };
 
-    let (low, high) = if low == 0 {
-        (PORT_RANGE_LOW, PORT_RANGE_HIGH)
-    } else {
-        (low, high)
-    };
+    let (low, high) = range.unwrap_or((PORT_RANGE_LOW, PORT_RANGE_HIGH));
 
     let mut last_err = String::new();
     for port in low..=high {
@@ -75,12 +79,12 @@ fn main() {
         Base64Key::random()
     };
 
-    let ssh_ip = if opts.use_ssh_connection || opts.bind_addr.is_none() {
+    let ssh_ip = if opts.use_ssh_connection {
         get_ssh_connection_ip()
     } else {
         None
     };
-    let desired_ip = opts.bind_addr.clone().or(ssh_ip);
+    let desired_ip = desired_bind_address(&opts, ssh_ip);
 
     // The daemon child inherits the port its parent already advertised.
     let port = if is_daemon_child {
@@ -91,8 +95,7 @@ fn main() {
     } else {
         match pick_port(
             desired_ip.as_deref().unwrap_or("0.0.0.0"),
-            opts.port_low,
-            opts.port_high,
+            opts.port_requested.then_some((opts.port_low, opts.port_high)),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -175,17 +178,32 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bind_any_does_not_use_ssh_connection_address() {
+        let mut opts = cli::CliOptions::default();
+        let ssh_ip = Some("127.0.0.2".to_string());
+        assert_eq!(desired_bind_address(&opts, ssh_ip.clone()), None);
+        opts.use_ssh_connection = true;
+        assert_eq!(desired_bind_address(&opts, ssh_ip.clone()), ssh_ip);
+    }
+
+    #[test]
+    fn explicit_port_zero_uses_an_assigned_port() {
+        let port = pick_port("127.0.0.1", Some((0, 0))).unwrap();
+        assert_ne!(port, 0);
+    }
+
     /// Without `-p`, the server used to bind port 0 and land in the OS
     /// ephemeral range (~49152+ on Windows), outside mosh firewall rules.
     #[test]
     fn no_requested_range_uses_moshs_default() {
-        let port = pick_port("127.0.0.1", 0, 0).unwrap();
+        let port = pick_port("127.0.0.1", None).unwrap();
         assert!((PORT_RANGE_LOW..=PORT_RANGE_HIGH).contains(&port), "{port}");
     }
 
     #[test]
     fn an_explicit_range_is_honoured() {
-        let port = pick_port("127.0.0.1", 61500, 61510).unwrap();
+        let port = pick_port("127.0.0.1", Some((61500, 61510))).unwrap();
         assert!((61500..=61510).contains(&port), "{port}");
     }
 }
