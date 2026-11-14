@@ -41,27 +41,9 @@ impl client::Handler for SshHandler {
 }
 
 impl SshSession {
-    /// Connect to `host:port` as `user`, offering each private key in turn
-    /// the way ssh does, and verifying the server against `host_keys`.
-    ///
-    /// Unencrypted keys are tried first; a passphrase is only asked for once
-    /// none of them was accepted, so an unused encrypted key never prompts.
-    pub fn connect(
-        addr: String,
-        user: impl Into<String> + Send,
-        key_paths: &[std::path::PathBuf],
-        host_keys: HostKeyPolicy,
-    ) -> Result<Self> {
-        use std::net::ToSocketAddrs;
-        let mut addresses: Vec<_> = addr
-            .to_socket_addrs()
-            .with_context(|| format!("Failed to resolve {addr}"))?
-            .collect();
-        addresses.sort_by_key(|address| !address.is_ipv4());
-        Self::connect_addresses(addresses, user, key_paths, host_keys)
-    }
-
-    /// Connect using the caller's address filtering and preference order.
+    /// Connect as `user` using the caller's address filtering and preference
+    /// order, offering each private key and verifying the server against
+    /// `host_keys`. A passphrase is only requested after unencrypted keys fail.
     pub fn connect_addresses(
         addresses: Vec<std::net::SocketAddr>,
         user: impl Into<String> + Send,
