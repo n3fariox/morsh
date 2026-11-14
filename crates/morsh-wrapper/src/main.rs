@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 
 mod banner;
 mod cli;
+mod connect;
+use connect::ConnectInfo;
 mod ssh_command;
 use cli::Args;
 #[cfg(feature = "russh")]
@@ -79,15 +81,6 @@ enum BindServer {
     Any,
     /// `-i ADDR`.
     Address(String),
-}
-
-/// Parsed MOSH CONNECT line from server.
-struct ConnectInfo {
-    port: u16,
-    key: String,
-    /// The address the SSH connection actually reached (mosh's `MOSH IP`),
-    /// when the backend could observe it.
-    ip: Option<String>,
 }
 
 fn main() {
@@ -415,7 +408,9 @@ fn try_launch_server(
     if proxy.is_some() {
         command.env("SHELL", "/bin/sh");
     }
-    let mut ssh_child = command.spawn().ok()?;
+    let mut ssh_child = command.spawn().inspect_err(|e| {
+        eprintln!("morsh: failed to start SSH command '{}': {e}", ssh_args[0]);
+    }).ok()?;
 
     let stdout = ssh_child.stdout.take()?;
     let stderr = ssh_child.stderr.take()?;
@@ -426,7 +421,6 @@ fn try_launch_server(
     // as it is seen, so we never wait on the proxy process to exit.
     let (ip_tx, ip_rx) = std::sync::mpsc::channel::<String>();
     let stderr_reader = std::thread::spawn(move || {
-        let mut rest = String::new();
         let mut seen_ip = false;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             match fake_proxy::parse_ip_line(&line) {
@@ -435,34 +429,20 @@ fn try_launch_server(
                     let _ = ip_tx.send(addr.to_string());
                 }
                 _ => {
-                    rest.push_str(&line);
-                    rest.push('\n');
+                    eprintln!("{line}");
                 }
             }
         }
-        rest
     });
 
-    let mut connect_info = None;
-
-    for line in reader.lines() {
-        let line = line.ok()?;
-        tracing::debug!("SSH stdout: {line}");
-
-        if line.starts_with("MOSH CONNECT") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                if let Ok(port) = parts[2].parse::<u16>() {
-                    connect_info = Some(ConnectInfo {
-                        port,
-                        key: parts[3].to_string(),
-                        ip: None,
-                    });
-                    break;
-                }
-            }
+    let mut connect_info = match ConnectInfo::read_output(reader) {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("morsh: could not read SSH stdout: {e}");
+            let _ = ssh_child.kill();
+            None
         }
-    }
+    };
 
     let _ = ssh_child.wait();
 
@@ -478,11 +458,7 @@ fn try_launch_server(
         // If we never found the MOSH CONNECT line, the SSH command likely
         // failed. Surface its stderr so the user can see what went wrong.
         None => {
-            if let Ok(err) = stderr_reader.join() {
-                if !err.trim().is_empty() {
-                    eprint!("{err}");
-                }
-            }
+            let _ = stderr_reader.join();
         }
     }
 
@@ -636,18 +612,8 @@ fn try_launch_russh(
             &remote_cmd,
             move |line: String| {
                 tracing::debug!("russh stdout: {line}");
-                if line.starts_with("MOSH CONNECT") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        if let Ok(port) = parts[2].parse::<u16>() {
-                            let mut guard = connect_info_clone.lock().unwrap();
-                            *guard = Some(ConnectInfo {
-                                port,
-                                key: parts[3].to_string(),
-                                ip: None,
-                            });
-                        }
-                    }
+                if let Some(info) = ConnectInfo::parse(&line) {
+                    *connect_info_clone.lock().unwrap() = Some(info);
                 }
             },
         )
