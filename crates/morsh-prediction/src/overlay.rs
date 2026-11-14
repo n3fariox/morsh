@@ -77,6 +77,20 @@ impl ConditionalOverlayCell {
         self.tentative_until_epoch = u64::MAX;
     }
 
+    /// Start a new prediction in this cell: `Some` character, or `None` for
+    /// "something unknown will be here". What the cell predicted before is
+    /// kept for credit tracking.
+    pub fn predict(&mut self, epoch: u64, frame: u64, time: Instant, replacement: Option<char>) {
+        self.reset_with_orig();
+        self.active = true;
+        self.tentative_until_epoch = epoch;
+        self.expire(frame, time);
+        self.unknown = replacement.is_none();
+        if let Some(ch) = replacement {
+            self.replacement = ch;
+        }
+    }
+
     /// Mark as active with an expiration.
     pub fn expire(&mut self, frame: u64, time: Instant) {
         self.expiration_frame = frame;

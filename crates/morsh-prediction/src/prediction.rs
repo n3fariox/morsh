@@ -259,18 +259,17 @@ impl PredictionEngine {
 
         // Only now pick the cursor: a resize above drops predictions made
         // for the old size, whose cursor may lie beyond the new one.
-        let (cursor_row, cursor_col) = self
+        let (row, col) = self
             .cursor_pos()
             .unwrap_or((screen.cursor_y as usize, screen.cursor_x as usize));
-        if cursor_row >= num_rows || cursor_col >= num_cols {
+        if row >= num_rows || col >= num_cols {
             // Nowhere sensible to predict from.
             self.unknown_input();
             self.input_state = InputState::Ground;
             return;
         }
-        let cell_at = |r: usize, c: usize| screen_char(screen, r, c);
 
-        self.init_cursor(cursor_row, cursor_col);
+        self.init_cursor(row, col);
 
         // Escape sequences (arrow keys, function keys, Alt+key) must not be
         // predicted as printable text.
@@ -292,13 +291,13 @@ impl PredictionEngine {
                 // Final bytes are 0x40..=0x7E; anything else is a parameter/intermediate
                 if ('\x40'..='\x7e').contains(&ch) {
                     self.input_state = InputState::Ground;
-                    self.predict_cursor_key(ch, num_cols, &cell_at);
+                    self.predict_cursor_key(ch, screen);
                 }
                 return;
             }
             InputState::Ss3 => {
                 self.input_state = InputState::Ground;
-                self.predict_cursor_key(ch, num_cols, &cell_at);
+                self.predict_cursor_key(ch, screen);
                 return;
             }
         }
@@ -306,33 +305,31 @@ impl PredictionEngine {
         if ch == '\x1b' {
             self.input_state = InputState::Escape;
         } else if ch == '\x7f' {
-            self.predict_backspace(cursor_row, cursor_col, num_cols, &cell_at);
+            self.predict_backspace(row, col, screen);
         } else if ch.is_control() || (!ch.is_ascii_graphic() && ch != ' ') {
             // Unknown control character (including Enter) — the server may
             // move the cursor anywhere, so it's no longer predictable
             self.unknown_input();
         } else {
-            self.predict_insert(ch, cursor_row, cursor_col, num_cols, num_rows, &cell_at);
+            self.predict_insert(ch, row, col, screen);
         }
     }
 
     /// Handle the final byte of a CSI/SS3 key sequence. Left/right arrows move
     /// the predicted cursor (as stock mosh does); anything else is unknown, as
     /// is stepping over a wide glyph, which the host may do in one keypress.
-    fn predict_cursor_key<F>(&mut self, final_byte: char, num_cols: usize, cell_at: &F)
-    where
-        F: Fn(usize, usize) -> Option<char>,
-    {
+    fn predict_cursor_key(&mut self, final_byte: char, screen: &ScreenSnapshot) {
         let frame = self.local_frame_sent + 1;
+        let num_cols = screen.cols as usize;
         match (final_byte, self.cursors.last_mut()) {
-            ('C', Some(cursor)) if cell_at(cursor.row, cursor.col).is_some() => {
+            ('C', Some(cursor)) if screen_char(screen, cursor.row, cursor.col).is_some() => {
                 if cursor.col + 1 < num_cols {
                     cursor.col += 1;
                     cursor.expiration_frame = frame;
                 }
             }
             ('D', Some(cursor))
-                if cursor.col == 0 || cell_at(cursor.row, cursor.col - 1).is_some() =>
+                if cursor.col == 0 || screen_char(screen, cursor.row, cursor.col - 1).is_some() =>
             {
                 if cursor.col > 0 {
                     cursor.col -= 1;
@@ -373,201 +370,118 @@ impl PredictionEngine {
         }
     }
 
+    /// The characters at `cols` of `row`, or `None` if any of them is a cell
+    /// a one-`char` prediction can't stand in for.
+    fn line(
+        screen: &ScreenSnapshot,
+        row: usize,
+        cols: std::ops::RangeInclusive<usize>,
+    ) -> Option<Vec<char>> {
+        cols.map(|col| screen_char(screen, row, col)).collect()
+    }
+
     /// Predict a backspace: move the cursor left and shift the rest of the
     /// line leftward over the deleted cell.
-    fn predict_backspace<F>(
-        &mut self,
-        cursor_row: usize,
-        cursor_col: usize,
-        num_cols: usize,
-        cell_at: &F,
-    ) where
-        F: Fn(usize, usize) -> Option<char>,
-    {
-        if cursor_col == 0 {
+    fn predict_backspace(&mut self, row: usize, col: usize, screen: &ScreenSnapshot) {
+        if col == 0 {
             return;
         }
-
-        let new_col = cursor_col - 1;
+        let num_cols = screen.cols as usize;
+        let new_col = col - 1;
         let rightmost = if self.predict_overwrite {
             new_col
         } else {
             num_cols - 1
         };
-        let Some(line) = (new_col..=rightmost)
-            .map(|col| cell_at(cursor_row, col))
-            .collect::<Option<Vec<char>>>()
-        else {
+        let Some(line) = Self::line(screen, row, new_col..=rightmost) else {
             self.unknown_input();
             return;
         };
 
-        let frame = self.local_frame_sent + 1;
-        let now = Instant::now();
-        let epoch = self.prediction_epoch;
-
-        // Move cursor left
-        if let Some(last_cursor) = self.cursors.last_mut() {
-            last_cursor.col = new_col;
-            last_cursor.expiration_frame = frame;
+        let (epoch, frame, now) = (
+            self.prediction_epoch,
+            self.local_frame_sent + 1,
+            Instant::now(),
+        );
+        if let Some(cursor) = self.cursors.last_mut() {
+            cursor.col = new_col;
+            cursor.expiration_frame = frame;
         }
 
+        let cells = &mut self.overlay.get_or_make_row(row, num_cols, epoch).cells;
         if self.predict_overwrite {
             // Just clear the cell to the left
-            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
-            let cell = &mut row.cells[new_col];
-            cell.reset_with_orig();
-            cell.active = true;
-            cell.tentative_until_epoch = epoch;
-            cell.expire(frame, now);
-            cell.unknown = false;
-            cell.replacement = ' ';
+            cells[new_col].predict(epoch, frame, now, Some(' '));
             return;
         }
-
-        // Read the right-hand neighbours before mutating, so each cell sees
-        // the pre-shift state — the same values mosh reads, since it walks
-        // left to right and only ever looks one column ahead.
-        let right_states: Vec<(bool, bool, char)> = {
-            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
-            (0..num_cols)
-                .map(|i| {
-                    if i + 1 < num_cols {
-                        let next = &row.cells[i + 1];
-                        (next.active, next.unknown, next.replacement)
-                    } else {
-                        (false, false, ' ')
-                    }
-                })
-                .collect()
-        };
-
-        let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
-        for (i, right) in right_states.iter().enumerate().take(num_cols).skip(new_col) {
-            let cell = &mut row.cells[i];
-            cell.reset_with_orig();
-            cell.active = true;
-            cell.tentative_until_epoch = epoch;
-            cell.expire(frame, now);
-
-            if i + 2 < num_cols {
-                let (next_active, next_unknown, next_replacement) = *right;
-                if next_active {
-                    cell.unknown = next_unknown;
-                    if !next_unknown {
-                        cell.replacement = next_replacement;
-                    }
-                } else {
+        // Left to right, so each cell reads its right-hand neighbour before
+        // that neighbour is overwritten, as mosh does.
+        for i in new_col..num_cols {
+            let shifted = if i + 2 < num_cols {
+                let next = &cells[i + 1];
+                match (next.active, next.unknown) {
+                    (true, true) => None,
+                    (true, false) => Some(next.replacement),
                     // Nothing predicted there: shift what the server actually
                     // has one column left.
-                    cell.unknown = false;
-                    cell.replacement = line[i + 1 - new_col];
+                    (false, _) => Some(line[i + 1 - new_col]),
                 }
             } else {
-                cell.unknown = true;
-            }
+                None
+            };
+            cells[i].predict(epoch, frame, now, shifted);
         }
     }
 
     /// Predict a character insertion at the cursor position.
-    fn predict_insert<F>(
-        &mut self,
-        ch: char,
-        cursor_row: usize,
-        cursor_col: usize,
-        num_cols: usize,
-        num_rows: usize,
-        cell_at: &F,
-    ) where
-        F: Fn(usize, usize) -> Option<char>,
-    {
+    fn predict_insert(&mut self, ch: char, row: usize, col: usize, screen: &ScreenSnapshot) {
+        let (num_cols, num_rows) = (screen.cols as usize, screen.rows_count as usize);
         // If at the last column, things are tricky (wrap behavior varies by app)
-        if cursor_col + 1 >= num_cols {
+        if col + 1 >= num_cols {
             self.become_tentative();
         }
 
         let rightmost = if self.predict_overwrite {
-            cursor_col
+            col
         } else {
             num_cols - 1
         };
-
-        let Some(line) = (cursor_col..=rightmost)
-            .map(|col| cell_at(cursor_row, col))
-            .collect::<Option<Vec<char>>>()
-        else {
+        let Some(line) = Self::line(screen, row, col..=rightmost) else {
             self.unknown_input();
             return;
         };
 
-        // Build the shifted cells in a temporary buffer to avoid borrow issues
-        let epoch = self.prediction_epoch;
-        let frame = self.local_frame_sent + 1;
-        let now = Instant::now();
-
-        // First, read the left neighbors
-        let mut left_states: Vec<(bool, bool, char)> = Vec::with_capacity(rightmost + 1);
-        {
-            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
-            for i in 0..=rightmost {
-                if i == 0 {
-                    left_states.push((false, false, ' '));
-                } else {
-                    let prev = &row.cells[i - 1];
-                    left_states.push((prev.active, prev.unknown, prev.replacement));
-                }
-            }
+        let (epoch, frame, now) = (
+            self.prediction_epoch,
+            self.local_frame_sent + 1,
+            Instant::now(),
+        );
+        let cells = &mut self.overlay.get_or_make_row(row, num_cols, epoch).cells;
+        // Right to left, so each cell reads its left-hand neighbour before
+        // that neighbour is overwritten, as mosh does.
+        for i in (col + 1..=rightmost).rev() {
+            let prev = &cells[i - 1];
+            let shifted = match (i == num_cols - 1, prev.active, prev.unknown) {
+                (true, _, _) | (false, true, true) => None,
+                (false, true, false) => Some(prev.replacement),
+                // Nothing predicted to the left: shift the cell the server
+                // actually has rightward. Substituting a blank here is what
+                // made every keystroke visually erase the rest of the line.
+                (false, false, _) => Some(line[i - 1 - col]),
+            };
+            cells[i].predict(epoch, frame, now, shifted);
         }
-
-        // Now mutate the cells
-        {
-            let row = self.overlay.get_or_make_row(cursor_row, num_cols, epoch);
-            // Shift cells right from rightmost to cursor position
-            for i in (cursor_col + 1..=rightmost).rev() {
-                let cell = &mut row.cells[i];
-                cell.reset_with_orig();
-                cell.active = true;
-                cell.tentative_until_epoch = epoch;
-                cell.expire(frame, now);
-
-                let (left_active, left_unknown, left_replacement) = left_states[i];
-                if i == num_cols - 1 {
-                    cell.unknown = true;
-                } else if left_active {
-                    if left_unknown {
-                        cell.unknown = true;
-                    } else {
-                        cell.unknown = false;
-                        cell.replacement = left_replacement;
-                    }
-                } else {
-                    // Nothing predicted to the left: shift the cell the server
-                    // actually has rightward. Substituting a blank here is what
-                    // made every keystroke visually erase the rest of the line.
-                    cell.unknown = false;
-                    cell.replacement = line[i - 1 - cursor_col];
-                }
-            }
-
-            // Place the character at cursor position
-            let cell = &mut row.cells[cursor_col];
-            cell.reset_with_orig();
-            cell.active = true;
-            cell.tentative_until_epoch = epoch;
-            cell.expire(frame, now);
-            cell.unknown = false;
-            cell.replacement = ch;
-        }
+        cells[col].predict(epoch, frame, now, Some(ch));
 
         // Move the cursor right, or wrap.
-        if cursor_col + 1 < num_cols {
-            if let Some(last_cursor) = self.cursors.last_mut() {
-                last_cursor.col = cursor_col + 1;
-                last_cursor.expiration_frame = frame;
+        if col + 1 < num_cols {
+            if let Some(cursor) = self.cursors.last_mut() {
+                cursor.col = col + 1;
+                cursor.expiration_frame = frame;
             }
         } else {
             self.become_tentative();
-            self.newline_carriage_return(cursor_row, num_cols, num_rows);
+            self.newline_carriage_return(row, num_cols, num_rows);
         }
     }
 
