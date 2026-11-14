@@ -8,6 +8,8 @@ use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, Transport};
 use morsh_prediction::{DisplayPreference, NotificationEngine, PredictionEngine};
 use morsh_statesync::{Complete, UserStream};
+#[cfg(unix)]
+use morsh_terminal::ScreenSnapshot;
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -107,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (term_tx, mut term_rx) = mpsc::channel::<TermEvent>(64);
     spawn_input_reader(term_tx, escape);
 
-    let mut shutdown_signals = ShutdownSignals::new();
+    let mut signals = Signals::new();
 
     tracing::info!("Entering event loop");
     let started = Instant::now();
@@ -145,7 +147,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Both branches are cancel-safe: `mpsc::Receiver::recv` and
             // `Transport::recv`, whose only await is a `recv_from`.
             Some(term_event) = term_rx.recv() => {
-                if handle_term_event(
+                if let TermEvent::Suspend = term_event {
+                    // Like stock mosh, not once the session is ending.
+                    #[cfg(unix)]
+                    if !transport.shutdown_in_progress() {
+                        if let Err(e) = tty.suspend() {
+                            break Err(e.into());
+                        }
+                        forget_screen(&mut local_framebuffer);
+                    }
+                } else if handle_term_event(
                     term_event,
                     &mut transport,
                     &mut prediction,
@@ -177,17 +188,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            () = shutdown_signals.recv() => {
-                if !transport.has_remote_addr() {
-                    break Ok(());
+            signal = signals.recv() => match signal {
+                SignalEvent::Shutdown => {
+                    if !transport.has_remote_addr() {
+                        break Ok(());
+                    }
+                    if !transport.shutdown_in_progress() {
+                        tracing::info!("Signal received, shutting down");
+                        notifications
+                            .set_notification("Signal received, shutting down...".to_string(), true);
+                        transport.start_shutdown();
+                    }
                 }
-                if !transport.shutdown_in_progress() {
-                    tracing::info!("Signal received, shutting down");
-                    notifications
-                        .set_notification("Signal received, shutting down...".to_string(), true);
-                    transport.start_shutdown();
+                // Stopped and continued from outside (or after our own
+                // suspend): the terminal may have been reset meanwhile.
+                #[cfg(unix)]
+                SignalEvent::Continued => {
+                    if let Err(e) = tty.resume() {
+                        break Err(e.into());
+                    }
+                    forget_screen(&mut local_framebuffer);
                 }
-            }
+            },
             _ = tokio::time::sleep(wait) => {}
         }
 
@@ -260,14 +282,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Signals that ask the client to end the session, as they do stock
-/// mosh-client: SIGTERM, SIGINT, SIGHUP and SIGPIPE.
-struct ShutdownSignals {
-    #[cfg(unix)]
-    signals: [Option<tokio::signal::unix::Signal>; 4],
+/// The alternate screen was entered afresh and is blank: model it so, and
+/// the next frame repaints everything.
+#[cfg(unix)]
+fn forget_screen(local_framebuffer: &mut ScreenSnapshot) {
+    let (cols, rows) = (local_framebuffer.cols, local_framebuffer.rows_count);
+    *local_framebuffer = Complete::new(cols, rows)
+        .map(|blank| blank.snapshot())
+        .unwrap_or_else(|_| ScreenSnapshot::new(cols, rows));
 }
 
-impl ShutdownSignals {
+/// Nothing is listened for on Windows yet.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum SignalEvent {
+    /// End the session.
+    Shutdown,
+    /// The process was continued after being stopped.
+    #[cfg(unix)]
+    Continued,
+}
+
+/// The signals stock mosh-client acts on: SIGTERM, SIGINT, SIGHUP and
+/// SIGPIPE end the session, and SIGCONT takes the terminal back over.
+struct Signals {
+    #[cfg(unix)]
+    shutdown: [Option<tokio::signal::unix::Signal>; 4],
+    #[cfg(unix)]
+    continued: Option<tokio::signal::unix::Signal>,
+}
+
+impl Signals {
     fn new() -> Self {
         #[cfg(unix)]
         {
@@ -278,20 +322,21 @@ impl ShutdownSignals {
                     .ok()
             };
             Self {
-                signals: [
+                shutdown: [
                     listen(SignalKind::terminate()),
                     listen(SignalKind::interrupt()),
                     listen(SignalKind::hangup()),
                     listen(SignalKind::pipe()),
                 ],
+                continued: listen(SignalKind::from_raw(libc::SIGCONT)),
             }
         }
         #[cfg(not(unix))]
         Self {}
     }
 
-    /// Wait for any of the signals. Cancel-safe.
-    async fn recv(&mut self) {
+    /// Wait for the next signal. Cancel-safe.
+    async fn recv(&mut self) -> SignalEvent {
         #[cfg(unix)]
         {
             async fn one(signal: &mut Option<tokio::signal::unix::Signal>) {
@@ -302,16 +347,17 @@ impl ShutdownSignals {
                 }
                 std::future::pending().await
             }
-            let [a, b, c, d] = &mut self.signals;
+            let [a, b, c, d] = &mut self.shutdown;
             tokio::select! {
-                () = one(a) => {}
-                () = one(b) => {}
-                () = one(c) => {}
-                () = one(d) => {}
+                () = one(a) => SignalEvent::Shutdown,
+                () = one(b) => SignalEvent::Shutdown,
+                () = one(c) => SignalEvent::Shutdown,
+                () = one(d) => SignalEvent::Shutdown,
+                () = one(&mut self.continued) => SignalEvent::Continued,
             }
         }
         #[cfg(not(unix))]
-        std::future::pending::<()>().await
+        std::future::pending().await
     }
 }
 

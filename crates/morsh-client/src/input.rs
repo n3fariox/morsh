@@ -25,6 +25,9 @@ pub enum TermEvent {
     Quit,
     /// The terminal has no more input to give (end of file or a read error).
     Closed,
+    /// The escape key's Ctrl-Z. The main loop handles it, since it has to
+    /// hand the terminal back and repaint.
+    Suspend,
 }
 
 /// The escape key and how to type it literally, set from `MOSH_ESCAPE_KEY`
@@ -112,6 +115,8 @@ pub struct Filtered {
     pub help: Option<bool>,
     /// The user typed the quit sequence. Input after it is dropped.
     pub quit: bool,
+    /// The user typed the suspend sequence.
+    pub suspend: bool,
 }
 
 /// Recognizes the two-keystroke escape sequence in the input stream, as
@@ -154,10 +159,8 @@ impl EscapeFilter {
                         out.quit = true;
                         return out;
                     }
-                    // Ctrl-Z: suspend, not yet implemented. Swallowed rather
-                    // than passed through so it does not reach the remote
-                    // shell and stop the wrong process.
-                    0x1A => {}
+                    // Ctrl-Z: suspend the client, not the remote process.
+                    0x1A => out.suspend = true,
                     b if b == config.pass_key || b == config.pass_key2 => out.send.push(config.key),
                     other => out.send.extend_from_slice(&[config.key, other]),
                 }
@@ -198,6 +201,9 @@ fn publish(escape: &mut EscapeFilter, bytes: &[u8], term_tx: &mpsc::Sender<TermE
         if term_tx.blocking_send(TermEvent::EscapeHelp(show)).is_err() {
             return false;
         }
+    }
+    if filtered.suspend && term_tx.blocking_send(TermEvent::Suspend).is_err() {
+        return false;
     }
     // Keep reading after a quit: the main loop may still be waiting for the
     // server to acknowledge the shutdown, and it is the one that decides to
@@ -464,6 +470,7 @@ pub fn handle_term_event(
         TermEvent::Quit => shut_down(transport, notifications, "Exiting on user request..."),
         // Like stock mosh, losing the terminal ends the session.
         TermEvent::Closed => shut_down(transport, notifications, "Exiting..."),
+        TermEvent::Suspend => false,
     }
 }
 
@@ -508,7 +515,7 @@ mod tests {
         Filtered {
             send: bytes.to_vec(),
             help: Some(false),
-            quit: false,
+            ..Default::default()
         }
     }
 
@@ -554,8 +561,8 @@ mod tests {
             escape.feed(&[b'l', b's', ESC, b'.', b'x']),
             Filtered {
                 send: b"ls".to_vec(),
-                help: None,
                 quit: true,
+                ..Default::default()
             }
         );
     }
@@ -589,9 +596,15 @@ mod tests {
     }
 
     #[test]
-    fn escape_then_ctrl_z_is_swallowed() {
+    fn escape_then_ctrl_z_suspends() {
         let mut escape = filter();
-        assert_eq!(escape.feed(&[ESC, 0x1A, b'.']), after_escape(b"."));
+        assert_eq!(
+            escape.feed(&[ESC, 0x1A, b'.']),
+            Filtered {
+                suspend: true,
+                ..after_escape(b".")
+            }
+        );
     }
 
     #[test]
@@ -651,8 +664,8 @@ mod tests {
             escape.feed(b"\r~."),
             Filtered {
                 send: b"\r".to_vec(),
-                help: None,
                 quit: true,
+                ..Default::default()
             }
         );
         // Typed twice after a newline, the second tilde is literal.

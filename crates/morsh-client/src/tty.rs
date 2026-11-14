@@ -4,6 +4,8 @@
 
 use crossterm::{cursor, execute, terminal};
 use std::io;
+#[cfg(unix)]
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The terminal is in our mode and needs handing back. Shared with the
@@ -59,6 +61,36 @@ impl Tty {
         let _ = terminal::disable_raw_mode();
         #[cfg(windows)]
         restore_console_mode(self.console_mode.take());
+    }
+}
+
+#[cfg(unix)]
+impl Tty {
+    /// Take the terminal over again after the process was stopped and
+    /// continued: whoever had it meanwhile (the shell, for one) will have put
+    /// it back in cooked mode and on the main screen. The caller must
+    /// repaint. Mosh's `STMClient::resume`.
+    pub fn resume(&mut self) -> io::Result<()> {
+        // crossterm skips enabling raw mode while it thinks it is still on.
+        // Forgetting it this way writes nothing, so a resume of a terminal
+        // that never left doesn't flicker.
+        let _ = terminal::disable_raw_mode();
+        self.take_over()
+    }
+
+    /// Hand the terminal back and stop the process group (as mosh does)
+    /// until the shell continues it, then take the terminal over again. The
+    /// caller must repaint. The escape key's Ctrl-Z.
+    pub fn suspend(&mut self) -> io::Result<()> {
+        self.restore();
+        let mut out = io::stdout();
+        out.write_all(b"\n\x1b[37;44m[morsh is suspended.]\x1b[m\n")?;
+        out.flush()?;
+        // SAFETY: kill(2) has no memory-safety preconditions.
+        unsafe {
+            libc::kill(0, libc::SIGSTOP);
+        }
+        self.resume()
     }
 }
 
