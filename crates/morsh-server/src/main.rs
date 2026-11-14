@@ -1,3 +1,4 @@
+mod bind;
 mod cli;
 mod daemon;
 mod lifecycle;
@@ -9,7 +10,6 @@ use morsh_log::LogGuard;
 use morsh_network::{PORT_RANGE_HIGH, PORT_RANGE_LOW};
 use std::env;
 use std::io::Write;
-use std::net::SocketAddr;
 
 fn get_ssh_connection_ip() -> Option<String> {
     let ssh_conn = env::var("SSH_CONNECTION").ok()?;
@@ -39,23 +39,26 @@ fn desired_bind_address(opts: &cli::CliOptions, ssh_ip: Option<String>) -> Optio
 /// for mosh won't cover.  Mirrors mosh, which walks the range and takes the
 /// first port it can bind.
 fn pick_port(ip: &str, range: Option<(u16, u16)>) -> Result<u16, String> {
-    let addr_for = |port: u16| -> SocketAddr {
-        match ip.parse::<std::net::IpAddr>() {
-            Ok(parsed) => SocketAddr::new(parsed, port),
-            Err(_) => SocketAddr::new("0.0.0.0".parse().unwrap(), port),
-        }
-    };
-
     let (low, high) = range.unwrap_or((PORT_RANGE_LOW, PORT_RANGE_HIGH));
 
     let mut last_err = String::new();
-    for port in low..=high {
-        match std::net::UdpSocket::bind(addr_for(port)) {
-            Ok(sock) => return sock.local_addr().map(|a| a.port()).map_err(|e| e.to_string()),
-            Err(e) => last_err = e.to_string(),
+    for mut address in bind::addresses(Some(ip)) {
+        for port in low..=high {
+            address.set_port(port);
+            match std::net::UdpSocket::bind(address) {
+                Ok(sock) => {
+                    return sock
+                        .local_addr()
+                        .map(|a| a.port())
+                        .map_err(|e| e.to_string())
+                }
+                Err(e) => last_err = e.to_string(),
+            }
         }
     }
-    Err(format!("Failed to bind to any port in {low}:{high}: {last_err}"))
+    Err(format!(
+        "Failed to bind to any port in {low}:{high}: {last_err}"
+    ))
 }
 
 fn init_logging(log_file: &Option<String>) -> LogGuard {
@@ -208,6 +211,11 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn unavailable_bind_address_still_finds_an_any_interface_port() {
+        assert!(pick_port("192.0.2.123", Some((0, 0))).is_ok());
     }
 
     #[test]
