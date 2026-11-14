@@ -85,8 +85,9 @@ fn main() {
         black_box(&frame);
     });
 
-    // What the client does on a wakeup where nothing has changed: rebuild the
-    // target frame and diff it against what the user already sees.
+    // A wakeup where nothing has changed: rebuild the target frame and diff
+    // it against what the user already sees (the client before it compared
+    // frames first), then the same with the comparison.
     let idle = PredictionEngine::new();
     let mut notifications = NotificationEngine::new();
     let mut shown = screen.clone();
@@ -98,6 +99,15 @@ fn main() {
         notifications.adjust_message();
         notifications.apply(&mut target);
         black_box(DisplayDiff::diff(&shown, &target));
+    });
+    measure("frame_idle_compared", 1, 200, || {
+        let mut target = screen.clone();
+        idle.apply(&mut target);
+        notifications.adjust_message();
+        notifications.apply(&mut target);
+        if shown != target {
+            black_box(DisplayDiff::diff(&shown, &target));
+        }
     });
 
     let typing = typing_engine(&screen);

@@ -37,27 +37,40 @@ pub fn output_new_frame(
         prediction,
         notifications,
     );
+    paint(local_framebuffer, target, stdout)
+}
 
-    let diff = DisplayDiff::diff(local_framebuffer, &target);
+/// Bring the user's screen from `shown` to `target`.
+fn paint(
+    shown: &mut ScreenSnapshot,
+    target: ScreenSnapshot,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    // Most wakeups (timers, acks, the countup) change nothing on screen,
+    // and comparing frames costs a tenth of diffing them.
+    if *shown == target {
+        return Ok(());
+    }
+    let diff = DisplayDiff::diff(shown, &target);
     if !diff.is_empty() {
-        if local_framebuffer.rows != target.rows {
+        if shown.rows != target.rows {
             // Synchronized update (ignored where unsupported) with the cursor
             // hidden, so the terminal never shows a half-drawn frame or the
             // cursor hopping between changed cells.
-            let mut out = String::with_capacity(diff.len() + 32);
-            out.push_str("\x1b[?2026h\x1b[?25l");
-            out.push_str(&diff);
+            let mut buf = String::with_capacity(diff.len() + 32);
+            buf.push_str("\x1b[?2026h\x1b[?25l");
+            buf.push_str(&diff);
             if target.cursor_visible {
-                out.push_str("\x1b[?25h");
+                buf.push_str("\x1b[?25h");
             }
-            out.push_str("\x1b[?2026l");
-            stdout.write_all(out.as_bytes())?;
+            buf.push_str("\x1b[?2026l");
+            out.write_all(buf.as_bytes())?;
         } else {
-            stdout.write_all(diff.as_bytes())?;
+            out.write_all(diff.as_bytes())?;
         }
-        stdout.flush()?;
+        out.flush()?;
     }
-    *local_framebuffer = target;
+    *shown = target;
     Ok(())
 }
 
@@ -102,5 +115,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(260));
         let shown = compose_frame(&remote, &mut prediction, &mut notifications);
         assert_eq!(shown.cell(1, 1).unwrap().text, "x");
+    }
+
+    #[test]
+    fn an_unchanged_frame_writes_nothing() {
+        let mut shown = ScreenSnapshot::new(20, 3);
+        let mut out = Vec::new();
+        paint(&mut shown, ScreenSnapshot::new(20, 3), &mut out).unwrap();
+        assert!(out.is_empty());
+
+        let mut target = ScreenSnapshot::new(20, 3);
+        target.rows[1][2].text = "x".to_string();
+        paint(&mut shown, target.clone(), &mut out).unwrap();
+        assert!(!out.is_empty());
+        assert_eq!(shown, target);
     }
 }
