@@ -119,9 +119,12 @@ fn main() {
     };
 
     if !is_daemon_child {
-        println!("MOSH CONNECT {} {}", port, key.printable_key());
-        println!("MOSH CONNECTION ID: 1");
-        std::io::stdout().flush().unwrap();
+        // SSH may close its pipe after reading CONNECT. A failed diagnostic
+        // write must not panic and kill the newly started server.
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "MOSH CONNECT {} {}", port, key.printable_key());
+        let _ = writeln!(stdout, "MOSH CONNECTION ID: 1");
+        let _ = stdout.flush();
     }
 
     // The appender guard must live for the whole of `main`; binding it inside
