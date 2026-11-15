@@ -42,32 +42,34 @@ impl QueryParser {
     /// Ghostty does not interpret UTF-8 C1 controls. Translate them to their
     /// 7-bit equivalents, retaining a trailing UTF-8 lead byte across writes.
     /// Unimplemented C1 controls and CAN/SUB cancel through ST without printing.
-    pub fn normalize<'a>(&mut self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    /// A true prefix flag requests a separate 0xC2 write before the returned data.
+    pub fn normalize<'a>(&mut self, input: &'a [u8]) -> (bool, std::borrow::Cow<'a, [u8]>) {
         use std::borrow::Cow;
         if input.is_empty() {
-            return Cow::Borrowed(input);
+            return (false, Cow::Borrowed(input));
+        }
+        // Flush a withheld plain-text lead byte separately instead of copying
+        // the next chunk just to prepend it. Only actual controls need storage.
+        let plain_prefix = self.pending_c2 && !(0x80..=0x9f).contains(&input[0]);
+        if plain_prefix {
+            self.pending_c2 = false;
         }
         if !self.pending_c2 && memchr::memchr3(0xc2, 0x18, 0x1a, input).is_none() {
-            return Cow::Borrowed(input);
+            return (plain_prefix, Cow::Borrowed(input));
         }
         if !self.pending_c2
             && input.last() != Some(&0xc2)
             && memchr::memchr2(0x18, 0x1a, input).is_none()
             && !contains_c1(input)
         {
-            return Cow::Borrowed(input);
+            return (plain_prefix, Cow::Borrowed(input));
         }
         let mut out = None;
         let mut start = 0;
         if self.pending_c2 {
             self.pending_c2 = false;
-            let buffer = out.insert(Vec::with_capacity(input.len() + 1));
-            if (0x80..=0x9f).contains(&input[0]) {
-                Self::c1_alias(buffer, input[0]);
-                start = 1;
-            } else {
-                buffer.push(0xc2);
-            }
+            Self::c1_alias(out.insert(Vec::with_capacity(input.len() + 1)), input[0]);
+            start = 1;
         }
         // Retain only the final lead byte, borrowing the preceding text when
         // there is nothing else to rewrite. Ordinary Latin-1 stays borrowed.
@@ -95,13 +97,14 @@ impl QueryParser {
                 start = pos + 2;
             }
         }
-        match out {
+        let data = match out {
             Some(mut buffer) => {
                 buffer.extend_from_slice(&input[start..end]);
                 Cow::Owned(buffer)
             }
             None => Cow::Borrowed(&input[..end]),
-        }
+        };
+        (plain_prefix, data)
     }
 
     fn c1_alias(out: &mut Vec<u8>, byte: u8) {

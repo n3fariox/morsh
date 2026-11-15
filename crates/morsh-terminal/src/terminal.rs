@@ -46,7 +46,11 @@ impl MoshTerminal {
     /// Apply host output and return the query replies stock mosh sends to the PTY.
     /// Replies use the cursor at the query, even if later bytes move it again.
     pub fn write_with_replies(&mut self, data: &[u8]) -> Vec<u8> {
-        let data = self.queries.normalize(data);
+        let (plain_prefix, data) = self.queries.normalize(data);
+        if plain_prefix {
+            self.terminal.vt_write(&[0xc2]);
+            let _ = self.queries.advance(0xc2);
+        }
         let mut replies = Vec::new();
         let mut start = 0;
         while let Some((end, query)) = self.queries.next_query(&data[start..]) {
