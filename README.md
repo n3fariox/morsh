@@ -184,10 +184,10 @@ runtime:
 
 ### Known gaps
 
-- The client does not yet implement Ctrl-^ Ctrl-Z suspend.
-- Terminal replies to host queries (DA, DSR, cursor position reports) are not
-  sent back to the child process; `libghostty-vt` does not surface them
-  through the API morsh uses.
+- After DECOM (`CSI ? 6 h`) is set, `libghostty-vt` homes the cursor to the
+  top of the scrolling region, where stock mosh leaves it. A cursor position
+  report sent right after that differs from stock.
+- The client ignores a window resize to 0x0, where stock mosh passes it on.
 - A terminal state reconstructed from a screen snapshot — which happens only
   when a state deep in the receive history is written to — restores cells,
   cursor, title, and input modes, but not scrollback or the scrolling region.
