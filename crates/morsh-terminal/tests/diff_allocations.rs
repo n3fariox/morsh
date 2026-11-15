@@ -98,3 +98,14 @@ fn reused_snapshot_clones_do_not_allocate_per_cell() {
         assert_eq!(reused, source);
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn latin1_output_does_not_allocate_query_scratch() {
+    let mut terminal = morsh_terminal::MoshTerminal::new(120, 40, 0).unwrap();
+    let text = "temp 21°C ±0.5 © «quoted» · ½ ".repeat(2000);
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    terminal.write(text.as_bytes());
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert_eq!(allocations, 0, "plain Latin-1 text needs no query scratch");
+}

@@ -43,57 +43,144 @@ impl QueryParser {
     /// 7-bit equivalents, retaining a trailing UTF-8 lead byte across writes.
     pub fn normalize<'a>(&mut self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
         use std::borrow::Cow;
-        if !self.pending_c2 && !input.contains(&0xc2) {
+        if input.is_empty() {
             return Cow::Borrowed(input);
         }
-        let mut out = Vec::with_capacity(input.len() + 1);
-        for &byte in input {
-            if self.pending_c2 {
-                self.pending_c2 = false;
-                if (0x80..=0x9f).contains(&byte) {
-                    let alias = match byte {
-                        0x84 => Some(b'D'),
-                        0x85 => Some(b'E'),
-                        0x88 => Some(b'H'),
-                        0x8d => Some(b'M'),
-                        0x90 => Some(b'P'),
-                        0x98 => Some(b'X'),
-                        0x9b => Some(b'['),
-                        0x9c => Some(b'\\'),
-                        0x9d => Some(b']'),
-                        0x9e => Some(b'^'),
-                        0x9f => Some(b'_'),
-                        _ => None,
-                    };
-                    if let Some(alias) = alias {
-                        out.extend_from_slice(&[0x1b, alias]);
-                    } else {
-                        // Other C1 controls cancel the sequence but mosh has
-                        // no registered action for them. CAN does the same.
-                        out.push(0x18);
-                    }
-                    continue;
-                }
-                out.push(0xc2);
-            }
-            if byte == 0xc2 {
-                self.pending_c2 = true;
+        if !self.pending_c2
+            && (!input.contains(&0xc2) || (input.last() != Some(&0xc2) && !contains_c1(input)))
+        {
+            return Cow::Borrowed(input);
+        }
+        let mut out = None;
+        let mut start = 0;
+        if self.pending_c2 {
+            self.pending_c2 = false;
+            let buffer = out.insert(Vec::with_capacity(input.len() + 1));
+            if (0x80..=0x9f).contains(&input[0]) {
+                Self::c1_alias(buffer, input[0]);
+                start = 1;
             } else {
-                out.push(byte);
+                buffer.push(0xc2);
             }
         }
-        Cow::Owned(out)
+        // Retain only the final lead byte, borrowing the preceding text when
+        // there is nothing else to rewrite. Ordinary Latin-1 stays borrowed.
+        let end = if input.last() == Some(&0xc2) && start < input.len() {
+            self.pending_c2 = true;
+            input.len() - 1
+        } else {
+            input.len()
+        };
+        let scan_start = start;
+        for pos in memchr::memchr_iter(0xc2, &input[scan_start..end]).map(|i| scan_start + i) {
+            if pos + 1 < end && (0x80..=0x9f).contains(&input[pos + 1]) {
+                let buffer = out.get_or_insert_with(|| Vec::with_capacity(input.len() + 1));
+                buffer.extend_from_slice(&input[start..pos]);
+                Self::c1_alias(buffer, input[pos + 1]);
+                start = pos + 2;
+            }
+        }
+        match out {
+            Some(mut buffer) => {
+                buffer.extend_from_slice(&input[start..end]);
+                Cow::Owned(buffer)
+            }
+            None => Cow::Borrowed(&input[..end]),
+        }
+    }
+
+    fn c1_alias(out: &mut Vec<u8>, byte: u8) {
+        let alias = match byte {
+            0x84 => Some(b'D'),
+            0x85 => Some(b'E'),
+            0x88 => Some(b'H'),
+            0x8d => Some(b'M'),
+            0x90 => Some(b'P'),
+            0x98 => Some(b'X'),
+            0x9b => Some(b'['),
+            0x9c => Some(b'\\'),
+            0x9d => Some(b']'),
+            0x9e => Some(b'^'),
+            0x9f => Some(b'_'),
+            _ => None,
+        };
+        if let Some(alias) = alias {
+            out.extend_from_slice(&[0x1b, alias]);
+        } else {
+            out.push(0x18);
+        }
     }
 
     pub fn next_query(&mut self, input: &[u8]) -> Option<(usize, Query)> {
         let mut index = 0;
+        if memchr::memchr2(b'c', b'n', input).is_none() {
+            // No stock query can finish in this chunk. ESC resets the parser
+            // from every state, so only the suffix after its last occurrence
+            // can determine the state carried to the next chunk.
+            if let Some(last_escape) = memchr::memrchr(0x1b, input) {
+                self.state = State::Escape;
+                self.utf8_len = 0;
+                index = last_escape + 1;
+            }
+        }
         while index < input.len() {
-            if matches!(self.state, State::Ground) && self.utf8_len == 0 {
-                // Plain text cannot query the terminal. Skip whole runs while
-                // preserving ESC and the UTF-8 lead byte for C1 controls.
-                index += input[index..]
-                    .iter()
-                    .position(|&b| b == 0x1b || b == 0xc2)?;
+            if self.utf8_len == 0 {
+                match self.state {
+                    State::Ground => {
+                        // C1 controls were normalized above, so ordinary UTF-8
+                        // text needs no decoding here, including Latin-1.
+                        index += memchr::memchr(0x1b, &input[index..])?;
+                        if input[index..].starts_with(b"\x1b[") {
+                            self.start_csi();
+                            index += 2;
+                            continue;
+                        }
+                    }
+                    State::CsiEntry | State::CsiParam => {
+                        // DA ignores parameters; DSR only uses the first. Once
+                        // it cannot become 5/6, do not parse the remaining digits.
+                        if matches!(self.state, State::CsiParam)
+                            && (self.prefix.is_some()
+                                || self.param_done
+                                || !matches!(self.first_param, 0 | 5 | 6))
+                        {
+                            index += input[index..]
+                                .iter()
+                                .position(|&b| !b.is_ascii_digit() && b != b';')?;
+                        }
+                        let byte = input[index];
+                        if byte.is_ascii_digit() || byte == b';' {
+                            self.parameter(byte);
+                            self.state = State::CsiParam;
+                            index += 1;
+                            continue;
+                        }
+                        if (0x40..=0x7e).contains(&byte) {
+                            index += 1;
+                            if let Some(query) = self.dispatch(byte) {
+                                return Some((index, query));
+                            }
+                            continue;
+                        }
+                    }
+                    State::CsiIntermediate | State::CsiIgnore => {
+                        index += input[index..].iter().position(|&b| {
+                            (0x40..=0x7e).contains(&b)
+                                || b == 0x1b
+                                || b == 0x18
+                                || b == 0x1a
+                                || b >= 0x80
+                        })?;
+                    }
+                    State::String { bell_terminated } => {
+                        index += if bell_terminated {
+                            memchr::memchr2(0x1b, 7, &input[index..])?
+                        } else {
+                            memchr::memchr(0x1b, &input[index..])?
+                        };
+                    }
+                    State::Escape | State::EscapeIntermediate => {}
+                }
             }
             if let Some(query) = self.advance(input[index]) {
                 return Some((index + 1, query));
@@ -250,5 +337,38 @@ impl QueryParser {
             }
         }
         None
+    }
+}
+
+// Check eight bytes at once for the C1 continuation range 0x80..=0x9f.
+// This avoids one memchr call per Latin-1 character when none are controls.
+fn contains_c1(input: &[u8]) -> bool {
+    let mut blocks = input.chunks_exact(8);
+    for block in &mut blocks {
+        let word = u64::from_ne_bytes(block.try_into().unwrap());
+        let candidate = (word & 0xe0e0_e0e0_e0e0_e0e0) ^ 0x8080_8080_8080_8080;
+        // Standard word-at-a-time zero-byte test, independent of endianness.
+        if candidate.wrapping_sub(0x0101_0101_0101_0101) & !candidate & 0x8080_8080_8080_8080 != 0 {
+            return true;
+        }
+    }
+    blocks.remainder().iter().any(|b| (0x80..=0x9f).contains(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_c1;
+
+    #[test]
+    fn c1_range_scan_matches_individual_bytes() {
+        for value in 0..=255 {
+            for position in 0..24 {
+                let mut bytes = [0xc2; 24];
+                bytes[position] = value;
+                for len in position + 1..=24 {
+                    assert_eq!(contains_c1(&bytes[..len]), (0x80..=0x9f).contains(&value));
+                }
+            }
+        }
     }
 }
