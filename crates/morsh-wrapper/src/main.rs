@@ -74,7 +74,11 @@ fn resolve_remote_shell_system(
     append_ssh_target(&mut args, host, family);
     args.push("uname -s".to_string());
 
-    match Command::new(&args[0]).args(&args[1..]).output() {
+    match Command::new(&args[0])
+        .env_remove("MOSH_PREDICTION_DISPLAY")
+        .args(&args[1..])
+        .output()
+    {
         Ok(out) if out.status.success() && !out.stdout.is_empty() => RemoteShell::Posix,
         _ => RemoteShell::Cmd,
     }
@@ -432,6 +436,7 @@ fn try_launch_server(
 
     let mut command = Command::new(&ssh_args[0]);
     command
+        .env_remove("MOSH_PREDICTION_DISPLAY")
         .args(&ssh_args[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -588,6 +593,7 @@ fn ssh_installed(ssh_command: &str) -> bool {
         return false;
     };
     Command::new(&args[0])
+        .env_remove("MOSH_PREDICTION_DISPLAY")
         .arg("-V")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

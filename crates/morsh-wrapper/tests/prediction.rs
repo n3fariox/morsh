@@ -37,3 +37,28 @@ fn help_precedes_prediction_environment_validation() {
         .unwrap();
     assert!(output.status.success());
 }
+
+#[cfg(unix)]
+#[test]
+fn prediction_display_is_not_inherited_by_ssh_subprocesses() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("morsh-ssh-env-{}-{stamp}", std::process::id()));
+    // Record config-query, shell-probe and server-launch environments. A bad
+    // CONNECT ends the wrapper before a real client or network session starts.
+    let script = r#"printf "%s\n" "${MOSH_PREDICTION_DISPLAY-unset}" >> "$MORSH_TEST_SSH_ENV_LOG"; if [ "$0" = "-G" ]; then printf 'proxycommand true\n'; elif [ "$1" = "uname -s" ]; then printf 'Linux\n'; else printf 'MOSH CONNECT broken\n'; fi"#;
+    let ssh = format!("/bin/sh -c {}", shell_words::quote(script));
+    let output = Command::new(env!("CARGO_BIN_EXE_morsh"))
+        .args(["--ssh", &ssh, "host"])
+        .env("MOSH_PREDICTION_DISPLAY", "always")
+        .env("MORSH_TEST_SSH_ENV_LOG", &path)
+        .output()
+        .unwrap();
+    let log = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Bad MOSH CONNECT string"));
+    assert_eq!(log, "unset\nunset\nunset\n");
+}
