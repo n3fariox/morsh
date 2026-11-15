@@ -35,6 +35,7 @@ pub fn query(ssh_command: &str, host: &str) -> Option<SshConfig> {
     let args = crate::ssh_command::parse(ssh_command).ok()?;
 
     let out = Command::new(&args[0])
+        .env_remove("MOSH_PREDICTION_DISPLAY")
         .args(&args[1..])
         .arg("-G")
         .arg(host)
