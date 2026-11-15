@@ -202,9 +202,20 @@ fn main() {
 /// statements for stock mosh-server on Posix remotes.
 fn collect_locale_vars() -> Vec<(String, String)> {
     let names = [
-        "LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
-        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
-        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL",
+        "LANG",
+        "LC_CTYPE",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "LC_COLLATE",
+        "LC_MONETARY",
+        "LC_MESSAGES",
+        "LC_PAPER",
+        "LC_NAME",
+        "LC_ADDRESS",
+        "LC_TELEPHONE",
+        "LC_MEASUREMENT",
+        "LC_IDENTIFICATION",
+        "LC_ALL",
     ];
     let mut vars = Vec::new();
     for name in &names {
@@ -222,11 +233,35 @@ fn build_remote_cmd(
     locale_vars: &[(String, String)],
 ) -> String {
     if args.server_path == "morsh-server" {
-        let first = build_server_args("morsh-server", bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
-        let second = build_server_args("mosh-server", bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let first = build_server_args(
+            "morsh-server",
+            bind,
+            &args.port_range,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+            locale_vars,
+        );
+        let second = build_server_args(
+            "mosh-server",
+            bind,
+            &args.port_range,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+            locale_vars,
+        );
         render_remote_command(shell, first, Some(second), rust_log, locale_vars)
     } else {
-        let only = build_server_args(&args.server_path, bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let only = build_server_args(
+            &args.server_path,
+            bind,
+            &args.port_range,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+            locale_vars,
+        );
         render_remote_command(shell, only, None, rust_log, locale_vars)
     }
 }
@@ -337,10 +372,18 @@ fn render_remote_command(
             format!("{locale_export}; {base}")
         }
         RemoteShell::Cmd => {
-            let first = first.iter().map(|s| cmd_quote(s)).collect::<Vec<_>>().join(" ");
+            let first = first
+                .iter()
+                .map(|s| cmd_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ");
             let run = match second {
                 Some(second) => {
-                    let second = second.iter().map(|s| cmd_quote(s)).collect::<Vec<_>>().join(" ");
+                    let second = second
+                        .iter()
+                        .map(|s| cmd_quote(s))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     format!("({first} 2>nul) || {second}")
                 }
                 None => first,
@@ -351,10 +394,18 @@ fn render_remote_command(
             }
         }
         RemoteShell::PowerShell => {
-            let first = first.iter().map(|s| pwsh_quote(s)).collect::<Vec<_>>().join(" ");
+            let first = first
+                .iter()
+                .map(|s| pwsh_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ");
             let run = match second {
                 Some(second) => {
-                    let second = second.iter().map(|s| pwsh_quote(s)).collect::<Vec<_>>().join(" ");
+                    let second = second
+                        .iter()
+                        .map(|s| pwsh_quote(s))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     format!("& {first} 2>$null; if ($LASTEXITCODE -ne 0) {{ & {second} }}")
                 }
                 None => format!("& {first}"),
@@ -426,7 +477,12 @@ fn try_launch_server(
     };
     if let Some(proxy) = &proxy {
         // `-S none`: a shared ControlMaster connection would skip the proxy.
-        ssh_args.extend(["-S".into(), "none".into(), "-o".into(), format!("ProxyCommand={proxy}")]);
+        ssh_args.extend([
+            "-S".into(),
+            "none".into(),
+            "-o".into(),
+            format!("ProxyCommand={proxy}"),
+        ]);
     }
     append_ssh_target(&mut ssh_args, host, family);
     ssh_args.push(remote_cmd.to_string());
@@ -611,7 +667,10 @@ fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Op
     let mode = match args.ssh_mode {
         SshMode::Auto if ssh_installed(&args.ssh_command) => SshMode::System,
         SshMode::Auto => {
-            tracing::info!("{} not found, using the built-in ssh client", args.ssh_command);
+            tracing::info!(
+                "{} not found, using the built-in ssh client",
+                args.ssh_command
+            );
             SshMode::Russh
         }
         mode => mode,
@@ -743,7 +802,10 @@ fn host_key_policy(hostname: &str, port: u16, cfg: Option<&SshConfig>) -> morsh_
     use std::path::PathBuf;
 
     let user_file = PathBuf::from(tilde_expand("~/.ssh/known_hosts"));
-    let mut known_hosts = vec![user_file.clone(), PathBuf::from(tilde_expand("~/.ssh/known_hosts2"))];
+    let mut known_hosts = vec![
+        user_file.clone(),
+        PathBuf::from(tilde_expand("~/.ssh/known_hosts2")),
+    ];
     if cfg!(windows) {
         if let Ok(data) = std::env::var("ProgramData") {
             known_hosts.push(PathBuf::from(&data).join("ssh").join("ssh_known_hosts"));
@@ -792,7 +854,11 @@ fn find_keys(cfg: Option<&SshConfig>) -> Vec<std::path::PathBuf> {
     let configured: Vec<&str> = cfg
         .map(|c| c.identity_files.iter().map(String::as_str).collect())
         .unwrap_or_default();
-    let candidates = if configured.is_empty() { DEFAULTS.to_vec() } else { configured };
+    let candidates = if configured.is_empty() {
+        DEFAULTS.to_vec()
+    } else {
+        configured
+    };
     candidates
         .into_iter()
         .map(|p| std::path::PathBuf::from(tilde_expand(p)))
@@ -857,7 +923,15 @@ mod tests {
     /// happened to return.
     #[test]
     fn bind_server_ssh_emits_dash_s() {
-        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, &None, false, &[], &[]);
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::SshConnection,
+            &None,
+            &None,
+            false,
+            &[],
+            &[],
+        );
         assert!(args.contains(&"-s".to_string()), "{args:?}");
         assert!(!args.contains(&"-i".to_string()), "{args:?}");
     }
@@ -881,7 +955,15 @@ mod tests {
 
     #[test]
     fn no_port_range_emits_no_dash_p() {
-        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, &None, false, &[], &[]);
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::SshConnection,
+            &None,
+            &None,
+            false,
+            &[],
+            &[],
+        );
         assert!(!args.contains(&"-p".to_string()), "{args:?}");
     }
 
@@ -903,7 +985,15 @@ mod tests {
 
     #[test]
     fn bind_server_any_emits_neither() {
-        let args = build_server_args("morsh-server", &BindServer::Any, &None, &None, false, &[], &[]);
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::Any,
+            &None,
+            &None,
+            false,
+            &[],
+            &[],
+        );
         assert!(!args.contains(&"-s".to_string()));
         assert!(!args.contains(&"-i".to_string()));
     }

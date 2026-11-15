@@ -149,7 +149,8 @@ impl Complete {
             }
         }
 
-        self.input_history.retain(|&(num, _)| num >= newest_echo_ack);
+        self.input_history
+            .retain(|&(num, _)| num >= newest_echo_ack);
 
         let changed = self.echo_ack != newest_echo_ack;
         self.echo_ack = newest_echo_ack;
@@ -448,7 +449,9 @@ mod tests {
     #[serial]
     fn diff_round_trips_through_apply_string() {
         let mut source = Complete::new(40, 4).unwrap();
-        source.act(b"first line\r\n\x1b[1;32msecond\x1b[0m").unwrap();
+        source
+            .act(b"first line\r\n\x1b[1;32msecond\x1b[0m")
+            .unwrap();
 
         let mut target = Complete::new(40, 4).unwrap();
         let blank = Complete::new(40, 4).unwrap();

@@ -545,7 +545,9 @@ mod tests {
     #[test]
     fn fragmenter_single_fragment() {
         let mut fragger = Fragmenter::new();
-        let frags = fragger.make_fragments(&inst(0, 1, vec![1, 2, 3]), 1000).unwrap();
+        let frags = fragger
+            .make_fragments(&inst(0, 1, vec![1, 2, 3]), 1000)
+            .unwrap();
         assert_eq!(frags.len(), 1);
         assert!(frags[0].final_flag);
     }
@@ -556,7 +558,11 @@ mod tests {
         let big_diff: Vec<u8> = (0..2000).map(|i| (i % 200) as u8).collect();
         let mut fragger = Fragmenter::new();
         let frags = fragger.make_fragments(&inst(0, 1, big_diff), 100).unwrap();
-        assert!(frags.len() > 1, "Expected >1 fragments, got {}", frags.len());
+        assert!(
+            frags.len() > 1,
+            "Expected >1 fragments, got {}",
+            frags.len()
+        );
         assert!(!frags[0].final_flag);
         assert!(frags.last().unwrap().final_flag);
     }
@@ -565,11 +571,17 @@ mod tests {
     #[test]
     fn identical_instruction_reuses_its_id() {
         let mut fragger = Fragmenter::new();
-        let a = fragger.make_fragments(&inst(0, 1, b"x".to_vec()), 500).unwrap();
-        let b = fragger.make_fragments(&inst(0, 1, b"x".to_vec()), 500).unwrap();
+        let a = fragger
+            .make_fragments(&inst(0, 1, b"x".to_vec()), 500)
+            .unwrap();
+        let b = fragger
+            .make_fragments(&inst(0, 1, b"x".to_vec()), 500)
+            .unwrap();
         assert_eq!(a[0].id, b[0].id, "retransmit should reuse the id");
 
-        let c = fragger.make_fragments(&inst(1, 2, b"y".to_vec()), 500).unwrap();
+        let c = fragger
+            .make_fragments(&inst(1, 2, b"y".to_vec()), 500)
+            .unwrap();
         assert_ne!(b[0].id, c[0].id, "a new instruction needs a new id");
     }
 
@@ -610,7 +622,9 @@ mod tests {
     fn assembly_handles_out_of_order_fragments() {
         let big: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
         let mut fragger = Fragmenter::new();
-        let mut frags = fragger.make_fragments(&inst(0, 1, big.clone()), 100).unwrap();
+        let mut frags = fragger
+            .make_fragments(&inst(0, 1, big.clone()), 100)
+            .unwrap();
         frags.reverse();
 
         let mut assembler = FragmentAssembly::new();
@@ -627,7 +641,9 @@ mod tests {
     fn assembly_ignores_duplicate_fragments() {
         let big: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
         let mut fragger = Fragmenter::new();
-        let frags = fragger.make_fragments(&inst(0, 1, big.clone()), 100).unwrap();
+        let frags = fragger
+            .make_fragments(&inst(0, 1, big.clone()), 100)
+            .unwrap();
 
         let mut assembler = FragmentAssembly::new();
         let mut completions = 0;
@@ -636,7 +652,10 @@ mod tests {
                 completions += 1;
             }
         }
-        assert_eq!(completions, 1, "duplicates must not re-complete the assembly");
+        assert_eq!(
+            completions, 1,
+            "duplicates must not re-complete the assembly"
+        );
     }
 
     /// A lost fragment used to leave its partial assembly in a HashMap forever.

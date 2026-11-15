@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
-use russh::keys::known_hosts::{check_known_hosts_path, known_host_keys_path, learn_known_hosts_path};
+use russh::keys::known_hosts::{
+    check_known_hosts_path, known_host_keys_path, learn_known_hosts_path,
+};
 use russh::keys::{self, ssh_key, Algorithm, HashAlg};
 use russh::Preferred;
 
@@ -182,22 +184,36 @@ mod tests {
 
     #[test]
     fn ssh_g_values_map_onto_the_policy() {
-        assert_eq!(StrictHostKeyChecking::from_ssh("true"), StrictHostKeyChecking::Yes);
-        assert_eq!(StrictHostKeyChecking::from_ssh("false"), StrictHostKeyChecking::AcceptNew);
+        assert_eq!(
+            StrictHostKeyChecking::from_ssh("true"),
+            StrictHostKeyChecking::Yes
+        );
+        assert_eq!(
+            StrictHostKeyChecking::from_ssh("false"),
+            StrictHostKeyChecking::AcceptNew
+        );
         assert_eq!(
             StrictHostKeyChecking::from_ssh("accept-new"),
             StrictHostKeyChecking::AcceptNew
         );
-        assert_eq!(StrictHostKeyChecking::from_ssh("ask"), StrictHostKeyChecking::Ask);
+        assert_eq!(
+            StrictHostKeyChecking::from_ssh("ask"),
+            StrictHostKeyChecking::Ask
+        );
     }
 
     #[test]
     fn rsa_keys_match_whatever_the_signature_hash() {
         assert!(same_key_type(
-            &Algorithm::Rsa { hash: Some(keys::HashAlg::Sha512) },
+            &Algorithm::Rsa {
+                hash: Some(keys::HashAlg::Sha512)
+            },
             &Algorithm::Rsa { hash: None }
         ));
-        assert!(!same_key_type(&Algorithm::Ed25519, &Algorithm::Rsa { hash: None }));
+        assert!(!same_key_type(
+            &Algorithm::Ed25519,
+            &Algorithm::Rsa { hash: None }
+        ));
     }
 
     /// An ed25519 public key whose 32 bytes are all `byte`.
@@ -226,7 +242,8 @@ mod tests {
     }
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("morsh-hostkeys-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("morsh-hostkeys-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

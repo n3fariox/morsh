@@ -121,7 +121,10 @@ mod tests {
 
     #[test]
     fn the_ip_line_is_recognised() {
-        assert_eq!(parse_ip_line("MOSH IP 203.0.113.9\r\n"), Some("203.0.113.9"));
+        assert_eq!(
+            parse_ip_line("MOSH IP 203.0.113.9\r\n"),
+            Some("203.0.113.9")
+        );
         assert_eq!(parse_ip_line("MOSH IP 2001:db8::1"), Some("2001:db8::1"));
         assert_eq!(parse_ip_line("Warning: Permanently added"), None);
     }

@@ -8,12 +8,18 @@ pub fn fork_and_detach(_port: u16) -> bool {
         }
         0 => {
             tracing::info!("Child forked OK, calling setsid()");
-            unsafe { libc::setsid(); }
+            unsafe {
+                libc::setsid();
+            }
             tracing::info!("setsid() complete, child PID={}", std::process::id());
             true
         }
         pid => {
-            tracing::info!("Parent (PID={}) exiting, child (PID={}) continues as daemon", std::process::id(), pid);
+            tracing::info!(
+                "Parent (PID={}) exiting, child (PID={}) continues as daemon",
+                std::process::id(),
+                pid
+            );
             std::process::exit(0);
         }
     }

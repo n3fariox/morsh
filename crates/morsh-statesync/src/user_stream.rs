@@ -1,5 +1,7 @@
 use morsh_network::State;
-use morsh_proto::client::{Instruction as ClientInstruction, Keystroke, ResizeMessage, UserMessage};
+use morsh_proto::client::{
+    Instruction as ClientInstruction, Keystroke, ResizeMessage, UserMessage,
+};
 use prost::Message;
 
 /// A user input event: keystroke or resize.
@@ -43,7 +45,9 @@ impl UserStream {
     /// Compute the diff from `existing` to `self`.
     /// Returns serialized ClientBuffers::UserMessage.
     fn encode_diff_from(&self, existing: &UserStream) -> Vec<u8> {
-        let mut msg = UserMessage { instruction: Vec::new() };
+        let mut msg = UserMessage {
+            instruction: Vec::new(),
+        };
 
         // Find where existing ends and our new events begin
         let common_prefix_len = self.common_prefix_len(existing);
@@ -106,7 +110,10 @@ impl UserStream {
             } else if let Some(ref resize) = inst.resize {
                 let w = resize.width.unwrap_or(80);
                 let h = resize.height.unwrap_or(24);
-                self.events.push(UserEvent::Resize { width: w, height: h });
+                self.events.push(UserEvent::Resize {
+                    width: w,
+                    height: h,
+                });
             }
         }
 
@@ -144,7 +151,6 @@ impl UserStream {
         i
     }
 }
-
 
 impl State for UserStream {
     /// User input is a queue: everything the peer has acknowledged can be
@@ -251,7 +257,9 @@ mod tests {
         s.push_key(b'b');
         s.push_key(b'c');
 
-        let prefix = UserStream { events: vec![UserEvent::UserByte(b'a'), UserEvent::UserByte(b'b')] };
+        let prefix = UserStream {
+            events: vec![UserEvent::UserByte(b'a'), UserEvent::UserByte(b'b')],
+        };
         s.subtract(&prefix);
         assert_eq!(s.len(), 1);
         assert_eq!(s.get(0), Some(&UserEvent::UserByte(b'c')));
@@ -269,7 +277,13 @@ mod tests {
         let msg = UserMessage::decode(diff.as_slice()).unwrap();
         // Consecutive keystrokes should be in a single instruction
         assert_eq!(msg.instruction.len(), 1);
-        let keys = msg.instruction[0].keystroke.as_ref().unwrap().keys.as_ref().unwrap();
+        let keys = msg.instruction[0]
+            .keystroke
+            .as_ref()
+            .unwrap()
+            .keys
+            .as_ref()
+            .unwrap();
         assert_eq!(keys, &vec![b'h', b'i']);
     }
 
@@ -283,6 +297,12 @@ mod tests {
         let diff = s.diff_from(&empty);
         let mut result = UserStream::new();
         result.apply_string(&diff).unwrap();
-        assert_eq!(result.get(0), Some(&UserEvent::Resize { width: 120, height: 40 }));
+        assert_eq!(
+            result.get(0),
+            Some(&UserEvent::Resize {
+                width: 120,
+                height: 40
+            })
+        );
     }
 }

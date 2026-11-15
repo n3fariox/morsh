@@ -260,7 +260,11 @@ impl ScreenSnapshot {
             mouse_focus_event: false,
             mouse_alternate_scroll: false,
             grapheme_cluster: false,
-            fg: RgbColor { r: 255, g: 255, b: 255 },
+            fg: RgbColor {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
             bg: RgbColor { r: 0, g: 0, b: 0 },
             palette: default_palette(),
         }
@@ -268,16 +272,12 @@ impl ScreenSnapshot {
 
     /// Get a cell at (x, y). Returns None if out of bounds.
     pub fn cell(&self, x: u16, y: u16) -> Option<&CellData> {
-        self.rows
-            .get(y as usize)?
-            .get(x as usize)
+        self.rows.get(y as usize)?.get(x as usize)
     }
 
     /// Get a mutable cell at (x, y). Returns None if out of bounds.
     pub fn cell_mut(&mut self, x: u16, y: u16) -> Option<&mut CellData> {
-        self.rows
-            .get_mut(y as usize)?
-            .get_mut(x as usize)
+        self.rows.get_mut(y as usize)?.get_mut(x as usize)
     }
 }
 

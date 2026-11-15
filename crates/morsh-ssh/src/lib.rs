@@ -266,9 +266,11 @@ fn load_key_with_passphrase_prompt(path: &std::path::Path) -> Result<PrivateKey>
 
     // rpassword reads from the terminal with echo off (/dev/tty on Unix, the
     // console on Windows) and strips the line ending, `\r\n` included.
-    let passphrase = rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))
-        .context("Cannot prompt for SSH key passphrase")?;
-    load_secret_key(path, Some(&passphrase)).context("Failed to decrypt key with provided passphrase; is the passphrase correct?")
+    let passphrase =
+        rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))
+            .context("Cannot prompt for SSH key passphrase")?;
+    load_secret_key(path, Some(&passphrase))
+        .context("Failed to decrypt key with provided passphrase; is the passphrase correct?")
 }
 
 impl Drop for SshSession {

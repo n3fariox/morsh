@@ -56,7 +56,9 @@ mod tests {
     #[test]
     fn windows_servers_are_recognised() {
         assert!(is_windows("SSH-2.0-OpenSSH_for_Windows_9.5"));
-        assert!(is_windows("SSH-2.0-9.31 FlowSsh: Bitvise SSH Server (WinSSHD) 9.31"));
+        assert!(is_windows(
+            "SSH-2.0-9.31 FlowSsh: Bitvise SSH Server (WinSSHD) 9.31"
+        ));
         assert!(!is_windows("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5"));
         assert!(!is_windows("SSH-2.0-dropbear_2022.83"));
     }

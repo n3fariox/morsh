@@ -534,7 +534,11 @@ impl<M: State, R: State> Transport<M, R> {
 
     /// The synchronous half of [`Transport::recv`], split out so tests can
     /// drive the protocol without sockets.
-    pub fn process_datagram(&mut self, data: &[u8], peer: std::net::SocketAddr) -> Result<RecvOutcome, String> {
+    pub fn process_datagram(
+        &mut self,
+        data: &[u8],
+        peer: std::net::SocketAddr,
+    ) -> Result<RecvOutcome, String> {
         let Some(inst) = self.connection.process_incoming(data, peer)? else {
             return Ok(RecvOutcome::Incomplete);
         };
@@ -581,7 +585,9 @@ impl<M: State, R: State> Transport<M, R> {
         self.process_throwaway_until(throwaway_num);
         let Some(reference_index) = self.received_states.iter().position(|s| s.num == old_num)
         else {
-            tracing::debug!("Reference state {old_num} was culled by throwaway_num {throwaway_num}");
+            tracing::debug!(
+                "Reference state {old_num} was culled by throwaway_num {throwaway_num}"
+            );
             return Ok(RecvOutcome::Ignored);
         };
 

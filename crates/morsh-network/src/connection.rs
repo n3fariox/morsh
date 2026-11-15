@@ -633,7 +633,10 @@ impl Connection {
         // Roaming: re-target whenever the source differs, but only after the
         // packet has authenticated. Only the client roams.
         if self.server && self.remote_addr != Some(peer) {
-            tracing::info!("Server now attached to client at {peer} (was {:?})", self.remote_addr);
+            tracing::info!(
+                "Server now attached to client at {peer} (was {:?})",
+                self.remote_addr
+            );
             self.remote_addr = Some(peer);
         }
 
@@ -645,7 +648,8 @@ impl Connection {
     /// Check if we should hop ports (client only).
     pub fn should_hop_port(&self, now: Instant) -> bool {
         !self.server
-            && (now - self.last_port_choice > std::time::Duration::from_millis(PORT_HOP_INTERVAL_MS))
+            && (now - self.last_port_choice
+                > std::time::Duration::from_millis(PORT_HOP_INTERVAL_MS))
             && (now - self.last_roundtrip_success
                 > std::time::Duration::from_millis(PORT_HOP_INTERVAL_MS))
     }

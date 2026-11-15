@@ -1,10 +1,10 @@
 use crate::queries::{Query, QueryParser};
-use std::io::Write as _;
 use libghostty_vt::render::RenderState;
-use libghostty_vt::style::RgbColor as VtRgbColor;
 use libghostty_vt::screen::CellWide;
+use libghostty_vt::style::RgbColor as VtRgbColor;
 use libghostty_vt::terminal::Mode;
 use libghostty_vt::{Terminal, TerminalOptions};
+use std::io::Write as _;
 
 use crate::snapshot::{
     CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor,
@@ -119,7 +119,10 @@ impl MoshTerminal {
 
         // Cursor position
         let (cursor_x, cursor_y) = match snapshot.cursor_viewport().ok().flatten() {
-            Some(cv) => (cv.x.min(cols.saturating_sub(1)), cv.y.min(rows.saturating_sub(1))),
+            Some(cv) => (
+                cv.x.min(cols.saturating_sub(1)),
+                cv.y.min(rows.saturating_sub(1)),
+            ),
             None => (0, 0),
         };
         let cursor_visible = snapshot.cursor_visible().unwrap_or(true);
@@ -136,7 +139,11 @@ impl MoshTerminal {
                 (fg, bg, palette)
             }
             Err(_) => (
-                VtRgbColor { r: 255, g: 255, b: 255 },
+                VtRgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                },
                 VtRgbColor { r: 0, g: 0, b: 0 },
                 [VtRgbColor { r: 0, g: 0, b: 0 }; 256],
             ),
@@ -144,8 +151,8 @@ impl MoshTerminal {
 
         // Read all cells
         let mut screen_rows: Vec<Vec<CellData>> = Vec::with_capacity(rows as usize);
-        let mut row_iter =
-            libghostty_vt::render::RowIterator::new().map_err(|e| format!("RowIterator::new: {e:?}"))?;
+        let mut row_iter = libghostty_vt::render::RowIterator::new()
+            .map_err(|e| format!("RowIterator::new: {e:?}"))?;
         let mut cell_iter = libghostty_vt::render::CellIterator::new()
             .map_err(|e| format!("CellIterator::new: {e:?}"))?;
 
@@ -179,7 +186,8 @@ impl MoshTerminal {
                                 .map_err(|_| "Cell::graphemes_buf failed".to_string())?;
                             &single[..len]
                         } else {
-                            cluster = cell.graphemes()
+                            cluster = cell
+                                .graphemes()
                                 .map_err(|_| "Cell::graphemes failed".to_string())?;
                             &cluster
                         };
@@ -198,8 +206,7 @@ impl MoshTerminal {
                             .and_then(|raw| raw.wide())
                             .unwrap_or(CellWide::Narrow);
                         let wide = width == CellWide::Wide;
-                        let spacer =
-                            width == CellWide::SpacerTail || width == CellWide::SpacerHead;
+                        let spacer = width == CellWide::SpacerTail || width == CellWide::SpacerHead;
 
                         // Canonicalise blank cells. ghostty reports a blank
                         // as either an empty grapheme list or a single space

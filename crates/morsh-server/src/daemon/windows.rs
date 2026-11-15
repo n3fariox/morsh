@@ -3,8 +3,8 @@ pub fn fork_and_detach(_port: u16) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, STARTUPINFOW, PROCESS_INFORMATION, DETACHED_PROCESS,
-        CREATE_BREAKAWAY_FROM_JOB,
+        CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTUPINFOW,
     };
 
     tracing::info!("Spawning detached child process via CreateProcess");
@@ -24,11 +24,12 @@ pub fn fork_and_detach(_port: u16) -> bool {
             cmd_line.push_str(arg);
         }
     }
-    let mut cmd_wide: Vec<u16> =
-        OsStr::new(&cmd_line).encode_wide().chain(Some(0)).collect();
+    let mut cmd_wide: Vec<u16> = OsStr::new(&cmd_line).encode_wide().chain(Some(0)).collect();
 
-    let exe_wide: Vec<u16> =
-        OsStr::new(exe.as_os_str()).encode_wide().chain(Some(0)).collect();
+    let exe_wide: Vec<u16> = OsStr::new(exe.as_os_str())
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;

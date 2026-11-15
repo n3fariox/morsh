@@ -100,10 +100,7 @@ mod tests {
         let decoded = UserMessage::decode(buf.as_slice()).unwrap();
         assert_eq!(decoded.instruction.len(), 1);
         let inst = &decoded.instruction[0];
-        assert_eq!(
-            inst.keystroke.as_ref().unwrap().keys,
-            Some(b"a".to_vec())
-        );
+        assert_eq!(inst.keystroke.as_ref().unwrap().keys, Some(b"a".to_vec()));
         let resize = inst.resize.as_ref().unwrap();
         assert_eq!(resize.width, Some(80));
         assert_eq!(resize.height, Some(24));

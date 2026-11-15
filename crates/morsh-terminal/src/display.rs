@@ -1,4 +1,6 @@
-use crate::snapshot::{CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor};
+use crate::snapshot::{
+    CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor,
+};
 use std::fmt::Write as _;
 
 /// Generates VT escape sequence strings from screen snapshots.
@@ -23,7 +25,10 @@ fn title(out: &mut String, text: &str) {
 /// per codepoint unless the host enables mode 2027, and the user's terminal may
 /// do neither the same way, so the cursor can't be trusted after such a cell.
 fn width_is_disputed(text: &str) -> bool {
-    text.chars().count() > 1 || text.chars().any(|c| ('\u{1F000}'..='\u{1FFFF}').contains(&c))
+    text.chars().count() > 1
+        || text
+            .chars()
+            .any(|c| ('\u{1F000}'..='\u{1FFFF}').contains(&c))
 }
 
 /// Blank the columns `cell` occupies, without moving the cursor. If the terminal
@@ -323,10 +328,7 @@ impl DisplayDiff {
         // drew something (which left the cursor wherever the last cell was) or
         // the cursor itself moved. Emitting it unconditionally means every
         // idle frame writes a few bytes to the user's terminal forever.
-        if !out.is_empty()
-            || old.cursor_y != new.cursor_y
-            || old.cursor_x != new.cursor_x
-        {
+        if !out.is_empty() || old.cursor_y != new.cursor_y || old.cursor_x != new.cursor_x {
             let _ = write!(out, "\x1b[{};{}H", new.cursor_y + 1, new.cursor_x + 1);
         }
 
@@ -453,7 +455,7 @@ mod tests {
 
         let vt = DisplayDiff::full_redraw(&snap);
         assert!(vt.contains("\x1b[2J")); // clear screen
-        assert!(vt.contains("\x1b[H"));  // move to top-left
+        assert!(vt.contains("\x1b[H")); // move to top-left
         assert!(vt.contains("Hi"));
     }
 
@@ -488,9 +490,9 @@ mod tests {
             ..CellStyle::default_style()
         };
         let s = style_on(&style);
-        assert!(s.contains("1"));   // bold
-        assert!(s.contains("38"));  // fg 256-color
-        assert!(s.contains("5"));   // palette mode
+        assert!(s.contains("1")); // bold
+        assert!(s.contains("38")); // fg 256-color
+        assert!(s.contains("5")); // palette mode
     }
 
     #[test]
@@ -634,7 +636,10 @@ mod tests {
         assert!(!vt.contains("\x1b[2J"), "must not repaint: {vt:?}");
         // Only the newly exposed line is drawn.
         assert!(vt.contains("six"));
-        assert!(!vt.contains("three"), "unchanged rows were repainted: {vt:?}");
+        assert!(
+            !vt.contains("three"),
+            "unchanged rows were repainted: {vt:?}"
+        );
     }
 
     #[test]
@@ -653,7 +658,10 @@ mod tests {
         old.cursor_y = 0;
 
         let vt = DisplayDiff::diff(&old, &new);
-        assert!(vt.contains("\x1b[1;4r"), "expected a scrolling region: {vt:?}");
+        assert!(
+            vt.contains("\x1b[1;4r"),
+            "expected a scrolling region: {vt:?}"
+        );
         assert!(vt.contains("\x1b[r"), "region must be reset: {vt:?}");
         assert!(!vt.contains("\x1b[2J"));
     }
@@ -701,8 +709,16 @@ mod tests {
         for paint in paints {
             for cluster in ["👍🏽", "👨\u{200d}👩\u{200d}👧", "🇯🇵", "❤\u{fe0f}"] {
                 let (expected, user) = paint_on_clustering_terminal(&format!("{cluster}xy"), paint);
-                assert_eq!(column_of(&user, "x"), column_of(&expected, "x"), "{cluster}");
-                assert_eq!(column_of(&user, "y"), column_of(&expected, "y"), "{cluster}");
+                assert_eq!(
+                    column_of(&user, "x"),
+                    column_of(&expected, "x"),
+                    "{cluster}"
+                );
+                assert_eq!(
+                    column_of(&user, "y"),
+                    column_of(&expected, "y"),
+                    "{cluster}"
+                );
             }
         }
     }
@@ -796,7 +812,20 @@ mod tests {
     }
 
     fn text_rows(snap: &ScreenSnapshot) -> Vec<String> {
-        snap.rows.iter().map(|r| r.iter().map(|c| if c.text.is_empty() { " " } else { c.text.as_str() }).collect()).collect()
+        snap.rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|c| {
+                        if c.text.is_empty() {
+                            " "
+                        } else {
+                            c.text.as_str()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Replays a stock mosh-server session (from a real log) into a model
@@ -810,7 +839,9 @@ mod tests {
         use crate::MoshTerminal;
         let (cols, rows) = (40u16, 10u16);
         let mut first = String::from("\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[?25l");
-        for _ in 0..rows { first.push_str("\x1b[K\n"); }
+        for _ in 0..rows {
+            first.push_str("\x1b[K\n");
+        }
         first.push_str("\x1b[K\x1b[1;1H\x1b[?25h\x1b[0m");
         let frames: Vec<&str> = vec![
             &first,
@@ -835,7 +866,11 @@ mod tests {
             screen.write(out.as_bytes());
             let shown = screen.snapshot().unwrap();
             assert_eq!(text_rows(&shown), text_rows(&snap), "after frame {f:?}");
-            assert_eq!((shown.cursor_x, shown.cursor_y), (snap.cursor_x, snap.cursor_y), "cursor after frame {f:?}");
+            assert_eq!(
+                (shown.cursor_x, shown.cursor_y),
+                (snap.cursor_x, snap.cursor_y),
+                "cursor after frame {f:?}"
+            );
             displayed = Some(snap);
         }
         let last = displayed.unwrap();

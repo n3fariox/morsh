@@ -329,8 +329,19 @@ mod tests {
     #[test]
     fn mosh_pl_invocation_with_bind_ip_port_and_command() {
         let opts = parse(&[
-            "new", "-c", "256", "-i", "10.0.0.5", "-p", "60000:60010", "-l", "LANG=C.UTF-8", "--",
-            "htop", "-d", "5",
+            "new",
+            "-c",
+            "256",
+            "-i",
+            "10.0.0.5",
+            "-p",
+            "60000:60010",
+            "-l",
+            "LANG=C.UTF-8",
+            "--",
+            "htop",
+            "-d",
+            "5",
         ]);
         assert_eq!(opts.bind_addr.as_deref(), Some("10.0.0.5"));
         assert!(!opts.use_ssh_connection);
@@ -430,10 +441,7 @@ mod tests {
 
     #[test]
     fn help_and_version_are_detected() {
-        assert_eq!(
-            parse_args(&["--help".to_string()]),
-            ParseOutcome::Help
-        );
+        assert_eq!(parse_args(&["--help".to_string()]), ParseOutcome::Help);
         assert_eq!(
             parse_args(&["new".to_string(), "-h".to_string()]),
             ParseOutcome::Help

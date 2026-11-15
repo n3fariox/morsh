@@ -23,7 +23,11 @@ impl Nonce {
 
     /// Create a nonce from the 8-byte wire representation.
     pub fn from_bytes(s_bytes: &[u8]) -> Self {
-        assert_eq!(s_bytes.len(), 8, "Nonce wire representation must be 8 bytes");
+        assert_eq!(
+            s_bytes.len(),
+            8,
+            "Nonce wire representation must be 8 bytes"
+        );
         let mut bytes = [0u8; 12];
         bytes[4..].copy_from_slice(s_bytes);
         Self(bytes)
