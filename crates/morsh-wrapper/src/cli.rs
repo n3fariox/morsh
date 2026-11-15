@@ -38,9 +38,25 @@ pub(crate) struct Args {
     #[arg(long = "port", short = 'p', value_parser = parse_port_range)]
     pub(crate) port_range: Option<String>,
 
-    /// Predict the future (enable prediction engine)
-    #[arg(long = "predict", default_value = "adaptive", value_parser = ["adaptive", "always", "never"])]
-    pub(crate) predict: String,
+    /// Prediction mode: adaptive (default), always, never, or experimental.
+    #[arg(long, overrides_with_all = ["predict", "always", "never"])]
+    predict: Option<String>,
+
+    /// Use local echo even on fast links (--predict=always).
+    #[arg(short = 'a', overrides_with_all = ["predict", "always", "never"])]
+    always: bool,
+
+    /// Never use local echo (--predict=never).
+    #[arg(short = 'n', overrides_with_all = ["predict", "always", "never"])]
+    never: bool,
+
+    /// Prediction overwrites existing text instead of inserting.
+    #[arg(long, short = 'o', overrides_with_all = ["predict_overwrite", "no_predict_overwrite"])]
+    predict_overwrite: bool,
+
+    /// Do not request prediction overwrite (preserves an inherited setting).
+    #[arg(long, alias = "nopredict-overwrite", overrides_with_all = ["predict_overwrite", "no_predict_overwrite"])]
+    no_predict_overwrite: bool,
 
     /// Do not send terminal initialization and restoration sequences.
     #[arg(long, alias = "noinit", overrides_with = "init")]
@@ -113,7 +129,33 @@ impl Args {
         }
     }
 
-    pub(crate) fn configure_client(&self, command: &mut std::process::Command) {
+    pub(crate) fn prediction_mode(&self, inherited: Option<&str>) -> Result<String, String> {
+        // mosh.pl validates after GetOptions, so the final explicit option
+        // overrides earlier values and even an invalid inherited mode.
+        let explicit = if self.always {
+            Some("always")
+        } else if self.never {
+            Some("never")
+        } else {
+            self.predict.as_deref()
+        };
+        let mode = explicit.or(inherited).unwrap_or("adaptive");
+        if matches!(mode, "adaptive" | "always" | "never" | "experimental") {
+            return Ok(mode.to_string());
+        }
+        let explanation = if explicit.is_none() && inherited.is_some() {
+            " (MOSH_PREDICTION_DISPLAY in environment)"
+        } else {
+            ""
+        };
+        Err(format!("Unknown mode \"{mode}\"{explanation}."))
+    }
+
+    pub(crate) fn configure_client(&self, command: &mut std::process::Command, prediction: &str) {
+        command.env("MOSH_PREDICTION_DISPLAY", prediction);
+        if self.predict_overwrite && !self.no_predict_overwrite {
+            command.env("MOSH_PREDICTION_OVERWRITE", "yes");
+        }
         // mosh.pl preserves an inherited value unless --no-init is selected.
         if self.no_init && !self.init {
             command.env("MOSH_NO_TERM_INIT", "1");
@@ -146,6 +188,113 @@ fn parse_port_range(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_prediction_flags_are_accepted() {
+        for flags in [
+            vec!["--predict=adaptive"],
+            vec!["--predict=always"],
+            vec!["--predict=never"],
+            vec!["--predict=experimental"],
+            vec!["-a"],
+            vec!["-n"],
+            vec!["--predict-overwrite"],
+            vec!["-o"],
+        ] {
+            let parsed = Args::try_parse_from(["morsh"].into_iter().chain(flags).chain(["host"]));
+            assert!(parsed.is_ok(), "{parsed:?}");
+        }
+    }
+
+    #[test]
+    fn prediction_modes_use_the_final_option_then_environment_then_default() {
+        for (flags, inherited, expected) in [
+            (vec![], None, "adaptive"),
+            (vec![], Some("experimental"), "experimental"),
+            (vec![], Some("never"), "never"),
+            (vec!["--predict=adaptive"], Some("always"), "adaptive"),
+            (vec!["--predict=experimental"], None, "experimental"),
+            (vec!["-a"], Some("invalid"), "always"),
+            (vec!["-n"], Some("invalid"), "never"),
+            (vec!["-an"], None, "never"),
+            (vec!["-na"], None, "always"),
+            (vec!["-a", "-a"], None, "always"),
+            (vec!["-n", "--predict=experimental"], None, "experimental"),
+            (vec!["--predict=invalid", "-a"], None, "always"),
+            (vec!["--predict=invalid", "--predict=never"], None, "never"),
+        ] {
+            let args =
+                Args::try_parse_from(["morsh"].into_iter().chain(flags).chain(["host"])).unwrap();
+            let mode = args.prediction_mode(inherited).unwrap();
+            assert_eq!(mode, expected);
+            let mut command = std::process::Command::new("morsh-client");
+            args.configure_client(&mut command, &mode);
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == "MOSH_PREDICTION_DISPLAY")
+                    .unwrap()
+                    .1
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn prediction_mode_errors_match_mosh_pl() {
+        let args = Args::try_parse_from(["morsh", "host"]).unwrap();
+        for mode in ["", "ADAPTIVE", "invalid"] {
+            assert_eq!(
+                args.prediction_mode(Some(mode)).unwrap_err(),
+                format!("Unknown mode \"{mode}\" (MOSH_PREDICTION_DISPLAY in environment).")
+            );
+            let args = Args::try_parse_from(["morsh", "-a", "--predict", mode, "host"]).unwrap();
+            assert_eq!(
+                args.prediction_mode(Some("never")).unwrap_err(),
+                format!("Unknown mode \"{mode}\".")
+            );
+        }
+    }
+
+    #[test]
+    fn prediction_overwrite_sets_yes_only_when_requested() {
+        for (flags, overwrite) in [
+            (vec![], false),
+            (vec!["--predict-overwrite"], true),
+            (vec!["-o"], true),
+            (vec!["-oo"], true),
+            (vec!["--predict-overwrite", "--no-predict-overwrite"], false),
+            (vec!["-o", "--nopredict-overwrite"], false),
+            (vec!["--no-predict-overwrite", "-o"], true),
+        ] {
+            let args =
+                Args::try_parse_from(["morsh"].into_iter().chain(flags).chain(["host"])).unwrap();
+            let mut command = std::process::Command::new("morsh-client");
+            args.configure_client(&mut command, "adaptive");
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == "MOSH_PREDICTION_OVERWRITE");
+            assert_eq!(
+                value.map(|(_, value)| value.unwrap()),
+                overwrite.then_some(std::ffi::OsStr::new("yes"))
+            );
+            // Like mosh.pl, a disabled overwrite flag does not unset the
+            // parent's existing MOSH_PREDICTION_OVERWRITE value.
+            let mut inherited = std::process::Command::new("morsh-client");
+            inherited.env("MOSH_PREDICTION_OVERWRITE", "yes");
+            args.configure_client(&mut inherited, "adaptive");
+            assert_eq!(
+                inherited
+                    .get_envs()
+                    .find(|(key, _)| *key == "MOSH_PREDICTION_OVERWRITE")
+                    .unwrap()
+                    .1
+                    .unwrap(),
+                "yes"
+            );
+        }
+    }
 
     #[test]
     fn stock_mosh_short_port_flag_is_accepted() {
@@ -186,7 +335,7 @@ mod tests {
             let args =
                 Args::try_parse_from(["morsh"].into_iter().chain(flags).chain(["host"])).unwrap();
             let mut command = std::process::Command::new("morsh-client");
-            args.configure_client(&mut command);
+            args.configure_client(&mut command, "adaptive");
             let value = command
                 .get_envs()
                 .find(|(key, _)| *key == "MOSH_NO_TERM_INIT");

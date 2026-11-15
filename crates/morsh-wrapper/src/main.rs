@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
@@ -101,6 +101,14 @@ fn main() {
     let _guard = morsh_log::init("morsh");
 
     let args = Args::parse();
+    let inherited_prediction =
+        std::env::var_os("MOSH_PREDICTION_DISPLAY").map(|mode| mode.to_string_lossy().into_owned());
+    let prediction = args
+        .prediction_mode(inherited_prediction.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("morsh: {error}\n\n{}", Args::command().render_help());
+            std::process::exit(1);
+        });
 
     // Which address the *server* should bind to. "ssh" means "let the server
     // read it out of $SSH_CONNECTION" — that is what `-s` is for, and it is
@@ -175,11 +183,10 @@ fn main() {
         .unwrap_or_else(|| "morsh-client".into());
 
     let mut client = Command::new(&client_path);
-    args.configure_client(&mut client);
+    args.configure_client(&mut client, &prediction);
     let exit_status = client
         .arg(&server_addr)
         .env("MORSH_KEY", &info.key)
-        .env("MOSH_PREDICTION_DISPLAY", &args.predict)
         .status()
         .expect("Failed to start morsh-client. Is it in PATH?");
 
