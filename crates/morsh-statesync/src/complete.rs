@@ -44,6 +44,21 @@ impl Clone for Complete {
             input_history: self.input_history.clone(),
         }
     }
+
+    /// Reuse screen/history buffers when they have enough capacity. As with
+    /// clone(), the copied state rebuilds its emulator lazily on the next write.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            terminal: _,
+            screen,
+            echo_ack,
+            input_history,
+        } = source;
+        self.terminal = None;
+        self.screen.clone_from(screen);
+        self.echo_ack = *echo_ack;
+        self.input_history.clone_from(input_history);
+    }
 }
 
 impl Complete {
@@ -155,6 +170,7 @@ impl Complete {
     }
 
     /// The current screen contents, cloned.
+    /// Use `destination.clone_from(self.screen())` to reuse an existing snapshot.
     pub fn snapshot(&self) -> ScreenSnapshot {
         self.screen.clone()
     }
@@ -300,6 +316,28 @@ mod tests {
         }
         assert_eq!(state.act(b"n").unwrap(), b"\x1b[3;7R");
         assert!(state.act(b"text").unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn clone_from_replaces_live_terminal_state_without_aliasing_source() {
+        let mut source = Complete::new(20, 2).unwrap();
+        source.act(b"seed").unwrap();
+        source.set_echo_ack_num(7);
+        source.register_input_frame(8, Instant::now());
+        let mut reused = Complete::new(4, 1).unwrap();
+        reused.act(b"old").unwrap();
+
+        reused.clone_from(&source);
+        assert!(reused.terminal.is_none());
+        assert!(source.terminal.is_some());
+        assert!(reused.state_equal(&source));
+        assert_eq!(reused.input_history, source.input_history);
+
+        reused.act(b"!").unwrap();
+        assert_eq!(reused.screen().rows[0][4].text, "!");
+        assert_eq!(source.screen().rows[0][4].text, "");
+        assert_eq!(reused.screen().rows[0][0].text, "s");
     }
 
     #[test]

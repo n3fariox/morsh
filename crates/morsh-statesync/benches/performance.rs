@@ -238,6 +238,16 @@ fn ultrawide_benchmarks() {
                 black_box(&reused_snapshot);
             },
         );
+        let mut reused_state = state.clone();
+        measure_iterations(
+            &format!("split_{cols}x{rows}_complete_clone_from_cells"),
+            cells,
+            3,
+            || {
+                reused_state.clone_from(black_box(&state));
+                black_box(&reused_state);
+            },
+        );
         let mut terminal = MoshTerminal::new(cols, rows, 0).unwrap();
         terminal.write(&initial_screen(cols, rows));
         measure_iterations(

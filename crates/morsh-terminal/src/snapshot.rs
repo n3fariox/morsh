@@ -74,12 +74,18 @@ impl Clone for CellData {
         }
     }
 
-    /// Reuse text storage when copying a cell.
+    /// Reuse the text buffer when its capacity is sufficient.
     fn clone_from(&mut self, source: &Self) {
-        self.text.clone_from(&source.text);
-        self.wide = source.wide;
-        self.spacer = source.spacer;
-        self.style = source.style;
+        let Self {
+            text,
+            wide,
+            spacer,
+            style,
+        } = source;
+        self.text.clone_from(text);
+        self.wide = *wide;
+        self.spacer = *spacer;
+        self.style = *style;
     }
 }
 
@@ -197,24 +203,42 @@ impl Clone for ScreenSnapshot {
         }
     }
 
-    /// Reuse row and cell storage when copying a frame.
+    /// Reuse row and cell buffers when their capacity is sufficient.
     fn clone_from(&mut self, source: &Self) {
-        self.rows.clone_from(&source.rows);
-        self.cols = source.cols;
-        self.rows_count = source.rows_count;
-        self.cursor_x = source.cursor_x;
-        self.cursor_y = source.cursor_y;
-        self.cursor_visible = source.cursor_visible;
-        self.title.clone_from(&source.title);
-        self.bracketed_paste = source.bracketed_paste;
-        self.mouse_reporting = source.mouse_reporting;
-        self.mouse_encoding = source.mouse_encoding;
-        self.mouse_focus_event = source.mouse_focus_event;
-        self.mouse_alternate_scroll = source.mouse_alternate_scroll;
-        self.grapheme_cluster = source.grapheme_cluster;
-        self.fg = source.fg;
-        self.bg = source.bg;
-        self.palette = source.palette;
+        let Self {
+            rows,
+            cols,
+            rows_count,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            title,
+            bracketed_paste,
+            mouse_reporting,
+            mouse_encoding,
+            mouse_focus_event,
+            mouse_alternate_scroll,
+            grapheme_cluster,
+            fg,
+            bg,
+            palette,
+        } = source;
+        self.rows.clone_from(rows);
+        self.cols = *cols;
+        self.rows_count = *rows_count;
+        self.cursor_x = *cursor_x;
+        self.cursor_y = *cursor_y;
+        self.cursor_visible = *cursor_visible;
+        self.title.clone_from(title);
+        self.bracketed_paste = *bracketed_paste;
+        self.mouse_reporting = *mouse_reporting;
+        self.mouse_encoding = *mouse_encoding;
+        self.mouse_focus_event = *mouse_focus_event;
+        self.mouse_alternate_scroll = *mouse_alternate_scroll;
+        self.grapheme_cluster = *grapheme_cluster;
+        self.fg = *fg;
+        self.bg = *bg;
+        self.palette = *palette;
     }
 }
 
