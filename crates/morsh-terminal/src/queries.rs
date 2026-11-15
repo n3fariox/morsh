@@ -41,13 +41,19 @@ pub(crate) struct QueryParser {
 impl QueryParser {
     /// Ghostty does not interpret UTF-8 C1 controls. Translate them to their
     /// 7-bit equivalents, retaining a trailing UTF-8 lead byte across writes.
+    /// Unimplemented C1 controls and CAN/SUB cancel through ST without printing.
     pub fn normalize<'a>(&mut self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
         use std::borrow::Cow;
         if input.is_empty() {
             return Cow::Borrowed(input);
         }
+        if !self.pending_c2 && memchr::memchr3(0xc2, 0x18, 0x1a, input).is_none() {
+            return Cow::Borrowed(input);
+        }
         if !self.pending_c2
-            && (!input.contains(&0xc2) || (input.last() != Some(&0xc2) && !contains_c1(input)))
+            && input.last() != Some(&0xc2)
+            && memchr::memchr2(0x18, 0x1a, input).is_none()
+            && !contains_c1(input)
         {
             return Cow::Borrowed(input);
         }
@@ -72,8 +78,17 @@ impl QueryParser {
             input.len()
         };
         let scan_start = start;
-        for pos in memchr::memchr_iter(0xc2, &input[scan_start..end]).map(|i| scan_start + i) {
-            if pos + 1 < end && (0x80..=0x9f).contains(&input[pos + 1]) {
+        for pos in
+            memchr::memchr3_iter(0xc2, 0x18, 0x1a, &input[scan_start..end]).map(|i| scan_start + i)
+        {
+            if input[pos] == 0x18 || input[pos] == 0x1a {
+                let buffer = out.get_or_insert_with(|| Vec::with_capacity(input.len() + 1));
+                buffer.extend_from_slice(&input[start..pos]);
+                // Ghostty prints CAN/SUB. ST cancels the sequence without
+                // leaving a control-code cell or moving the cursor.
+                buffer.extend_from_slice(b"\x1b\\");
+                start = pos + 1;
+            } else if pos + 1 < end && (0x80..=0x9f).contains(&input[pos + 1]) {
                 let buffer = out.get_or_insert_with(|| Vec::with_capacity(input.len() + 1));
                 buffer.extend_from_slice(&input[start..pos]);
                 Self::c1_alias(buffer, input[pos + 1]);
@@ -107,7 +122,7 @@ impl QueryParser {
         if let Some(alias) = alias {
             out.extend_from_slice(&[0x1b, alias]);
         } else {
-            out.push(0x18);
+            out.extend_from_slice(b"\x1b\\");
         }
     }
 

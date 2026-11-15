@@ -68,3 +68,33 @@ fn replies_match_stock_mosh_for_complete_and_fragmented_queries() {
         }
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn cancellation_controls_never_become_printable_cells() {
+    let mut controls = vec![vec![0x18], vec![0x1a]];
+    for c1 in [
+        0x80, 0x81, 0x82, 0x83, 0x86, 0x87, 0x89, 0x8a, 0x8b, 0x8c, 0x8e, 0x8f, 0x91, 0x92, 0x93,
+        0x94, 0x95, 0x96, 0x97, 0x99, 0x9a,
+    ] {
+        controls.push(vec![0xc2, c1]);
+    }
+    for control in controls {
+        let mut input = vec![b'x'];
+        input.extend(&control);
+        input.extend_from_slice(b"y\x1b[6n");
+        for size in [1, 2, input.len()] {
+            let mut terminal = MoshTerminal::new(20, 3, 0).unwrap();
+            let mut replies = Vec::new();
+            for chunk in input.chunks(size) {
+                replies.extend(terminal.write_with_replies(chunk));
+            }
+            assert_eq!(replies, b"\x1b[1;3R", "{control:?}, chunk size {size}");
+            let screen = terminal.snapshot().unwrap();
+            assert_eq!(screen.rows[0][0].text, "x");
+            assert_eq!(screen.rows[0][1].text, "y");
+            let display = morsh_terminal::DisplayDiff::full_redraw(&screen);
+            assert!(!display.contains('\x18') && !display.contains('\x1a'));
+        }
+    }
+}
