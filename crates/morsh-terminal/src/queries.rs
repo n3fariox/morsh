@@ -358,16 +358,16 @@ impl QueryParser {
 // Check eight bytes at once for the C1 continuation range 0x80..=0x9f.
 // This avoids one memchr call per Latin-1 character when none are controls.
 fn contains_c1(input: &[u8]) -> bool {
-    let mut blocks = input.chunks_exact(8);
-    for block in &mut blocks {
-        let word = u64::from_ne_bytes(block.try_into().unwrap());
+    let (blocks, remainder) = input.as_chunks::<8>();
+    for block in blocks {
+        let word = u64::from_ne_bytes(*block);
         let candidate = (word & 0xe0e0_e0e0_e0e0_e0e0) ^ 0x8080_8080_8080_8080;
         // Standard word-at-a-time zero-byte test, independent of endianness.
         if candidate.wrapping_sub(0x0101_0101_0101_0101) & !candidate & 0x8080_8080_8080_8080 != 0 {
             return true;
         }
     }
-    blocks.remainder().iter().any(|b| (0x80..=0x9f).contains(b))
+    remainder.iter().any(|b| (0x80..=0x9f).contains(b))
 }
 
 #[cfg(test)]
