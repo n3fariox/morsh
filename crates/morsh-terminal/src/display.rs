@@ -364,8 +364,6 @@ impl DisplayDiff {
             out.push_str("\x1b[r");
         }
     }
-
-
 }
 
 /// Generate SGR escape sequence to enable the given style attributes.

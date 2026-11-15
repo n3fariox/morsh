@@ -8,6 +8,7 @@ description = "Terminal emulation adapter for morsh using libghostty-vt"
 
 [dependencies]
 libghostty-vt = "0.2"
+memchr = "2"
 
 [dev-dependencies]
 serial_test = "3"

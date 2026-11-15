@@ -78,7 +78,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HOST");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
-    println!("cargo:rerun-if-changed=crates/libghostty-vt-sys/build.rs");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=patches");
 
     // An explicit source override should stay authoritative even when the
     // pkg-config feature is enabled, so local Ghostty checkouts remain easy to
@@ -119,6 +120,10 @@ fn build_vendored(link_mode: LinkMode) {
         }
         Err(_) => fetch_ghostty(&out_dir),
     };
+
+    // Both fetched/cached checkouts and explicit source overrides need the
+    // same native fixes (including scripts/build.ps1's Windows override).
+    apply_patches(&ghostty_dir);
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");
@@ -370,6 +375,62 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
     src_dir
 }
 
+/// Apply local backports once, including when Cargo reuses a cached checkout.
+fn apply_patches(source: &Path) {
+    let directory = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .join("patches");
+    let mut patches: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap_or_else(|e| panic!("read {}: {e}", directory.display()))
+        .map(|entry| entry.expect("patch directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+        .collect();
+    patches.sort();
+    for patch in patches {
+        apply_patch(source, &patch);
+    }
+}
+
+fn apply_patch(source: &Path, patch: &Path) {
+    // Ignore whitespace only in context lines, so a Windows checkout using
+    // CRLF also accepts the LF patch. Arguments remain separate for paths
+    // containing spaces. No Git repository or network access is required.
+    let command = || {
+        let mut command = Command::new("git");
+        command
+            .current_dir(source)
+            .args(["apply", "--ignore-whitespace"]);
+        command
+    };
+    let forward = command()
+        .arg("--check")
+        .arg(patch)
+        .output()
+        .unwrap_or_else(|e| panic!("check {}: {e}", patch.display()));
+    if forward.status.success() {
+        run(
+            {
+                let mut apply = command();
+                apply.arg(patch);
+                apply
+            },
+            "apply Ghostty backport",
+        );
+        return;
+    }
+    let reverse = command()
+        .args(["--reverse", "--check"])
+        .arg(patch)
+        .output()
+        .unwrap_or_else(|e| panic!("check applied {}: {e}", patch.display()));
+    assert!(
+        reverse.status.success(),
+        "Ghostty patch {} neither applies nor is already applied in {}: {}",
+        patch.display(),
+        source.display(),
+        String::from_utf8_lossy(&forward.stderr)
+    );
+}
+
 fn run(mut command: Command, context: &str) {
     let status = command
         .status()
@@ -405,4 +466,47 @@ fn zig_target(target: &str) -> String {
         other => panic!("unsupported Rust target for vendored build: {other}"),
     };
     value.to_owned()
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn patch_application_is_idempotent_for_checkouts_and_source_archives() {
+        for repository in [false, true] {
+            for crlf in [false, true] {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = env::temp_dir()
+                    .join(format!("morsh patch test {}-{nonce}", std::process::id()));
+                let source = root.join("source with spaces");
+                std::fs::create_dir_all(&source).unwrap();
+                if repository {
+                    run(
+                        {
+                            let mut init = Command::new("git");
+                            init.args(["init", "--quiet"]).arg(&source);
+                            init
+                        },
+                        "init test checkout",
+                    );
+                }
+                let file = source.join("sample.txt");
+                std::fs::write(&file, if crlf { "old\r\n" } else { "old\n" }).unwrap();
+                let patch = root.join("backport.patch");
+                std::fs::write(
+                    &patch,
+                    "--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n",
+                )
+                .unwrap();
+                apply_patch(&source, &patch);
+                apply_patch(&source, &patch);
+                assert_eq!(std::fs::read_to_string(file).unwrap().trim(), "new");
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
 }

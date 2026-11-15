@@ -277,8 +277,9 @@ impl Handler {
                     return;
                 }
                 let (data, exit) = pty::batch_output(data, &mut self.pty.rx);
-                if let Err(e) = self.transport.get_current_state_mut().act(&data) {
-                    tracing::warn!("Terminal error: {e}");
+                match self.transport.get_current_state_mut().act(&data) {
+                    Ok(mut replies) => self.write_keys(&mut replies),
+                    Err(e) => tracing::warn!("Terminal error: {e}"),
                 }
                 if let Some(status) = exit {
                     self.handle_pty_event(PtyEvent::Exited(status));
@@ -693,5 +694,76 @@ mod windows_size_tests {
         assert!(client_pty_size(i16::MAX as i32 + 1, 24).is_none());
         assert!(client_pty_size(80, i16::MAX as i32 + 1).is_none());
         assert!(client_pty_size(0, 0).is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod query_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cursor_position_reply_reaches_the_host_pty() {
+        let connection =
+            Connection::new_server("127.0.0.1:0".parse().unwrap(), Session::new([0x42; 16]))
+                .await
+                .unwrap();
+        let transport = ServerTransport::new_server(
+            connection,
+            Complete::new(120, 40).unwrap(),
+            UserStream::new(),
+        );
+        // Read with a bounded termios timeout so a missing reply fails instead
+        // of leaving a child blocked forever. The query probes the screen size.
+        let command = "stty raw -echo min 0 time 20; printf '\\033[999;999H\\033[6n'; dd bs=1 count=9 2>/dev/null | od -An -tx1; printf ' CPR_END'";
+        let pty = pty::spawn_pty(
+            PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            "/bin/sh",
+            &["/bin/sh".into(), "-c".into(), command.into()],
+            &[("LC_ALL".into(), "C.UTF-8".into())],
+        )
+        .unwrap();
+        let mut handler = Handler {
+            transport,
+            pty,
+            last_remote_num: 0,
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = handler.pty.rx.recv().await {
+                handler.handle_pty_event(event);
+                if handler.transport.shutdown_in_progress() {
+                    break;
+                }
+            }
+        })
+        .await;
+        let _ = handler.pty.child.kill();
+        let _ = handler.pty.child.wait();
+        result.expect("host did not finish its cursor query");
+        // Inspect the modeled screen because handle_pty_event may batch further
+        // output from the channel, including the child's hex dump of the reply.
+        let text: String = handler
+            .transport
+            .get_current_state()
+            .screen()
+            .rows
+            .iter()
+            .flatten()
+            .map(|cell| {
+                if cell.text.is_empty() {
+                    " "
+                } else {
+                    &cell.text
+                }
+            })
+            .collect();
+        assert!(
+            text.contains("1b 5b 34 30 3b 31 32 30 52"),
+            "host did not receive ESC[40;120R: {text:?}"
+        );
     }
 }

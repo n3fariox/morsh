@@ -195,6 +195,7 @@ fn main() {
                 .unwrap(),
         );
     });
+    chunked_emulation_benchmarks();
     ultrawide_benchmarks();
 }
 
@@ -235,6 +236,16 @@ fn ultrawide_benchmarks() {
             || {
                 reused_snapshot.clone_from(black_box(&new));
                 black_box(&reused_snapshot);
+            },
+        );
+        let mut reused_state = state.clone();
+        measure_iterations(
+            &format!("split_{cols}x{rows}_complete_clone_from_cells"),
+            cells,
+            3,
+            || {
+                reused_state.clone_from(black_box(&state));
+                black_box(&reused_state);
             },
         );
         let mut terminal = MoshTerminal::new(cols, rows, 0).unwrap();
@@ -292,5 +303,36 @@ fn ultrawide_benchmarks() {
                 black_box(state.diff_from(&before));
             },
         );
+    }
+}
+
+// Compare the adapter with the underlying emulator to catch query-scanner
+// overhead on terminal output that contains no queries.
+fn chunked_emulation_benchmarks() {
+    let latin = "temp 21°C ±0.5 © «quoted» · ½ ".repeat(2000).into_bytes();
+    let sgr = (0..20000)
+        .map(|i| format!("\x1b[38;5;{}m#", i % 256))
+        .collect::<String>()
+        .into_bytes();
+    let ascii = "the quick brown fox jumps over the lazy dog\r\n"
+        .repeat(2000)
+        .into_bytes();
+    for (name, bytes) in [("ascii", ascii), ("sgr", sgr), ("latin1", latin)] {
+        let mut terminal = MoshTerminal::new(120, 40, 0).unwrap();
+        measure(
+            &format!("emulate_chunked_{name}_bytes"),
+            bytes.len(),
+            || {
+                for chunk in bytes.chunks(4096) {
+                    terminal.write(black_box(chunk));
+                }
+            },
+        );
+        let mut native = MoshTerminal::new(120, 40, 0).unwrap();
+        measure(&format!("native_chunked_{name}_bytes"), bytes.len(), || {
+            for chunk in bytes.chunks(4096) {
+                native.inner_mut().vt_write(black_box(chunk));
+            }
+        });
     }
 }

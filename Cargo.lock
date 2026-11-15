@@ -1725,6 +1725,7 @@ name = "morsh-terminal"
 version = "0.0.7"
 dependencies = [
  "libghostty-vt",
+ "memchr",
  "serial_test",
 ]
 

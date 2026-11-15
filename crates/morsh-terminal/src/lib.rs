@@ -1,4 +1,5 @@
 mod terminal;
+mod queries;
 mod snapshot;
 mod display;
 mod keymap;
