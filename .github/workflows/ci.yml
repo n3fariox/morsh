@@ -25,7 +25,9 @@ jobs:
             zig_arch: x86_64-linux
             zig_ext: tar.xz
             allow_fail: false
-          - os: windows-latest
+          # Pinned: windows-latest now ships MSVC 14.52, whose STL rejects the
+          # clang bundled with zig 0.15.2 (STL1000, "expected Clang 22").
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             zig_arch: x86_64-windows
             zig_ext: zip
