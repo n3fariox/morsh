@@ -1144,10 +1144,28 @@ mod tests {
             eprintln!("no IPv6; skipping");
             return;
         };
-        let only_v6 = socket2::SockRef::from(&server.sockets[0])
-            .only_v6()
-            .unwrap();
-        assert!(!only_v6);
+        // Check the behaviour rather than reading IPV6_V6ONLY back: on
+        // Windows getsockopt returns a 1-byte value, which trips a debug
+        // assertion in socket2 0.5's `only_v6()`. A dual-stack `::` socket
+        // must accept a datagram from an IPv4 peer.
+        let port = server.local_addr().unwrap().port();
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        v4.send_to(b"dual-stack", ("127.0.0.1", port)).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.sockets[0].recv_from(&mut buf),
+        )
+        .await
+        .expect("an IPv4 datagram never reached the IPv6 wildcard socket")
+        .unwrap();
+        assert_eq!(&buf[..n], b"dual-stack");
+        // Dual-stack sockets report IPv4 peers as IPv4-mapped IPv6.
+        let from_ip = match from.ip() {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4),
+            v4 => Some(v4),
+        };
+        assert_eq!(from_ip, Some("127.0.0.1".parse().unwrap()));
     }
 
     #[tokio::test]
