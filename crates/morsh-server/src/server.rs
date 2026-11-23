@@ -761,8 +761,11 @@ mod query_tests {
                 }
             })
             .collect();
+        // Compare without whitespace: od's column spacing differs between
+        // implementations and versions (e.g. "1b 5b" vs "1b  5b").
+        let hex: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            text.contains("1b 5b 34 30 3b 31 32 30 52"),
+            hex.contains("1b5b34303b31323052"),
             "host did not receive ESC[40;120R: {text:?}"
         );
     }
