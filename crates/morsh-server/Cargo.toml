@@ -21,7 +21,6 @@ morsh-statesync = { path = "../morsh-statesync" }
 prost = "0.14"
 tracing = "0.1"
 morsh-log = { path = "../morsh-log" }
-clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -670,8 +670,8 @@ mod tests {
     fn identical_frames_are_not_mistaken_for_a_scroll() {
         let cols = 10u16;
         let mut old = ScreenSnapshot::new(cols, 3);
-        for y in 0..3 {
-            old.rows[y] = text_row(cols, "same");
+        for row in &mut old.rows {
+            *row = text_row(cols, "same");
         }
         let new = old.clone();
         let vt = DisplayDiff::diff(&old, &new);

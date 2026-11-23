@@ -1101,9 +1101,9 @@ mod tests {
             shifted, "hello",
             "prior contents were not shifted rightward"
         );
-        for i in 3..8 {
+        for (i, cell) in row.cells.iter().enumerate().take(8).skip(3) {
             assert!(
-                !row.cells[i].unknown,
+                !cell.unknown,
                 "cell {i} was marked unknown and would render as a blank"
             );
         }
