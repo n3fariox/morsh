@@ -139,7 +139,8 @@ to match `mosh`.
   `auto` (the default) reads the server's SSH banner before logging in: any
   non-Windows server gets a POSIX shell, as `mosh` assumes. Only for Windows
   servers, or hosts behind a jump host, does it log in once more to run
-  `uname -s` and tell `cmd` from POSIX.
+  `echo $PSVersionTable.PSEdition` and tell PowerShell, `cmd` and POSIX
+  apart.
 - `-D`/`--no-daemonize` and `--server-log-file` are for debugging the server.
 
 **`morsh-server`**

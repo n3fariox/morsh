@@ -48,7 +48,7 @@ fn prediction_display_is_not_inherited_by_ssh_subprocesses() {
     let path = std::env::temp_dir().join(format!("morsh-ssh-env-{}-{stamp}", std::process::id()));
     // Record config-query, shell-probe and server-launch environments. A bad
     // CONNECT ends the wrapper before a real client or network session starts.
-    let script = r#"printf "%s\n" "${MOSH_PREDICTION_DISPLAY-unset}" >> "$MORSH_TEST_SSH_ENV_LOG"; if [ "$0" = "-G" ]; then printf 'proxycommand true\n'; elif [ "$1" = "uname -s" ]; then printf 'Linux\n'; else printf 'MOSH CONNECT broken\n'; fi"#;
+    let script = r#"printf "%s\n" "${MOSH_PREDICTION_DISPLAY-unset}" >> "$MORSH_TEST_SSH_ENV_LOG"; if [ "$0" = "-G" ]; then printf 'proxycommand true\n'; elif [ "$1" = 'echo $PSVersionTable.PSEdition' ]; then printf '.PSEdition\n'; else printf 'MOSH CONNECT broken\n'; fi"#;
     let ssh = format!("/bin/sh -c {}", shell_words::quote(script));
     let output = Command::new(env!("CARGO_BIN_EXE_morsh"))
         .args(["--ssh", &ssh, "host"])

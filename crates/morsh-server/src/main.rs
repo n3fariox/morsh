@@ -128,6 +128,15 @@ fn main() {
         let _ = writeln!(stdout, "MOSH CONNECT {} {}", port, key.printable_key());
         let _ = writeln!(stdout, "MOSH CONNECTION ID: 1");
         let _ = stdout.flush();
+        drop(stdout);
+        // Like stock mosh-server's banner; the wrapper shows stderr when the
+        // connect fails, so this says which build the remote actually ran.
+        // Written fallibly for the same closed-pipe reason as above.
+        let _ = writeln!(
+            std::io::stderr(),
+            "morsh-server (morsh) {}",
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     // The appender guard must live for the whole of `main`; binding it inside
@@ -163,7 +172,8 @@ fn main() {
     }
 
     tracing::info!(
-        "Server starting on port {port} (PID: {})",
+        "morsh-server {} starting on port {port} (PID: {})",
+        env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
 
