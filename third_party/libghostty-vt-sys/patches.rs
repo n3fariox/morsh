@@ -136,6 +136,17 @@ mod patch_tests {
             }
         }
     }
+
+    /// The sample file's text with CRLF folded to LF. With `core.autocrlf`
+    /// on (the default on Windows CI runners), `git checkout` restores files
+    /// as CRLF and `git apply --ignore-whitespace` keeps that, so compare
+    /// content rather than line endings.
+    fn sample_text(source: &Path) -> String {
+        std::fs::read_to_string(source.join("sample.txt"))
+            .unwrap()
+            .replace("\r\n", "\n")
+    }
+
     #[test]
     fn changed_patch_set_refreshes_cached_checkout() {
         let nonce = std::time::SystemTime::now()
@@ -187,27 +198,18 @@ mod patch_tests {
             std::fs::read(source.join(".ghostty-patches")).unwrap(),
             initial_stamp
         );
-        assert_eq!(
-            std::fs::read_to_string(source.join("sample.txt")).unwrap(),
-            "first\n"
-        );
+        assert_eq!(sample_text(&source), "first\n");
         write_patch("second");
         apply_patches(&source, &directory, true);
         assert_ne!(
             std::fs::read(source.join(".ghostty-patches")).unwrap(),
             initial_stamp
         );
-        assert_eq!(
-            std::fs::read_to_string(source.join("sample.txt")).unwrap(),
-            "second\n"
-        );
+        assert_eq!(sample_text(&source), "second\n");
         // Removing a patch must also discard its changes.
         std::fs::remove_file(patch).unwrap();
         apply_patches(&source, &directory, true);
-        assert_eq!(
-            std::fs::read_to_string(source.join("sample.txt")).unwrap(),
-            "old\n"
-        );
+        assert_eq!(sample_text(&source), "old\n");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
