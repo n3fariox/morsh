@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-client"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "crossterm",
  "libc",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-crypto"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "aes 0.8.4",
  "base64",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-log"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "dirs",
  "tracing",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-network"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "flate2",
  "libc",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-prediction"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "morsh-terminal",
  "serial_test",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-proto"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "prost",
  "prost-build",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-server"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "libc",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-ssh"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "rpassword",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-statesync"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "hex",
  "morsh-crypto",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-terminal"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "libghostty-vt",
  "memchr",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "morsh-wrapper"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "clap",
  "morsh-log",
