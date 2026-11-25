@@ -22,7 +22,10 @@ fn default_log_dir() -> PathBuf {
 /// - Returns a guard that **must** be held for the program's lifetime; dropping it
 ///   stops the background writer and silently drops subsequent log records.
 pub fn init(binary_name: &str) -> WorkerGuard {
-    init_at(binary_name, &default_log_dir().join(format!("{binary_name}.log")))
+    init_at(
+        binary_name,
+        &default_log_dir().join(format!("{binary_name}.log")),
+    )
 }
 
 /// Initialize file-based logging writing to the given path (no rotation).

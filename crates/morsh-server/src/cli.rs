@@ -19,7 +19,9 @@ use std::process;
 /// Parsed command line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliOptions {
-    /// Low end of the requested bind port range (0 = any).
+    /// Whether a port was requested; explicit zero means an ephemeral port.
+    pub port_requested: bool,
+    /// Low end of the requested bind port range.
     pub port_low: u16,
     /// High end of the requested bind port range (0 = any).
     pub port_high: u16,
@@ -74,7 +76,7 @@ fn parse_portrange(s: &str) -> Result<(u16, u16), String> {
     };
     let low: u32 = low_str.parse().map_err(|_| bad())?;
     let high: u32 = high_str.parse().map_err(|_| bad())?;
-    if !(1..=65535).contains(&low) || !(1..=65535).contains(&high) || low > high {
+    if low > 65535 || high > 65535 || low > high || (low == 0 && s.contains(':')) {
         return Err(bad());
     }
     Ok((low as u16, high as u16))
@@ -129,6 +131,7 @@ pub fn parse_args(args: &[String]) -> ParseOutcome {
                 opts.bind_addr = Some(head[0].clone());
                 match parse_portrange(&head[1]) {
                     Ok((lo, hi)) => {
+                        opts.port_requested = true;
                         opts.port_low = lo;
                         opts.port_high = hi;
                     }
@@ -224,6 +227,7 @@ pub fn parse_args(args: &[String]) -> ParseOutcome {
                 }
                 'p' => match parse_portrange(value.as_deref().unwrap_or("")) {
                     Ok((lo, hi)) => {
+                        opts.port_requested = true;
                         opts.port_low = lo;
                         opts.port_high = hi;
                     }
@@ -325,8 +329,19 @@ mod tests {
     #[test]
     fn mosh_pl_invocation_with_bind_ip_port_and_command() {
         let opts = parse(&[
-            "new", "-c", "256", "-i", "10.0.0.5", "-p", "60000:60010", "-l", "LANG=C.UTF-8", "--",
-            "htop", "-d", "5",
+            "new",
+            "-c",
+            "256",
+            "-i",
+            "10.0.0.5",
+            "-p",
+            "60000:60010",
+            "-l",
+            "LANG=C.UTF-8",
+            "--",
+            "htop",
+            "-d",
+            "5",
         ]);
         assert_eq!(opts.bind_addr.as_deref(), Some("10.0.0.5"));
         assert!(!opts.use_ssh_connection);
@@ -426,10 +441,7 @@ mod tests {
 
     #[test]
     fn help_and_version_are_detected() {
-        assert_eq!(
-            parse_args(&["--help".to_string()]),
-            ParseOutcome::Help
-        );
+        assert_eq!(parse_args(&["--help".to_string()]), ParseOutcome::Help);
         assert_eq!(
             parse_args(&["new".to_string(), "-h".to_string()]),
             ParseOutcome::Help
@@ -446,8 +458,15 @@ mod tests {
     }
 
     #[test]
+    fn port_zero_requests_an_ephemeral_port() {
+        let opts = parse(&["new", "-p", "0"]);
+        assert_eq!((opts.port_low, opts.port_high), (0, 0));
+        assert!(opts.port_requested);
+    }
+
+    #[test]
     fn bad_values_are_rejected() {
-        assert!(parse_err(&["new", "-p", "0"]).contains("port range"));
+        assert!(parse_err(&["new", "-p", "0:1"]).contains("port range"));
         assert!(parse_err(&["new", "-p", "70000"]).contains("port range"));
         assert!(parse_err(&["new", "-p", "600:500"]).contains("port range"));
         assert!(parse_err(&["new", "-c", "many"]).contains("colors"));

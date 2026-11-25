@@ -1,3 +1,5 @@
+mod patches;
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,7 +80,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HOST");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
-    println!("cargo:rerun-if-changed=crates/libghostty-vt-sys/build.rs");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=patches.rs");
+    println!("cargo:rerun-if-changed=patches");
 
     // An explicit source override should stay authoritative even when the
     // pkg-config feature is enabled, so local Ghostty checkouts remain easy to
@@ -119,6 +123,16 @@ fn build_vendored(link_mode: LinkMode) {
         }
         Err(_) => fetch_ghostty(&out_dir),
     };
+
+    // Both fetched/cached checkouts and explicit source overrides need the
+    // same native fixes (including scripts/build.ps1's Windows override).
+    let patch_directory = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .join("patches");
+    patches::apply_patches(
+        &ghostty_dir,
+        &patch_directory,
+        env::var_os("GHOSTTY_SOURCE_DIR").is_none(),
+    );
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");

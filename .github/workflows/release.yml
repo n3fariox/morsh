@@ -39,7 +39,8 @@ jobs:
             zig_arch: x86_64-linux
             zig_ext: tar.xz
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            # Pinned: see ci.yml (MSVC 14.52 STL rejects zig 0.15.2's clang).
+            os: windows-2022
             zig_arch: x86_64-windows
             zig_ext: zip
           - target: aarch64-apple-darwin

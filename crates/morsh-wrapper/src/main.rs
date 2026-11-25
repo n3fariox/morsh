@@ -1,93 +1,22 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::io::{BufRead, BufReader};
-use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 
 mod banner;
+mod cli;
+mod connect;
+use connect::ConnectInfo;
+#[cfg(feature = "russh")]
+use connect::ConnectRecord;
+mod ssh_command;
+use cli::Args;
+#[cfg(feature = "russh")]
+use cli::SshMode;
 mod fake_proxy;
+mod family;
+use family::Family;
 mod ssh_config;
 use ssh_config::SshConfig;
-
-/// Which SSH backend to use for connecting to the remote host.
-#[cfg_attr(not(feature = "russh"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SshMode {
-    /// Use the system ssh command, or russh when no ssh is installed.
-    Auto,
-    /// Use the system ssh command.
-    System,
-    /// Use russh (pure Rust). Error if no private key is available.
-    Russh,
-}
-
-impl std::str::FromStr for SshMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "auto" => Ok(SshMode::Auto),
-            "russh" => Ok(SshMode::Russh),
-            "system" => Ok(SshMode::System),
-            other => Err(format!(
-                "unknown SSH mode '{other}'. Use 'auto', 'russh', or 'system'"
-            )),
-        }
-    }
-}
-
-/// Morsh: mobile (rust) shell - connects to a remote host via SSH and starts a morsh-server.
-#[derive(Parser, Debug)]
-#[command(name = "morsh", about = "Remote, stateless, mobile (rust) shell")]
-struct Args {
-    /// SSH command to use (default: "ssh")
-    #[arg(long = "ssh", default_value = "ssh")]
-    ssh_command: String,
-
-    /// UDP port range for morsh-server (e.g., "60000:61000")
-    #[arg(long = "port")]
-    port_range: Option<String>,
-
-    /// Predict the future (enable prediction engine)
-    #[arg(long = "predict", default_value = "adaptive", value_parser = ["adaptive", "always", "never"])]
-    predict: String,
-
-    /// Control the IP address that morsh-server binds to:
-    ///   ssh  - bind to the IP from SSH_CONNECTION (default)
-    ///   any  - bind to 0.0.0.0
-    ///   IP   - bind to the specified IP address
-    #[arg(long = "bind-server", default_value = "ssh")]
-    bind_server: String,
-
-    /// Path on the remote host for morsh-server debug logs
-    #[arg(long = "server-log-file")]
-    server_log_file: Option<String>,
-
-    /// Run morsh-server in foreground (don't daemonize)
-    #[arg(long = "no-daemonize", short = 'D')]
-    no_daemonize: bool,
-
-    /// Path to morsh-server on the remote host (default: morsh-server, looked up in PATH)
-    #[arg(long = "server", short = 'S', default_value = "morsh-server")]
-    server_path: String,
-
-    /// SSH backend: "auto" (system ssh, or russh when no ssh is installed),
-    /// "system" (system ssh command), or "russh" (pure Rust).
-    /// Only available when compiled with the "russh" feature.
-    #[cfg(feature = "russh")]
-    #[arg(long = "ssh-mode", default_value = "auto")]
-    ssh_mode: SshMode,
-
-    /// Remote user@host
-    host: String,
-
-    /// Command to run on remote (default: shell)
-    command: Vec<String>,
-
-    /// Shell on the remote host that interprets the launch command.
-    /// auto (detect), posix (sh/bash), cmd (Windows cmd.exe), or powershell (pwsh).
-    /// Default: auto.
-    #[arg(long = "remote-shell", default_value = "auto")]
-    remote_shell: String,
-}
 
 /// Shell used on the remote host to interpret the launch command.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,11 +70,16 @@ fn classify_shell_probe(success: bool, stdout: &str) -> RemoteShell {
 /// anything but a Windows SSH server gets a POSIX shell, as mosh always
 /// assumes. Only Windows servers, and hosts we can't reach directly, need a
 /// second ssh login to ask.
-fn resolve_remote_shell_system(ssh_command: &str, host: &str, cfg: Option<&SshConfig>) -> RemoteShell {
+fn resolve_remote_shell_system(
+    ssh_command: &str,
+    host: &str,
+    cfg: Option<&SshConfig>,
+    family: Family,
+) -> RemoteShell {
     if !cfg.is_some_and(|c| c.uses_proxy) {
         let hostname = target_hostname(host, cfg);
         let port = target_port(host, cfg);
-        match banner::fetch(&hostname, port) {
+        match banner::fetch(&hostname, port, family) {
             Some(b) if !banner::is_windows(&b) => {
                 tracing::info!("SSH banner {b:?}: assuming a POSIX shell");
                 return RemoteShell::Posix;
@@ -155,12 +89,20 @@ fn resolve_remote_shell_system(ssh_command: &str, host: &str, cfg: Option<&SshCo
         }
     }
 
-    let mut args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
-    args.push(host.to_string());
+    let Ok(mut args) = ssh_command::parse(ssh_command) else {
+        return RemoteShell::Posix;
+    };
+    append_ssh_target(&mut args, host, family);
     args.push(SHELL_PROBE.to_string());
 
-    let shell = match Command::new(&args[0]).args(&args[1..]).output() {
-        Ok(out) => classify_shell_probe(out.status.success(), &String::from_utf8_lossy(&out.stdout)),
+    let shell = match Command::new(&args[0])
+        .env_remove("MOSH_PREDICTION_DISPLAY")
+        .args(&args[1..])
+        .output()
+    {
+        Ok(out) => {
+            classify_shell_probe(out.status.success(), &String::from_utf8_lossy(&out.stdout))
+        }
         Err(_) => RemoteShell::Cmd,
     };
     tracing::info!("remote shell probe: {shell:?}");
@@ -178,15 +120,6 @@ enum BindServer {
     Address(String),
 }
 
-/// Parsed MOSH CONNECT line from server.
-struct ConnectInfo {
-    port: u16,
-    key: String,
-    /// The address the SSH connection actually reached (mosh's `MOSH IP`),
-    /// when the backend could observe it.
-    ip: Option<String>,
-}
-
 fn main() {
     // ssh runs us as its ProxyCommand; see fake_proxy.rs.
     let argv: Vec<String> = std::env::args().collect();
@@ -197,6 +130,14 @@ fn main() {
     let _guard = morsh_log::init("morsh");
 
     let args = Args::parse();
+    let inherited_prediction =
+        std::env::var_os("MOSH_PREDICTION_DISPLAY").map(|mode| mode.to_string_lossy().into_owned());
+    let prediction = args
+        .prediction_mode(inherited_prediction.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("morsh: {error}\n\n{}", Args::command().render_help());
+            std::process::exit(1);
+        });
 
     // Which address the *server* should bind to. "ssh" means "let the server
     // read it out of $SSH_CONNECTION" — that is what `-s` is for, and it is
@@ -221,13 +162,26 @@ fn main() {
     });
 
     #[cfg(not(feature = "russh"))]
-    let info = try_launch_server(&args.ssh_command, &args.host, ssh_cfg.as_ref(), &{
-        let locale_vars = collect_locale_vars();
-        let rust_log = std::env::var("RUST_LOG").ok();
-        let shell = resolve_remote_shell_value(&args.remote_shell)
-            .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host, ssh_cfg.as_ref()));
-        build_remote_cmd(&args, &bind_arg, shell, rust_log, &locale_vars)
-    }).unwrap_or_else(|| {
+    let info = try_launch_server(
+        &args.ssh_command,
+        &args.host,
+        ssh_cfg.as_ref(),
+        args.family(),
+        &{
+            let locale_vars = collect_locale_vars();
+            let rust_log = std::env::var("RUST_LOG").ok();
+            let shell = resolve_remote_shell_value(&args.remote_shell).unwrap_or_else(|| {
+                resolve_remote_shell_system(
+                    &args.ssh_command,
+                    &args.host,
+                    ssh_cfg.as_ref(),
+                    args.family(),
+                )
+            });
+            build_remote_cmd(&args, &bind_arg, shell, rust_log, &locale_vars)
+        },
+    )
+    .unwrap_or_else(|| {
         eprintln!("Failed to get MOSH CONNECT from remote server");
         eprintln!("Make sure morsh-server or mosh-server is installed on the remote host");
         std::process::exit(1);
@@ -239,7 +193,10 @@ fn main() {
     let server_ip = match (info.ip.clone(), &bind_arg) {
         (Some(ip), _) => ip,
         (None, BindServer::Address(ip)) => ip.clone(),
-        (None, _) => resolve_host(&target_hostname(&args.host, ssh_cfg.as_ref())),
+        (None, _) => resolve_host(
+            &target_hostname(&args.host, ssh_cfg.as_ref()),
+            args.family(),
+        ),
     };
     // Bracket IPv6 literals so the port can be appended.
     let server_addr = match server_ip.parse::<std::net::IpAddr>() {
@@ -254,10 +211,11 @@ fn main() {
         .and_then(|p| p.parent().map(|d| d.join("morsh-client")))
         .unwrap_or_else(|| "morsh-client".into());
 
-    let exit_status = Command::new(&client_path)
+    let mut client = Command::new(&client_path);
+    args.configure_client(&mut client, &prediction);
+    let exit_status = client
         .arg(&server_addr)
         .env("MORSH_KEY", &info.key)
-        .env("MOSH_PREDICTION_DISPLAY", &args.predict)
         .status()
         .expect("Failed to start morsh-client. Is it in PATH?");
 
@@ -269,9 +227,20 @@ fn main() {
 /// statements for stock mosh-server on Posix remotes.
 fn collect_locale_vars() -> Vec<(String, String)> {
     let names = [
-        "LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
-        "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
-        "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL",
+        "LANG",
+        "LC_CTYPE",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "LC_COLLATE",
+        "LC_MONETARY",
+        "LC_MESSAGES",
+        "LC_PAPER",
+        "LC_NAME",
+        "LC_ADDRESS",
+        "LC_TELEPHONE",
+        "LC_MEASUREMENT",
+        "LC_IDENTIFICATION",
+        "LC_ALL",
     ];
     let mut vars = Vec::new();
     for name in &names {
@@ -289,11 +258,35 @@ fn build_remote_cmd(
     locale_vars: &[(String, String)],
 ) -> String {
     if args.server_path == "morsh-server" {
-        let first = build_server_args("morsh-server", bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
-        let second = build_server_args("mosh-server", bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let first = build_server_args(
+            "morsh-server",
+            bind,
+            &args.port_range,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+            locale_vars,
+        );
+        let second = build_server_args(
+            "mosh-server",
+            bind,
+            &args.port_range,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+            locale_vars,
+        );
         render_remote_command(shell, first, Some(second), rust_log, locale_vars)
     } else {
-        let only = build_server_args(&args.server_path, bind, &args.port_range, &args.server_log_file, args.no_daemonize, &args.command, locale_vars);
+        let only = build_server_args(
+            &args.server_path,
+            bind,
+            &args.port_range,
+            &args.server_log_file,
+            args.no_daemonize,
+            &args.command,
+            locale_vars,
+        );
         render_remote_command(shell, only, None, rust_log, locale_vars)
     }
 }
@@ -404,10 +397,18 @@ fn render_remote_command(
             format!("{locale_export}; {base}")
         }
         RemoteShell::Cmd => {
-            let first = first.iter().map(|s| cmd_quote(s)).collect::<Vec<_>>().join(" ");
+            let first = first
+                .iter()
+                .map(|s| cmd_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ");
             let run = match second {
                 Some(second) => {
-                    let second = second.iter().map(|s| cmd_quote(s)).collect::<Vec<_>>().join(" ");
+                    let second = second
+                        .iter()
+                        .map(|s| cmd_quote(s))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     format!("({first} 2>nul) || {second}")
                 }
                 None => first,
@@ -418,10 +419,18 @@ fn render_remote_command(
             }
         }
         RemoteShell::PowerShell => {
-            let first = first.iter().map(|s| pwsh_quote(s)).collect::<Vec<_>>().join(" ");
+            let first = first
+                .iter()
+                .map(|s| pwsh_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ");
             let run = match second {
                 Some(second) => {
-                    let second = second.iter().map(|s| pwsh_quote(s)).collect::<Vec<_>>().join(" ");
+                    let second = second
+                        .iter()
+                        .map(|s| pwsh_quote(s))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     format!("& {first} 2>$null; if ($LASTEXITCODE -ne 0) {{ & {second} }}")
                 }
                 None => format!("& {first}"),
@@ -478,9 +487,10 @@ fn try_launch_server(
     ssh_command: &str,
     host: &str,
     cfg: Option<&SshConfig>,
+    family: Family,
     remote_cmd: &str,
 ) -> Option<ConnectInfo> {
-    let mut ssh_args: Vec<String> = ssh_command.split_whitespace().map(String::from).collect();
+    let mut ssh_args = ssh_command::parse(ssh_command).ok()?;
 
     // mosh's default `--experimental-remote-ip=proxy`: make ssh connect
     // through `morsh --fake-proxy`, which reports the address it reached.
@@ -488,13 +498,18 @@ fn try_launch_server(
     // would replace it and the host would become unreachable.
     let proxy = match cfg {
         Some(c) if c.uses_proxy => None,
-        _ => fake_proxy::proxy_command(),
+        _ => fake_proxy::proxy_command(family),
     };
     if let Some(proxy) = &proxy {
         // `-S none`: a shared ControlMaster connection would skip the proxy.
-        ssh_args.extend(["-S".into(), "none".into(), "-o".into(), format!("ProxyCommand={proxy}")]);
+        ssh_args.extend([
+            "-S".into(),
+            "none".into(),
+            "-o".into(),
+            format!("ProxyCommand={proxy}"),
+        ]);
     }
-    ssh_args.push(host.to_string());
+    append_ssh_target(&mut ssh_args, host, family);
     ssh_args.push(remote_cmd.to_string());
 
     tracing::info!("SSH: {}", ssh_args[..ssh_args.len() - 1].join(" "));
@@ -502,6 +517,7 @@ fn try_launch_server(
 
     let mut command = Command::new(&ssh_args[0]);
     command
+        .env_remove("MOSH_PREDICTION_DISPLAY")
         .args(&ssh_args[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -512,7 +528,12 @@ fn try_launch_server(
     if proxy.is_some() {
         command.env("SHELL", "/bin/sh");
     }
-    let mut ssh_child = command.spawn().ok()?;
+    let mut ssh_child = command
+        .spawn()
+        .inspect_err(|e| {
+            eprintln!("morsh: failed to start SSH command '{}': {e}", ssh_args[0]);
+        })
+        .ok()?;
 
     let stdout = ssh_child.stdout.take()?;
     let stderr = ssh_child.stderr.take()?;
@@ -523,7 +544,6 @@ fn try_launch_server(
     // as it is seen, so we never wait on the proxy process to exit.
     let (ip_tx, ip_rx) = std::sync::mpsc::channel::<String>();
     let stderr_reader = std::thread::spawn(move || {
-        let mut rest = String::new();
         let mut seen_ip = false;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             match fake_proxy::parse_ip_line(&line) {
@@ -532,34 +552,25 @@ fn try_launch_server(
                     let _ = ip_tx.send(addr.to_string());
                 }
                 _ => {
-                    rest.push_str(&line);
-                    rest.push('\n');
+                    eprintln!("{line}");
                 }
             }
         }
-        rest
     });
 
-    let mut connect_info = None;
-
-    for line in reader.lines() {
-        let line = line.ok()?;
-        tracing::debug!("SSH stdout: {line}");
-
-        if line.starts_with("MOSH CONNECT") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                if let Ok(port) = parts[2].parse::<u16>() {
-                    connect_info = Some(ConnectInfo {
-                        port,
-                        key: parts[3].to_string(),
-                        ip: None,
-                    });
-                    break;
-                }
-            }
+    let mut connect_info = match ConnectInfo::read_output(reader) {
+        Ok(info) => info,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let _ = ssh_child.wait();
+            eprintln!("morsh: {e}");
+            std::process::exit(1);
         }
-    }
+        Err(e) => {
+            eprintln!("morsh: could not read SSH stdout: {e}");
+            let _ = ssh_child.kill();
+            None
+        }
+    };
 
     let _ = ssh_child.wait();
 
@@ -575,11 +586,7 @@ fn try_launch_server(
         // If we never found the MOSH CONNECT line, the SSH command likely
         // failed. Surface its stderr so the user can see what went wrong.
         None => {
-            if let Ok(err) = stderr_reader.join() {
-                if !err.trim().is_empty() {
-                    eprint!("{err}");
-                }
-            }
+            let _ = stderr_reader.join();
         }
     }
 
@@ -600,42 +607,62 @@ fn query_ssh_config(ssh_command: &str, host: &str) -> Option<SshConfig> {
     ssh_config::query(ssh_command, host)
 }
 
-/// The real host name behind the argument: ssh's `HostName` for an alias,
-/// otherwise the argument minus any `user@` and `:port`.
-fn target_hostname(host: &str, cfg: Option<&SshConfig>) -> String {
-    if let Some(hostname) = cfg.and_then(|c| c.hostname.as_deref()) {
-        return hostname.to_string();
+/// Split a literal IPv6 address, bracketed IPv6[:port], or host[:port].
+fn hostname_and_port(host: &str) -> (&str, Option<u16>) {
+    let host = host_part(host);
+    if let Some((hostname, suffix)) = host.strip_prefix('[').and_then(|s| s.split_once(']')) {
+        return (
+            hostname,
+            suffix.strip_prefix(':').and_then(|s| s.parse().ok()),
+        );
     }
-    let hostname = host_part(host);
-    hostname.split(':').next().unwrap_or(hostname).to_string()
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return (host, None);
+    }
+    match host.rsplit_once(':') {
+        Some((hostname, port)) if port.parse::<u16>().is_ok() => (hostname, port.parse().ok()),
+        _ => (host, None),
+    }
 }
 
-/// The SSH port: an explicit `:port` in the argument, then ssh config, then 22.
+fn target_hostname(host: &str, cfg: Option<&SshConfig>) -> String {
+    cfg.and_then(|c| c.hostname.clone())
+        .unwrap_or_else(|| hostname_and_port(host).0.to_string())
+}
+
 fn target_port(host: &str, cfg: Option<&SshConfig>) -> u16 {
-    host_part(host)
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
+    hostname_and_port(host)
+        .1
         .or_else(|| cfg.and_then(|c| c.port))
         .unwrap_or(22)
 }
 
-fn resolve_host(hostname: &str) -> String {
-    tracing::info!("Resolving hostname: {hostname}");
-
-    let addrs: Vec<_> = (hostname, 0u16)
-        .to_socket_addrs()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to resolve hostname '{hostname}': {e}");
-            std::process::exit(1);
-        })
-        .collect();
-
-    if let Some(addr) = addrs.iter().find(|a| a.ip().is_ipv4()).or(addrs.first()) {
-        return addr.ip().to_string();
+/// Let OpenSSH expand aliases, while preserving explicit ports and family flags.
+fn append_ssh_target(args: &mut Vec<String>, host: &str, family: Family) {
+    match family {
+        Family::Inet => args.push("-4".into()),
+        Family::Inet6 => args.push("-6".into()),
+        _ => {}
     }
+    let (hostname, port) = hostname_and_port(host);
+    if let Some(port) = port {
+        args.extend(["-p".into(), port.to_string()]);
+    }
+    let user = host.rsplit_once('@').map_or("", |(user, _)| user);
+    args.push(if user.is_empty() {
+        hostname.to_string()
+    } else {
+        format!("{user}@{hostname}")
+    });
+}
 
-    eprintln!("No addresses found for '{hostname}'");
-    std::process::exit(1);
+fn resolve_host(hostname: &str, family: Family) -> String {
+    family.resolve(hostname, 0).unwrap_or_else(|e| {
+        eprintln!("morsh: {e}");
+        std::process::exit(1);
+    })[0]
+        .ip()
+        .to_string()
 }
 
 // ── russh (pure-Rust) backend ──────────────────────────────────────────────────
@@ -643,10 +670,11 @@ fn resolve_host(hostname: &str) -> String {
 /// Can the ssh command be run at all?
 #[cfg(feature = "russh")]
 fn ssh_installed(ssh_command: &str) -> bool {
-    let Some(program) = ssh_command.split_whitespace().next() else {
+    let Ok(args) = ssh_command::parse(ssh_command) else {
         return false;
     };
-    Command::new(program)
+    Command::new(&args[0])
+        .env_remove("MOSH_PREDICTION_DISPLAY")
         .arg("-V")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -664,7 +692,10 @@ fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Op
     let mode = match args.ssh_mode {
         SshMode::Auto if ssh_installed(&args.ssh_command) => SshMode::System,
         SshMode::Auto => {
-            tracing::info!("{} not found, using the built-in ssh client", args.ssh_command);
+            tracing::info!(
+                "{} not found, using the built-in ssh client",
+                args.ssh_command
+            );
             SshMode::Russh
         }
         mode => mode,
@@ -683,10 +714,17 @@ fn try_launch_ssh(args: &Args, bind: &BindServer, cfg: Option<&SshConfig>) -> Op
     tracing::info!("using system ssh");
     let locale_vars = collect_locale_vars();
     let rust_log = std::env::var("RUST_LOG").ok();
-    let shell = resolve_remote_shell_value(&args.remote_shell)
-        .unwrap_or_else(|| resolve_remote_shell_system(&args.ssh_command, &args.host, cfg));
+    let shell = resolve_remote_shell_value(&args.remote_shell).unwrap_or_else(|| {
+        resolve_remote_shell_system(&args.ssh_command, &args.host, cfg, args.family())
+    });
     let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
-    try_launch_server(&args.ssh_command, &args.host, cfg, &remote_cmd)
+    try_launch_server(
+        &args.ssh_command,
+        &args.host,
+        cfg,
+        args.family(),
+        &remote_cmd,
+    )
 }
 
 #[cfg(feature = "russh")]
@@ -704,7 +742,12 @@ fn try_launch_russh(
     tracing::info!("russh: connecting to {addr} as {user}");
 
     let host_keys = host_key_policy(&hostname, port, cfg);
-    let mut session = SshSession::connect(addr, user, key_paths, host_keys)
+    let addresses = args
+        .family()
+        .resolve(&hostname, port)
+        .inspect_err(|e| eprintln!("morsh: {e}"))
+        .ok()?;
+    let mut session = SshSession::connect_addresses(addresses, user, key_paths, host_keys)
         .inspect_err(|e| eprintln!("morsh: {e:#}"))
         .ok()?;
 
@@ -723,39 +766,37 @@ fn try_launch_russh(
     let locale_vars = collect_locale_vars();
     let remote_cmd = build_remote_cmd(args, bind, shell, rust_log, &locale_vars);
 
-    let connect_info = std::sync::Arc::new(std::sync::Mutex::new(None::<ConnectInfo>));
+    let connect_info = std::sync::Arc::new(std::sync::Mutex::new(ConnectRecord::default()));
     let connect_info_clone = connect_info.clone();
 
-    let exit_code = session
-        .exec_with_handler(
-            &remote_cmd,
-            move |line: String| {
-                tracing::debug!("russh stdout: {line}");
-                if line.starts_with("MOSH CONNECT") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        if let Ok(port) = parts[2].parse::<u16>() {
-                            let mut guard = connect_info_clone.lock().unwrap();
-                            *guard = Some(ConnectInfo {
-                                port,
-                                key: parts[3].to_string(),
-                                ip: None,
-                            });
-                        }
-                    }
-                }
-            },
-        )
-        .ok()?;
+    let exit_status = session.exec_with_handler(&remote_cmd, move |line: String| {
+        tracing::debug!("russh stdout: {line}");
+        connect_info_clone.lock().unwrap().observe(&line);
+    });
 
-    tracing::info!("russh: remote command exited with code {exit_code}");
-    let result = connect_info.lock().unwrap().take();
+    let record = std::mem::take(&mut *connect_info.lock().unwrap());
+    let result = finish_russh_output(record, exit_status).unwrap_or_else(|error| {
+        eprintln!("morsh: {error}");
+        std::process::exit(1);
+    });
     // We made the TCP connection ourselves, so we know where it went: the
     // russh equivalent of mosh's fake proxy.
     result.map(|info| ConnectInfo {
         ip: Some(session.peer_addr().ip().to_string()),
         ..info
     })
+}
+
+#[cfg(feature = "russh")]
+fn finish_russh_output(
+    record: ConnectRecord,
+    status: Result<u32, impl std::fmt::Display>,
+) -> Result<Option<ConnectInfo>, String> {
+    match status {
+        Ok(code) => tracing::info!("russh: remote command exited with code {code}"),
+        Err(error) => tracing::warn!("russh: remote command closed: {error}"),
+    }
+    record.finish()
 }
 
 /// User, host name and port for a direct russh connection.
@@ -784,7 +825,10 @@ fn host_key_policy(hostname: &str, port: u16, cfg: Option<&SshConfig>) -> morsh_
     use std::path::PathBuf;
 
     let user_file = PathBuf::from(tilde_expand("~/.ssh/known_hosts"));
-    let mut known_hosts = vec![user_file.clone(), PathBuf::from(tilde_expand("~/.ssh/known_hosts2"))];
+    let mut known_hosts = vec![
+        user_file.clone(),
+        PathBuf::from(tilde_expand("~/.ssh/known_hosts2")),
+    ];
     if cfg!(windows) {
         if let Ok(data) = std::env::var("ProgramData") {
             known_hosts.push(PathBuf::from(&data).join("ssh").join("ssh_known_hosts"));
@@ -833,7 +877,11 @@ fn find_keys(cfg: Option<&SshConfig>) -> Vec<std::path::PathBuf> {
     let configured: Vec<&str> = cfg
         .map(|c| c.identity_files.iter().map(String::as_str).collect())
         .unwrap_or_default();
-    let candidates = if configured.is_empty() { DEFAULTS.to_vec() } else { configured };
+    let candidates = if configured.is_empty() {
+        DEFAULTS.to_vec()
+    } else {
+        configured
+    };
     candidates
         .into_iter()
         .map(|p| std::path::PathBuf::from(tilde_expand(p)))
@@ -849,18 +897,40 @@ mod tests {
     /// whose `&&`/`||` Windows PowerShell 5.1 can't parse.
     #[test]
     fn shell_probe_recognises_powershell() {
-        assert_eq!(classify_shell_probe(true, "Desktop
-"), RemoteShell::PowerShell);
-        assert_eq!(classify_shell_probe(true, "Core
-"), RemoteShell::PowerShell);
+        assert_eq!(
+            classify_shell_probe(
+                true, "Desktop
+"
+            ),
+            RemoteShell::PowerShell
+        );
+        assert_eq!(
+            classify_shell_probe(
+                true, "Core
+"
+            ),
+            RemoteShell::PowerShell
+        );
     }
 
     #[test]
     fn shell_probe_recognises_cmd_and_posix() {
-        assert_eq!(classify_shell_probe(true, "$PSVersionTable.PSEdition
-"), RemoteShell::Cmd);
-        assert_eq!(classify_shell_probe(true, ".PSEdition
-"), RemoteShell::Posix);
+        assert_eq!(
+            classify_shell_probe(
+                true,
+                "$PSVersionTable.PSEdition
+"
+            ),
+            RemoteShell::Cmd
+        );
+        assert_eq!(
+            classify_shell_probe(
+                true,
+                ".PSEdition
+"
+            ),
+            RemoteShell::Posix
+        );
         assert_eq!(classify_shell_probe(false, ""), RemoteShell::Cmd);
     }
 
@@ -869,6 +939,33 @@ mod tests {
     }
 
     /// `morsh host <cmd>` used to emit `-e`, which neither server accepts.
+    #[cfg(feature = "russh")]
+    #[test]
+    fn russh_connect_record_survives_absent_exit_status() {
+        let mut record = ConnectRecord::default();
+        record.observe("MOSH CONNECT 60001 abcdefghijklmnopqrstuv");
+        let info = finish_russh_output(record, Err("SSH channel closed without exit status"))
+            .unwrap()
+            .expect("captured CONNECT must survive a missing exit status");
+        assert_eq!(info.port, 60001);
+    }
+
+    #[test]
+    fn ipv6_literals_and_explicit_ports_are_kept_intact() {
+        for (host, hostname, port) in [
+            ("::1", "::1", 22),
+            ("user@[::1]", "::1", 22),
+            ("user@[::1]:2222", "::1", 2222),
+            ("user@alias:2200", "alias", 2200),
+        ] {
+            assert_eq!(target_hostname(host, None), hostname);
+            assert_eq!(target_port(host, None), port);
+        }
+        let mut args = Vec::new();
+        append_ssh_target(&mut args, "user@[::1]:2222", Family::Inet6);
+        assert_eq!(args, ["-6", "-p", "2222", "user@::1"]);
+    }
+
     #[test]
     fn a_remote_command_is_introduced_with_a_double_dash() {
         let args = build_server_args(
@@ -890,7 +987,15 @@ mod tests {
     /// happened to return.
     #[test]
     fn bind_server_ssh_emits_dash_s() {
-        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, &None, false, &[], &[]);
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::SshConnection,
+            &None,
+            &None,
+            false,
+            &[],
+            &[],
+        );
         assert!(args.contains(&"-s".to_string()), "{args:?}");
         assert!(!args.contains(&"-i".to_string()), "{args:?}");
     }
@@ -914,7 +1019,15 @@ mod tests {
 
     #[test]
     fn no_port_range_emits_no_dash_p() {
-        let args = build_server_args("morsh-server", &BindServer::SshConnection, &None, &None, false, &[], &[]);
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::SshConnection,
+            &None,
+            &None,
+            false,
+            &[],
+            &[],
+        );
         assert!(!args.contains(&"-p".to_string()), "{args:?}");
     }
 
@@ -936,7 +1049,15 @@ mod tests {
 
     #[test]
     fn bind_server_any_emits_neither() {
-        let args = build_server_args("morsh-server", &BindServer::Any, &None, &None, false, &[], &[]);
+        let args = build_server_args(
+            "morsh-server",
+            &BindServer::Any,
+            &None,
+            &None,
+            false,
+            &[],
+            &[],
+        );
         assert!(!args.contains(&"-s".to_string()));
         assert!(!args.contains(&"-i".to_string()));
     }

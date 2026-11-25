@@ -1,12 +1,15 @@
 mod cli;
 mod frame;
 mod input;
+mod tty;
 
-use crossterm::{cursor, execute, terminal};
+use crossterm::terminal;
 use morsh_crypto::{Base64Key, Session};
 use morsh_network::{Connection, Transport};
-use morsh_prediction::{DisplayPreference, NotificationEngine, PredictionEngine};
+use morsh_prediction::{NotificationEngine, PredictionEngine};
 use morsh_statesync::{Complete, UserStream};
+#[cfg(unix)]
+use morsh_terminal::ScreenSnapshot;
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -15,11 +18,18 @@ use tokio::sync::mpsc;
 use cli::ParseOutcome;
 use frame::output_new_frame;
 use input::{handle_term_event, spawn_input_reader, EscapeConfig, TermEvent};
+use tty::Tty;
 
 /// Longest we sleep between housekeeping passes.
 const MAX_WAIT: Duration = Duration::from_millis(250);
 /// Give up if the server never answers at all.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Say that the server hasn't answered once it has been this long.
+const CONNECTING_NOTICE_AFTER: Duration = Duration::from_millis(250);
+/// Stock mosh-client's warning when the server never acknowledged the end of
+/// the session.
+const UNCLEAN_SHUTDOWN: &str = "\n\nmorsh did not shut down cleanly. Please note that the\n\
+                                morsh-server process may still be running on the server.\n";
 
 pub type ClientTransport = Transport<UserStream, Complete>;
 
@@ -44,6 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Same variables and values as stock mosh-client, checked up front as
+    // it does.
+    let env = |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let display_preference =
+        match cli::prediction_display(env("MOSH_PREDICTION_DISPLAY").as_deref()) {
+            Ok(mode) => mode,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        };
+    let predict_overwrite = cli::prediction_overwrite(env("MOSH_PREDICTION_OVERWRITE").as_deref());
+
     let key_str = std::env::var("MORSH_KEY").map_err(|_| {
         "MORSH_KEY environment variable not set. Run via morsh wrapper.".to_string()
     })?;
@@ -62,21 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|&(c, r)| c > 0 && r > 0)
         .unwrap_or((80, 24));
 
-    let mut user_stream = UserStream::new();
-    user_stream.push_resize(cols as i32, rows as i32);
-
-    let mut transport: ClientTransport =
-        Transport::new_client(connection, user_stream, Complete::new(cols, rows)?);
+    let mut transport = new_transport(connection, cols, rows)?;
 
     let mut prediction = PredictionEngine::new();
-    // Same variable and values as stock mosh-client
-    let display_preference = match std::env::var("MOSH_PREDICTION_DISPLAY").as_deref() {
-        Ok("always") => DisplayPreference::Always,
-        Ok("never") => DisplayPreference::Never,
-        _ => DisplayPreference::Adaptive,
-    };
     tracing::info!("Prediction display: {display_preference:?}");
     prediction.set_display_preference(display_preference);
+    prediction.set_predict_overwrite(predict_overwrite);
     prediction.set_send_interval(transport.send_interval_ms());
 
     let mut notifications = NotificationEngine::new();
@@ -87,31 +101,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications.set_escape_key_help(escape.help());
     }
 
-    terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    #[cfg(windows)]
-    let original_console_mode = enable_delayed_wrap();
-    #[cfg(windows)]
-    let original_input_mode = input::enable_vt_input();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-
     // What we believe is currently on the user's screen. The alternate screen
-    // we just entered is blank, and a blank `Complete` is precisely our model
-    // of a blank terminal — building the baseline any other way makes the
-    // first frame repaint the whole screen with spaces.
+    // we are about to enter is blank, and a blank `Complete` is precisely our
+    // model of a blank terminal — building the baseline any other way makes
+    // the first frame repaint the whole screen with spaces.
     let mut local_framebuffer = Complete::new(cols, rows)?.snapshot();
+
+    let mut scratch_frame = local_framebuffer.clone();
+    let mut tty = Tty::enter()?;
+    let mut stdout = io::stdout();
 
     let (term_tx, mut term_rx) = mpsc::channel::<TermEvent>(64);
     spawn_input_reader(term_tx, escape);
 
+    let mut signals = Signals::new();
+
     tracing::info!("Entering event loop");
     let started = Instant::now();
-    let mut connect_failed = false;
+    // Like stock mosh: true once the session ended by agreement with the
+    // server, rather than by giving up on it.
+    let mut clean_shutdown = false;
+    let connecting_notification = format!(
+        "Nothing received from server on UDP port {}.",
+        server_addr.port()
+    );
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
-        output_new_frame(&transport, &prediction, &mut local_framebuffer, &mut stdout)?;
+        // Not `?`: that would leave without handing the terminal back or
+        // saying why.
+        if let Err(e) = output_new_frame(
+            &transport,
+            &mut prediction,
+            &mut notifications,
+            &mut local_framebuffer,
+            &mut scratch_frame,
+            &mut stdout,
+        ) {
+            break Err(e.into());
+        }
 
-        let mut wait = transport.wait_time_ms().min(prediction.wait_time_ms());
+        let mut wait = transport
+            .wait_time_ms()
+            .min(prediction.wait_time_ms())
+            .min(notifications.wait_time_ms());
         if transport.get_remote_state_num() == 0 {
             wait = wait.min(250);
         }
@@ -121,7 +153,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Both branches are cancel-safe: `mpsc::Receiver::recv` and
             // `Transport::recv`, whose only await is a `recv_from`.
             Some(term_event) = term_rx.recv() => {
-                if handle_term_event(
+                if let TermEvent::Suspend = term_event {
+                    // Like stock mosh, not once the session is ending.
+                    #[cfg(unix)]
+                    if !transport.shutdown_in_progress() {
+                        if let Err(e) = tty.suspend() {
+                            break Err(e.into());
+                        }
+                        forget_screen(&mut local_framebuffer);
+                    }
+                } else if handle_term_event(
                     term_event,
                     &mut transport,
                     &mut prediction,
@@ -135,61 +176,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = transport.recv() => {
                 match result {
                     Ok(_) => {
-                        notifications.clear_network_error();
-                        notifications.server_heard(Instant::now());
+                        notifications.server_heard(transport.get_latest_remote_state().timestamp);
                         notifications.server_acked(transport.sender.sent_state_acked_timestamp());
 
-                        prediction.set_local_frame_acked(transport.sender.sent_state_acked());
                         prediction.set_send_interval(transport.send_interval_ms());
-                        let remote = &transport.get_latest_remote_state().state;
-                        prediction.set_local_frame_late_acked(remote.echo_ack());
-
-                        let screen = remote.snapshot();
-                        prediction.validate_predictions(
-                            |r, c| {
-                                screen
-                                    .cell(c as u16, r as u16)
-                                    .and_then(|d| d.text.chars().next())
-                                    .unwrap_or(' ')
-                            },
-                            screen.cursor_y as usize,
-                            screen.cursor_x as usize,
+                        // The predictions are checked against the new state
+                        // when the next frame is drawn.
+                        prediction.set_local_frame_late_acked(
+                            transport.get_latest_remote_state().state.echo_ack(),
                         );
                     }
                     Err(e) => {
                         tracing::warn!("Recv error: {e}");
-                        notifications.set_network_error(e.to_string());
+                        if !transport.shutdown_in_progress() {
+                            notifications.set_network_error(e.to_string());
+                        }
                     }
                 }
             }
+            signal = signals.recv() => match signal {
+                SignalEvent::Shutdown => {
+                    if !transport.has_remote_addr() {
+                        break Ok(());
+                    }
+                    if !transport.shutdown_in_progress() {
+                        tracing::info!("Signal received, shutting down");
+                        notifications
+                            .set_notification("Signal received, shutting down...".to_string(), true);
+                        transport.start_shutdown();
+                    }
+                }
+                // Stopped and continued from outside (or after our own
+                // suspend): the terminal may have been reset meanwhile.
+                #[cfg(unix)]
+                SignalEvent::Continued => {
+                    if let Err(e) = tty.resume() {
+                        break Err(e.into());
+                    }
+                    forget_screen(&mut local_framebuffer);
+                }
+            },
             _ = tokio::time::sleep(wait) => {}
         }
 
         // Quit once our shutdown has been acknowledged, or we give up on it.
-        if transport.shutdown_in_progress()
-            && (transport.shutdown_acknowledged() || transport.shutdown_ack_timed_out())
-        {
+        if transport.shutdown_in_progress() && transport.shutdown_acknowledged() {
+            clean_shutdown = true;
+            break Ok(());
+        }
+        if transport.shutdown_in_progress() && transport.shutdown_ack_timed_out() {
             break Ok(());
         }
         // The server asked to shut down and we have acknowledged it.
         if transport.counterparty_shutdown_ack_sent() {
             tracing::info!("Server sent shutdown");
+            clean_shutdown = true;
             break Ok(());
         }
 
-        if transport.get_remote_state_num() == 0
+        let still_connecting = transport.get_remote_state_num() == 0;
+        if still_connecting
             && started.elapsed() > CONNECT_TIMEOUT
             && !transport.shutdown_in_progress()
         {
             tracing::info!("Timed out waiting for server");
             notifications.set_notification("Timed out waiting for server...".to_string(), true);
-            connect_failed = true;
             break Ok(());
         }
+        // Say so if the server hasn't answered yet, as stock mosh does.
+        if still_connecting
+            && !transport.shutdown_in_progress()
+            && started.elapsed() > CONNECTING_NOTICE_AFTER
+        {
+            notifications.set_notification(connecting_notification.clone(), false);
+        } else if !still_connecting && notifications.notification() == connecting_notification {
+            notifications.set_notification(String::new(), false);
+        }
 
-        if let Err(e) = transport.tick().await {
-            tracing::warn!("Send error: {e}");
-            notifications.set_network_error(e.to_string());
+        match transport.tick().await {
+            Ok(()) => notifications.clear_network_error(),
+            Err(e) => {
+                tracing::warn!("Send error: {e}");
+                notifications.set_network_error(e.to_string());
+            }
         }
 
         let now = Instant::now();
@@ -200,29 +269,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Cleanup
-    let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
-    // The saved input mode is the raw one, so put it back before leaving raw mode.
-    #[cfg(windows)]
-    input::restore_input_mode(original_input_mode);
-    let _ = terminal::disable_raw_mode();
-    #[cfg(windows)]
-    restore_console_mode(original_console_mode);
-    println!("morsh is exiting.");
+    tty.restore();
 
-    if connect_failed {
-        eprint!("{}", connect_failure_hint(server_addr));
+    // As stock mosh-client's `STMClient::shutdown` and `main`.
+    if transport.get_remote_state_num() == 0 {
+        eprint!("{}", connect_failure_hint(server_addr, started.elapsed()));
+    } else if !clean_shutdown {
+        eprint!("{UNCLEAN_SHUTDOWN}");
+    }
+    if let Err(e) = &result {
+        eprint!("Error: {e}\r\n");
+    }
+    println!("[morsh is exiting.]");
+
+    if result.is_err() || !clean_shutdown {
         std::process::exit(1);
     }
+    Ok(())
+}
 
-    result
+/// The client's transport, with the window size as the first thing to tell
+/// the server.
+fn new_transport(connection: Connection, cols: u16, rows: u16) -> Result<ClientTransport, String> {
+    // In this order, as stock mosh-client does: the transport takes its
+    // starting state as what the server already has, so a resize pushed
+    // before it is built would never be sent.
+    let mut transport =
+        Transport::new_client(connection, UserStream::new(), Complete::new(cols, rows)?);
+    transport
+        .get_current_state_mut()
+        .push_resize(cols as i32, rows as i32);
+    Ok(transport)
+}
+
+/// The alternate screen was entered afresh and is blank: model it so, and
+/// the next frame repaints everything.
+#[cfg(unix)]
+fn forget_screen(local_framebuffer: &mut ScreenSnapshot) {
+    let (cols, rows) = (local_framebuffer.cols, local_framebuffer.rows_count);
+    *local_framebuffer = Complete::new(cols, rows)
+        .map(|blank| blank.snapshot())
+        .unwrap_or_else(|_| ScreenSnapshot::new(cols, rows));
+}
+
+/// Nothing is listened for on Windows yet.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum SignalEvent {
+    /// End the session.
+    Shutdown,
+    /// The process was continued after being stopped.
+    #[cfg(unix)]
+    Continued,
+}
+
+/// The signals stock mosh-client acts on: SIGTERM, SIGINT, SIGHUP and
+/// SIGPIPE end the session, and SIGCONT takes the terminal back over.
+struct Signals {
+    #[cfg(unix)]
+    shutdown: [Option<tokio::signal::unix::Signal>; 4],
+    #[cfg(unix)]
+    continued: Option<tokio::signal::unix::Signal>,
+}
+
+impl Signals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let listen = |kind: SignalKind| {
+                signal(kind)
+                    .inspect_err(|e| tracing::warn!("Failed to listen for {kind:?}: {e}"))
+                    .ok()
+            };
+            Self {
+                shutdown: [
+                    listen(SignalKind::terminate()),
+                    listen(SignalKind::interrupt()),
+                    listen(SignalKind::hangup()),
+                    listen(SignalKind::pipe()),
+                ],
+                continued: listen(SignalKind::from_raw(libc::SIGCONT)),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Wait for the next signal. Cancel-safe.
+    async fn recv(&mut self) -> SignalEvent {
+        #[cfg(unix)]
+        {
+            async fn one(signal: &mut Option<tokio::signal::unix::Signal>) {
+                if let Some(signal) = signal {
+                    if signal.recv().await.is_some() {
+                        return;
+                    }
+                }
+                std::future::pending().await
+            }
+            let [a, b, c, d] = &mut self.shutdown;
+            tokio::select! {
+                () = one(a) => SignalEvent::Shutdown,
+                () = one(b) => SignalEvent::Shutdown,
+                () = one(c) => SignalEvent::Shutdown,
+                () = one(d) => SignalEvent::Shutdown,
+                () = one(&mut self.continued) => SignalEvent::Continued,
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending().await
+    }
 }
 
 /// Message shown when the server never answers. SSH already worked, so the
 /// server is almost certainly running and UDP is being blocked on the way.
-fn connect_failure_hint(server_addr: SocketAddr) -> String {
+fn connect_failure_hint(server_addr: SocketAddr, waited: Duration) -> String {
     let port = server_addr.port();
-    let waited = CONNECT_TIMEOUT.as_secs();
+    let waited = waited.as_secs();
     format!(
         "morsh: no response from server at {server_addr} (UDP) after {waited}s.\n\
          \n\
@@ -236,36 +399,47 @@ fn connect_failure_hint(server_addr: SocketAddr) -> String {
     )
 }
 
-/// Windows console: make the cursor wait at the right margin instead of
-/// wrapping as soon as the last column is written (which scrolls the screen
-/// when on the bottom row). Returns the original mode to restore on exit.
-#[cfg(windows)]
-fn enable_delayed_wrap() -> Option<u32> {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
-    };
-    unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut mode = 0;
-        if GetConsoleMode(handle, &mut mode) == 0 {
-            return None;
-        }
-        let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
-        if SetConsoleMode(handle, new_mode) == 0 {
-            tracing::warn!("Failed to set console mode {new_mode:#x}");
-            return None;
-        }
-        Some(mode)
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use morsh_statesync::UserEvent;
 
-#[cfg(windows)]
-fn restore_console_mode(mode: Option<u32>) {
-    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_OUTPUT_HANDLE};
-    if let Some(mode) = mode {
-        unsafe {
-            SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+    /// The server sizes the session's pty from the client's first resize,
+    /// and has nothing else to go on: it must be in the first diff sent.
+    #[tokio::test]
+    async fn the_window_size_reaches_the_server() {
+        let key = *Base64Key::random().data();
+        let server_conn = Connection::new_server("127.0.0.1:0".parse().unwrap(), Session::new(key))
+            .await
+            .unwrap();
+        let server_addr = server_conn.local_addr().unwrap();
+        let mut server: Transport<Complete, UserStream> = Transport::new_server(
+            server_conn,
+            Complete::new(80, 24).unwrap(),
+            UserStream::new(),
+        );
+
+        let mut client_conn = Connection::new_client(Session::new(key)).await.unwrap();
+        client_conn.set_remote_addr(server_addr);
+        let mut client = new_transport(client_conn, 180, 52).unwrap();
+
+        let resize = UserEvent::Resize {
+            width: 180,
+            height: 52,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            client.tick().await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(50), server.recv()).await;
+            if server
+                .get_latest_remote_state()
+                .state
+                .events()
+                .contains(&resize)
+            {
+                return;
+            }
         }
+        panic!("the server never heard the window size");
     }
 }

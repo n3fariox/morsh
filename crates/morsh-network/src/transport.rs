@@ -88,9 +88,9 @@ impl<S: State> TransportSender<S> {
     }
 
     /// Roughly two frames per RTT, bounded by the frame-rate limits.
-    pub fn send_interval(&self, srtt_ms: u64) -> Duration {
-        ms(srtt_ms
-            .div_ceil(2)
+    /// Mosh: `lrint( ceil( SRTT / 2.0 ) )`, clamped.
+    pub fn send_interval(&self, srtt_ms: f64) -> Duration {
+        ms(((srtt_ms / 2.0).ceil().max(0.0) as u64)
             .clamp(SEND_INTERVAL_MIN_MS, SEND_INTERVAL_MAX_MS))
     }
 
@@ -204,7 +204,7 @@ impl<S: State> TransportSender<S> {
     }
 
     /// Recompute the send and ack deadlines. Mosh's `calculate_timers`.
-    fn calculate_timers(&mut self, now: Instant, timeout: Duration, srtt_ms: u64) {
+    fn calculate_timers(&mut self, now: Instant, timeout: Duration, srtt_ms: f64) {
         self.update_assumed_receiver_state(now, timeout);
         self.rationalize_states();
 
@@ -253,7 +253,7 @@ impl<S: State> TransportSender<S> {
         &mut self,
         now: Instant,
         timeout: Duration,
-        srtt_ms: u64,
+        srtt_ms: f64,
         has_remote_addr: bool,
     ) -> u64 {
         self.calculate_timers(now, timeout, srtt_ms);
@@ -278,7 +278,7 @@ impl<S: State> TransportSender<S> {
         &mut self,
         now: Instant,
         timeout: Duration,
-        srtt_ms: u64,
+        srtt_ms: f64,
         has_remote_addr: bool,
     ) -> Option<TransportInstruction> {
         self.calculate_timers(now, timeout, srtt_ms);
@@ -493,7 +493,7 @@ impl<M: State, R: State> Transport<M, R> {
     pub fn wait_time_ms(&mut self) -> u64 {
         let now = Instant::now();
         let timeout = self.connection.timeout();
-        let srtt = self.connection.srtt_ms();
+        let srtt = self.connection.srtt();
         let has_remote = self.connection.has_remote();
         self.sender.wait_time_ms(now, timeout, srtt, has_remote)
     }
@@ -502,7 +502,7 @@ impl<M: State, R: State> Transport<M, R> {
     pub async fn tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
         let timeout = self.connection.timeout();
-        let srtt = self.connection.srtt_ms();
+        let srtt = self.connection.srtt();
         let has_remote = self.connection.has_remote();
 
         let Some(inst) = self.sender.tick(now, timeout, srtt, has_remote) else {
@@ -521,18 +521,24 @@ impl<M: State, R: State> Transport<M, R> {
 
     /// Receive and process one datagram.
     ///
-    /// Cancel-safe. The only await is [`Connection::recv_raw`]; everything
+    /// Cancel-safe. The only await is inside [`Connection::recv`]; everything
     /// that mutates receiver state runs synchronously afterwards, so dropping
     /// this future in a `select!` cannot lose a packet that has already been
     /// taken off the socket.
     pub async fn recv(&mut self) -> Result<RecvOutcome, String> {
-        let (data, peer) = self.connection.recv_raw().await?;
-        self.process_datagram(&data, peer)
+        match self.connection.recv().await? {
+            Some(inst) => self.process_instruction(inst),
+            None => Ok(RecvOutcome::Incomplete),
+        }
     }
 
     /// The synchronous half of [`Transport::recv`], split out so tests can
     /// drive the protocol without sockets.
-    pub fn process_datagram(&mut self, data: &[u8], peer: std::net::SocketAddr) -> Result<RecvOutcome, String> {
+    pub fn process_datagram(
+        &mut self,
+        data: &[u8],
+        peer: std::net::SocketAddr,
+    ) -> Result<RecvOutcome, String> {
         let Some(inst) = self.connection.process_incoming(data, peer)? else {
             return Ok(RecvOutcome::Incomplete);
         };
@@ -579,7 +585,9 @@ impl<M: State, R: State> Transport<M, R> {
         self.process_throwaway_until(throwaway_num);
         let Some(reference_index) = self.received_states.iter().position(|s| s.num == old_num)
         else {
-            tracing::debug!("Reference state {old_num} was culled by throwaway_num {throwaway_num}");
+            tracing::debug!(
+                "Reference state {old_num} was culled by throwaway_num {throwaway_num}"
+            );
             return Ok(RecvOutcome::Ignored);
         };
 
@@ -680,7 +688,10 @@ impl<M: State, R: State> Transport<M, R> {
             }
         }
 
-        self.last_receiver_state = self.received_states.last().unwrap().state.clone();
+        // `clone_from` lets a state reuse its existing allocations (a
+        // terminal framebuffer, for `Complete`) instead of building a new one.
+        let latest = &self.received_states.last().unwrap().state;
+        self.last_receiver_state.clone_from(latest);
         ret
     }
 
@@ -720,7 +731,7 @@ impl<M: State, R: State> Transport<M, R> {
     /// Adaptive send interval in milliseconds, for the prediction engine.
     pub fn send_interval_ms(&self) -> u64 {
         self.sender
-            .send_interval(self.connection.srtt_ms())
+            .send_interval(self.connection.srtt())
             .as_millis() as u64
     }
 
@@ -774,7 +785,7 @@ mod tests {
     }
 
     const TIMEOUT: Duration = Duration::from_millis(50);
-    const SRTT: u64 = 50;
+    const SRTT: f64 = 50.0;
 
     fn sender() -> TransportSender<Bytes> {
         TransportSender::new(Bytes::default())
@@ -999,9 +1010,10 @@ mod tests {
     #[test]
     fn send_interval_tracks_rtt_within_bounds() {
         let s = sender();
-        assert_eq!(s.send_interval(10), ms(SEND_INTERVAL_MIN_MS));
-        assert_eq!(s.send_interval(100), ms(50));
-        assert_eq!(s.send_interval(5000), ms(SEND_INTERVAL_MAX_MS));
+        assert_eq!(s.send_interval(10.0), ms(SEND_INTERVAL_MIN_MS));
+        assert_eq!(s.send_interval(100.0), ms(50));
+        assert_eq!(s.send_interval(100.5), ms(51), "mosh rounds up");
+        assert_eq!(s.send_interval(5000.0), ms(SEND_INTERVAL_MAX_MS));
     }
 
     // ---- receiver-side guards -------------------------------------------

@@ -44,6 +44,21 @@ impl Clone for Complete {
             input_history: self.input_history.clone(),
         }
     }
+
+    /// Reuse screen/history buffers when they have enough capacity. As with
+    /// clone(), the copied state rebuilds its emulator lazily on the next write.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            terminal: _,
+            screen,
+            echo_ack,
+            input_history,
+        } = source;
+        self.terminal = None;
+        self.screen.clone_from(screen);
+        self.echo_ack = *echo_ack;
+        self.input_history.clone_from(input_history);
+    }
 }
 
 impl Complete {
@@ -69,6 +84,7 @@ impl Complete {
         if self.terminal.is_none() {
             let (cols, rows) = (self.screen.cols, self.screen.rows_count);
             let mut term = MoshTerminal::new(cols, rows, 0)?;
+            term.write(DisplayDiff::grapheme_mode(&self.screen).as_bytes());
             term.write(DisplayDiff::full_redraw(&self.screen).as_bytes());
             self.terminal = Some(term);
         }
@@ -85,14 +101,13 @@ impl Complete {
 
     /// Feed raw host (PTY) output into the terminal.
     ///
-    /// Mosh's `Complete::act`, which also returns what the terminal wants to
-    /// write back to the host. libghostty-vt does not surface terminal replies
-    /// through this API, so nothing is returned; queries such as DA/DSR go
-    /// unanswered, exactly as before this change.
-    pub fn act(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.terminal_mut()?.write(bytes);
+    /// Mosh's `Complete::act`: the returned bytes must be written back to the
+    /// host PTY. They answer the device attribute, status, and cursor queries
+    /// supported by stock mosh 1.4.0.
+    pub fn act(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let replies = self.terminal_mut()?.write_with_replies(bytes);
         self.refresh();
-        Ok(())
+        Ok(replies)
     }
 
     /// Resize the terminal, preserving its contents.
@@ -134,7 +149,8 @@ impl Complete {
             }
         }
 
-        self.input_history.retain(|&(num, _)| num >= newest_echo_ack);
+        self.input_history
+            .retain(|&(num, _)| num >= newest_echo_ack);
 
         let changed = self.echo_ack != newest_echo_ack;
         self.echo_ack = newest_echo_ack;
@@ -155,6 +171,7 @@ impl Complete {
     }
 
     /// The current screen contents, cloned.
+    /// Use `destination.clone_from(self.screen())` to reuse an existing snapshot.
     pub fn snapshot(&self) -> ScreenSnapshot {
         self.screen.clone()
     }
@@ -204,7 +221,11 @@ impl State for Complete {
                 });
             }
 
-            let update = DisplayDiff::diff(&existing.screen, &self.screen);
+            let mut update = String::new();
+            if existing.screen.grapheme_cluster != self.screen.grapheme_cluster {
+                update.push_str(&DisplayDiff::grapheme_mode(&self.screen));
+            }
+            update.push_str(&DisplayDiff::diff(&existing.screen, &self.screen));
             if !update.is_empty() {
                 output.instruction.push(HostInstruction {
                     hostbytes: Some(HostBytes {
@@ -271,6 +292,57 @@ mod tests {
 
     #[test]
     #[serial]
+    fn host_queries_return_stock_mosh_replies() {
+        let mut state = Complete::new(120, 40).unwrap();
+        let replies = state.act(b"\x1b[c\x1b[>c\x1b[5n\x1b[6n").unwrap();
+        assert_eq!(replies, b"\x1b[?62c\x1b[>1;10;0c\x1b[0n\x1b[1;1R");
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_queries_report_the_position_at_each_query_and_after_resize() {
+        let mut state = Complete::new(120, 40).unwrap();
+        let replies = state.act(b"\x1b[999;999H\x1b[6n\x1b[H\x1b[6n").unwrap();
+        assert_eq!(replies, b"\x1b[40;120R\x1b[1;1R");
+        state.resize(320, 80).unwrap();
+        assert_eq!(state.act(b"\x1b[999;999H\x1b[6n").unwrap(), b"\x1b[80;320R");
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_query_fragments_survive_pty_read_boundaries() {
+        let mut state = Complete::new(80, 24).unwrap();
+        for byte in b"\x1b[3;7H\x1b[6" {
+            assert!(state.act(&[*byte]).unwrap().is_empty());
+        }
+        assert_eq!(state.act(b"n").unwrap(), b"\x1b[3;7R");
+        assert!(state.act(b"text").unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn clone_from_replaces_live_terminal_state_without_aliasing_source() {
+        let mut source = Complete::new(20, 2).unwrap();
+        source.act(b"seed").unwrap();
+        source.set_echo_ack_num(7);
+        source.register_input_frame(8, Instant::now());
+        let mut reused = Complete::new(4, 1).unwrap();
+        reused.act(b"old").unwrap();
+
+        reused.clone_from(&source);
+        assert!(reused.terminal.is_none());
+        assert!(source.terminal.is_some());
+        assert!(reused.state_equal(&source));
+        assert_eq!(reused.input_history, source.input_history);
+
+        reused.act(b"!").unwrap();
+        assert_eq!(reused.screen().rows[0][4].text, "!");
+        assert_eq!(source.screen().rows[0][4].text, "");
+        assert_eq!(reused.screen().rows[0][0].text, "s");
+    }
+
+    #[test]
+    #[serial]
     fn create_complete() {
         let c = Complete::new(80, 24);
         assert!(c.is_ok());
@@ -327,11 +399,59 @@ mod tests {
         assert!(String::from_utf8_lossy(bytes).contains("Hi"));
     }
 
+    const CLUSTER: &str = "\x1b[?2027h👍🏽x";
+
+    #[test]
+    #[serial]
+    fn grapheme_mode_reaches_the_peer_before_the_text() {
+        let mut server = Complete::new(20, 3).unwrap();
+        let mut client = Complete::new(20, 3).unwrap();
+        let blank = server.clone();
+        server.act(CLUSTER.as_bytes()).unwrap();
+
+        client.apply_string(&server.diff_from(&blank)).unwrap();
+
+        assert!(client.screen().grapheme_cluster);
+        assert_eq!(client.screen().rows, server.screen().rows);
+    }
+
+    #[test]
+    #[serial]
+    fn grapheme_mode_can_be_turned_off_again() {
+        let mut server = Complete::new(20, 3).unwrap();
+        let mut client = Complete::new(20, 3).unwrap();
+        let blank = server.clone();
+        server.act(b"\x1b[?2027h").unwrap();
+        client.apply_string(&server.diff_from(&blank)).unwrap();
+
+        let enabled = server.clone();
+        server.act(b"\x1b[?2027l").unwrap();
+        client.apply_string(&server.diff_from(&enabled)).unwrap();
+
+        assert!(!client.screen().grapheme_cluster);
+    }
+
+    #[test]
+    #[serial]
+    fn grapheme_mode_survives_rebuilding_the_emulator() {
+        let mut original = Complete::new(20, 3).unwrap();
+        original.act(CLUSTER.as_bytes()).unwrap();
+
+        let mut rebuilt = original.clone();
+        rebuilt.act(" y".as_bytes()).unwrap();
+        original.act(" y".as_bytes()).unwrap();
+
+        assert!(rebuilt.screen().grapheme_cluster);
+        assert_eq!(rebuilt.screen().rows, original.screen().rows);
+    }
+
     #[test]
     #[serial]
     fn diff_round_trips_through_apply_string() {
         let mut source = Complete::new(40, 4).unwrap();
-        source.act(b"first line\r\n\x1b[1;32msecond\x1b[0m").unwrap();
+        source
+            .act(b"first line\r\n\x1b[1;32msecond\x1b[0m")
+            .unwrap();
 
         let mut target = Complete::new(40, 4).unwrap();
         let blank = Complete::new(40, 4).unwrap();

@@ -53,7 +53,7 @@ impl CellStyle {
 }
 
 /// A single terminal cell with content and style.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CellData {
     pub text: String,
     /// This cell holds a double-width glyph and owns the column to its right.
@@ -62,6 +62,31 @@ pub struct CellData {
     /// drawn here: writing the wide glyph already covered it.
     pub spacer: bool,
     pub style: CellStyle,
+}
+
+impl Clone for CellData {
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            wide: self.wide,
+            spacer: self.spacer,
+            style: self.style,
+        }
+    }
+
+    /// Reuse the text buffer when its capacity is sufficient.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            text,
+            wide,
+            spacer,
+            style,
+        } = source;
+        self.text.clone_from(text);
+        self.wide = *wide;
+        self.spacer = *spacer;
+        self.style = *style;
+    }
 }
 
 impl CellData {
@@ -77,6 +102,20 @@ impl CellData {
 
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    /// The `char` this cell shows, if one narrow `char` describes it fully.
+    /// `None` for either half of a wide glyph and for multi-codepoint clusters.
+    pub fn single_char(&self) -> Option<char> {
+        if self.wide || self.spacer {
+            return None;
+        }
+        let mut chars = self.text.chars();
+        match (chars.next(), chars.next()) {
+            (None, _) => Some(' '),
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
     }
 }
 
@@ -113,7 +152,7 @@ pub enum MouseEncoding {
 /// grid — the window title and the input modes are part of the terminal's
 /// observable state, and a client that never learns about them can never show
 /// a title or run a mouse-driven program.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ScreenSnapshot {
     pub rows: Vec<Vec<CellData>>,
     pub cols: u16,
@@ -133,9 +172,74 @@ pub struct ScreenSnapshot {
     pub mouse_focus_event: bool,
     /// DEC 1007: alternate scroll.
     pub mouse_alternate_scroll: bool,
+    /// DEC 2027: grapheme clustering. Unlike the modes above this one is kept
+    /// between emulators and never reaches the user's terminal, which may have
+    /// its own default that we couldn't restore on exit.
+    pub grapheme_cluster: bool,
     pub fg: RgbColor,
     pub bg: RgbColor,
     pub palette: [RgbColor; 256],
+}
+
+impl Clone for ScreenSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            rows: self.rows.clone(),
+            cols: self.cols,
+            rows_count: self.rows_count,
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+            cursor_visible: self.cursor_visible,
+            title: self.title.clone(),
+            bracketed_paste: self.bracketed_paste,
+            mouse_reporting: self.mouse_reporting,
+            mouse_encoding: self.mouse_encoding,
+            mouse_focus_event: self.mouse_focus_event,
+            mouse_alternate_scroll: self.mouse_alternate_scroll,
+            grapheme_cluster: self.grapheme_cluster,
+            fg: self.fg,
+            bg: self.bg,
+            palette: self.palette,
+        }
+    }
+
+    /// Reuse row and cell buffers when their capacity is sufficient.
+    fn clone_from(&mut self, source: &Self) {
+        let Self {
+            rows,
+            cols,
+            rows_count,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            title,
+            bracketed_paste,
+            mouse_reporting,
+            mouse_encoding,
+            mouse_focus_event,
+            mouse_alternate_scroll,
+            grapheme_cluster,
+            fg,
+            bg,
+            palette,
+        } = source;
+        self.rows.clone_from(rows);
+        self.cols = *cols;
+        self.rows_count = *rows_count;
+        self.cursor_x = *cursor_x;
+        self.cursor_y = *cursor_y;
+        self.cursor_visible = *cursor_visible;
+        self.title.clone_from(title);
+        self.bracketed_paste = *bracketed_paste;
+        self.mouse_reporting = *mouse_reporting;
+        self.mouse_encoding = *mouse_encoding;
+        self.mouse_focus_event = *mouse_focus_event;
+        self.mouse_alternate_scroll = *mouse_alternate_scroll;
+        self.grapheme_cluster = *grapheme_cluster;
+        self.fg = *fg;
+        self.bg = *bg;
+        self.palette = *palette;
+    }
 }
 
 impl ScreenSnapshot {
@@ -155,7 +259,12 @@ impl ScreenSnapshot {
             mouse_encoding: MouseEncoding::Default,
             mouse_focus_event: false,
             mouse_alternate_scroll: false,
-            fg: RgbColor { r: 255, g: 255, b: 255 },
+            grapheme_cluster: false,
+            fg: RgbColor {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
             bg: RgbColor { r: 0, g: 0, b: 0 },
             palette: default_palette(),
         }
@@ -163,16 +272,12 @@ impl ScreenSnapshot {
 
     /// Get a cell at (x, y). Returns None if out of bounds.
     pub fn cell(&self, x: u16, y: u16) -> Option<&CellData> {
-        self.rows
-            .get(y as usize)?
-            .get(x as usize)
+        self.rows.get(y as usize)?.get(x as usize)
     }
 
     /// Get a mutable cell at (x, y). Returns None if out of bounds.
     pub fn cell_mut(&mut self, x: u16, y: u16) -> Option<&mut CellData> {
-        self.rows
-            .get_mut(y as usize)?
-            .get_mut(x as usize)
+        self.rows.get_mut(y as usize)?.get_mut(x as usize)
     }
 }
 
@@ -214,4 +319,49 @@ fn default_palette() -> [RgbColor; 256] {
         palette[(232 + i) as usize] = RgbColor { r: v, g: v, b: v };
     }
     palette
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_from_copies_all_state_and_keeps_storage_independent() {
+        let mut source = ScreenSnapshot::new(12, 3);
+        source.cursor_x = 2;
+        source.cursor_y = 1;
+        source.cursor_visible = false;
+        source.title = "a new title".into();
+        source.bracketed_paste = true;
+        source.mouse_reporting = MouseReporting::AnyEvent;
+        source.mouse_encoding = MouseEncoding::Sgr;
+        source.mouse_focus_event = true;
+        source.mouse_alternate_scroll = true;
+        source.grapheme_cluster = true;
+        source.fg = RgbColor { r: 1, g: 2, b: 3 };
+        source.bg = RgbColor { r: 4, g: 5, b: 6 };
+        source.palette[42] = source.fg;
+        source.rows[0][0].text = "👍🏽".into();
+        source.rows[0][0].wide = true;
+        source.rows[0][0].style.bold = true;
+        source.rows[0][1].spacer = true;
+        source.rows[1][2].text = "e\u{301}".into();
+
+        let mut reused = ScreenSnapshot::new(4, 1);
+        reused.clone_from(&source);
+        assert_eq!(reused, source);
+        assert_eq!(source.clone(), source);
+
+        // Shrink, grow a cluster, clear a title, and replace all mode state.
+        let mut changed = ScreenSnapshot::new(3, 1);
+        changed.rows[0][0].text = "👨\u{200d}👩\u{200d}👧".into();
+        source.clone_from(&changed);
+        assert_eq!(source, changed);
+        assert_eq!(reused.rows[0][0].text, "👍🏽");
+        assert_eq!(reused.title, "a new title");
+        reused.clone_from(&source);
+        assert_eq!(reused, changed);
+        reused.rows[0][0].text.clear();
+        assert!(!source.rows[0][0].text.is_empty());
+    }
 }

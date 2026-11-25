@@ -6,6 +6,7 @@ use russh::keys::{self, *};
 use russh::*;
 
 mod host_keys;
+mod output;
 pub use host_keys::{HostKeyPolicy, StrictHostKeyChecking};
 
 /// A blocking SSH session that executes commands on a remote host.
@@ -40,13 +41,11 @@ impl client::Handler for SshHandler {
 }
 
 impl SshSession {
-    /// Connect to `host:port` as `user`, offering each private key in turn
-    /// the way ssh does, and verifying the server against `host_keys`.
-    ///
-    /// Unencrypted keys are tried first; a passphrase is only asked for once
-    /// none of them was accepted, so an unused encrypted key never prompts.
-    pub fn connect(
-        addr: String,
+    /// Connect as `user` using the caller's address filtering and preference
+    /// order, offering each private key and verifying the server against
+    /// `host_keys`. A passphrase is only requested after unencrypted keys fail.
+    pub fn connect_addresses(
+        addresses: Vec<std::net::SocketAddr>,
         user: impl Into<String> + Send,
         key_paths: &[std::path::PathBuf],
         host_keys: HostKeyPolicy,
@@ -65,7 +64,7 @@ impl SshSession {
                 host_keys: Arc::new(host_keys),
             };
 
-            let socket = connect_tcp(&addr).await?;
+            let socket = connect_tcp(&addresses).await?;
             let peer = socket.peer_addr()?;
             let _ = socket.set_nodelay(true);
 
@@ -120,7 +119,7 @@ impl SshSession {
         let session = self
             .session
             .as_mut()
-            .expect("SshSession used after disconnect");
+            .context("SSH session is disconnected")?;
 
         self.rt.block_on(async move {
             let mut channel = session
@@ -155,7 +154,7 @@ impl SshSession {
                 }
             }
 
-            let code = code.expect("Child exited without exit status");
+            let code = output::exit_status(code)?;
             let output = output.trim_end_matches('\n').to_string();
             Ok::<_, anyhow::Error>((code, output))
         })
@@ -172,7 +171,7 @@ impl SshSession {
         let session = self
             .session
             .as_ref()
-            .expect("SshSession used after disconnect");
+            .context("SSH session is disconnected")?;
 
         self.rt.block_on(async move {
             let mut channel = session
@@ -186,6 +185,7 @@ impl SshSession {
                 .context("Failed to exec SSH command")?;
 
             let mut code = None;
+            let mut lines = output::Lines::default();
 
             loop {
                 let Some(msg) = channel.wait().await else {
@@ -193,9 +193,7 @@ impl SshSession {
                 };
                 match msg {
                     ChannelMsg::Data { data } => {
-                        for line in String::from_utf8_lossy(&data).lines() {
-                            handler(line.to_string());
-                        }
+                        lines.push(&data, &mut handler);
                     }
                     ChannelMsg::ExtendedData { data, .. } => {
                         std::io::Write::write_all(&mut std::io::stderr(), &data).ok();
@@ -207,7 +205,8 @@ impl SshSession {
                 }
             }
 
-            Ok::<u32, anyhow::Error>(code.expect("Child exited without exit status"))
+            lines.finish(&mut handler);
+            output::exit_status(code)
         })
     }
 
@@ -225,25 +224,20 @@ impl SshSession {
     }
 }
 
-/// Connect to the first reachable address of `host:port`, IPv4 first
-/// (mosh's default `--family=prefer-inet`).
-async fn connect_tcp(addr: &str) -> Result<tokio::net::TcpStream> {
-    let mut addrs: Vec<_> = tokio::net::lookup_host(addr)
-        .await
-        .with_context(|| format!("Failed to resolve {addr}"))?
-        .collect();
-    addrs.sort_by_key(|a| !a.is_ipv4());
-
+/// Try resolved addresses in the caller's order; do not change its family policy.
+async fn connect_tcp(addresses: &[std::net::SocketAddr]) -> Result<tokio::net::TcpStream> {
     let mut last_err = None;
-    for a in addrs {
-        match tokio::net::TcpStream::connect(a).await {
-            Ok(s) => return Ok(s),
-            Err(e) => last_err = Some(e),
+    for &address in addresses {
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_err = Some((address, error)),
         }
     }
     match last_err {
-        Some(e) => Err(e).with_context(|| format!("Failed to connect to {addr}")),
-        None => bail!("No addresses found for {addr}"),
+        Some((address, error)) => {
+            Err(error).with_context(|| format!("Failed to connect to {address}"))
+        }
+        None => bail!("No addresses found for SSH connection"),
     }
 }
 
@@ -272,13 +266,32 @@ fn load_key_with_passphrase_prompt(path: &std::path::Path) -> Result<PrivateKey>
 
     // rpassword reads from the terminal with echo off (/dev/tty on Unix, the
     // console on Windows) and strips the line ending, `\r\n` included.
-    let passphrase = rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))
-        .context("Cannot prompt for SSH key passphrase")?;
-    load_secret_key(path, Some(&passphrase)).context("Failed to decrypt key with provided passphrase; is the passphrase correct?")
+    let passphrase =
+        rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))
+            .context("Cannot prompt for SSH key passphrase")?;
+    load_secret_key(path, Some(&passphrase))
+        .context("Failed to decrypt key with provided passphrase; is the passphrase correct?")
 }
 
 impl Drop for SshSession {
     fn drop(&mut self) {
         let _ = self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn caller_address_order_is_preserved() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let preferred = second.local_addr().unwrap();
+        let socket = connect_tcp(&[preferred, first.local_addr().unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(socket.peer_addr().unwrap(), preferred);
+        assert!(connect_tcp(&[]).await.is_err());
     }
 }

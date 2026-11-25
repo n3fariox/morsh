@@ -18,7 +18,10 @@ impl Base64Key {
     /// Parse a 22-character base64 key string.
     pub fn from_printable(printable: &str) -> Result<Self, String> {
         if printable.len() != 22 {
-            return Err(format!("Key must be 22 characters, got {}", printable.len()));
+            return Err(format!(
+                "Key must be 22 characters, got {}",
+                printable.len()
+            ));
         }
 
         // Add back the padding
@@ -32,7 +35,10 @@ impl Base64Key {
             .map_err(|e| format!("Invalid base64: {e}"))?;
 
         if decoded.len() != 16 {
-            return Err(format!("Key must represent 16 octets, got {}", decoded.len()));
+            return Err(format!(
+                "Key must represent 16 octets, got {}",
+                decoded.len()
+            ));
         }
 
         let mut key = [0u8; 16];

@@ -1,4 +1,6 @@
-use crate::snapshot::{CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor};
+use crate::snapshot::{
+    CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor,
+};
 use std::fmt::Write as _;
 
 /// Generates VT escape sequence strings from screen snapshots.
@@ -16,6 +18,23 @@ fn mode(out: &mut String, number: u16, on: bool) {
 /// ST — the same choice mosh makes.
 fn title(out: &mut String, text: &str) {
     let _ = write!(out, "\x1b]0;{text}\x07");
+}
+
+/// Whether a terminal that clusters graphemes may give `text` a different
+/// width than we did, or fold it into the cell before it. The emulator measures
+/// per codepoint unless the host enables mode 2027, and the user's terminal may
+/// do neither the same way, so the cursor can't be trusted after such a cell.
+fn width_is_disputed(text: &str) -> bool {
+    text.chars().count() > 1
+        || text
+            .chars()
+            .any(|c| ('\u{1F000}'..='\u{1FFFF}').contains(&c))
+}
+
+/// Blank the columns `cell` occupies, without moving the cursor. If the terminal
+/// folds the cell into its neighbour nothing else would clear them.
+fn erase_cell(out: &mut String, cell: &CellData) {
+    let _ = write!(out, "\x1b[{}X", if cell.wide { 2 } else { 1 });
 }
 
 /// Emit the mode changes needed to go from `old` to `new`.
@@ -120,6 +139,15 @@ fn detect_scroll(old_rows: &[Vec<CellData>], new: &ScreenSnapshot) -> Option<Scr
 }
 
 impl DisplayDiff {
+    /// The sequence that puts an emulator in `snap`'s grapheme clustering mode.
+    /// It decides how the cells that follow are laid out, so it has to arrive
+    /// before them.
+    pub fn grapheme_mode(snap: &ScreenSnapshot) -> String {
+        let mut out = String::new();
+        mode(&mut out, 2027, snap.grapheme_cluster);
+        out
+    }
+
     /// Generate VT escape sequences to render a full snapshot from scratch.
     pub fn full_redraw(snap: &ScreenSnapshot) -> String {
         let mut out = String::with_capacity(snap.cols as usize * snap.rows_count as usize * 4);
@@ -150,6 +178,10 @@ impl DisplayDiff {
                     }
                     last_style = cell.style;
                 }
+                let disputed = width_is_disputed(&cell.text);
+                if disputed {
+                    erase_cell(&mut out, cell);
+                }
                 if cell.text.is_empty() {
                     out.push(' ');
                 } else {
@@ -157,6 +189,9 @@ impl DisplayDiff {
                 }
                 // A wide glyph already covered the column to its right.
                 x += if cell.wide { 2 } else { 1 };
+                if disputed && x < row.len() {
+                    let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
+                }
             }
             // Reset style at end of row
             if !last_style.is_default() {
@@ -196,24 +231,28 @@ impl DisplayDiff {
 
         state_changes(&mut out, Some(old), new);
 
-        // A scrolled screen is reproduced by scrolling, not by rewriting every
-        // row. `old_rows` is then updated to reflect the shift so the row-by-row
-        // pass below diffs against what is actually on the display.
-        let mut old_rows = old.rows.clone();
+        // Compare against the rows a scroll leaves on the display without
+        // cloning the framebuffer (and every cell's String) on each frame.
+        let scroll = detect_scroll(&old.rows, new);
         let mut first_row = 0usize;
-        if let Some(scroll) = detect_scroll(&old_rows, new) {
+        let mut blank_row = Vec::new();
+        if let Some(scroll) = &scroll {
             first_row = scroll.height;
-            Self::emit_scroll(&mut out, &scroll, new, old.cursor_y);
-            Self::shift_rows(&mut old_rows, &scroll, new);
+            Self::emit_scroll(&mut out, scroll, new, old.cursor_y);
+            blank_row.resize_with(new.cols as usize, CellData::empty);
         }
 
-        let rows = new.rows_count as usize;
-        for (y, (old_row, new_row)) in old_rows[..rows]
+        for (y, new_row) in new.rows[..new.rows_count as usize]
             .iter()
-            .zip(new.rows[..rows].iter())
             .enumerate()
             .skip(first_row)
         {
+            let old_row = match &scroll {
+                // Matching shifted rows were skipped above. The rest of the
+                // scroll region was exposed by scrolling and is now blank.
+                Some(scroll) if y < scroll.height + scroll.lines => &blank_row,
+                _ => &old.rows[y],
+            };
 
             // Quick check: skip unchanged rows
             if old_row == new_row {
@@ -258,6 +297,11 @@ impl DisplayDiff {
                     let width = if new_cell.wide { 2 } else { 1 };
                     cursor_pos = Some((y + 1, x + 1 + width));
 
+                    let disputed = width_is_disputed(&new_cell.text);
+                    if disputed {
+                        erase_cell(&mut out, new_cell);
+                        cursor_pos = None;
+                    }
                     if new_cell.text.is_empty() {
                         out.push(' ');
                     } else {
@@ -284,10 +328,7 @@ impl DisplayDiff {
         // drew something (which left the cursor wherever the last cell was) or
         // the cursor itself moved. Emitting it unconditionally means every
         // idle frame writes a few bytes to the user's terminal forever.
-        if !out.is_empty()
-            || old.cursor_y != new.cursor_y
-            || old.cursor_x != new.cursor_x
-        {
+        if !out.is_empty() || old.cursor_y != new.cursor_y || old.cursor_x != new.cursor_x {
             let _ = write!(out, "\x1b[{};{}H", new.cursor_y + 1, new.cursor_x + 1);
         }
 
@@ -323,18 +364,6 @@ impl DisplayDiff {
                 out.push('\n');
             }
             out.push_str("\x1b[r");
-        }
-    }
-
-    fn shift_rows(old_rows: &mut [Vec<CellData>], scroll: &Scroll, new: &ScreenSnapshot) {
-        let bottom = scroll.lines + scroll.height - 1;
-        let blank: Vec<CellData> = (0..new.cols).map(|_| CellData::empty()).collect();
-        for i in 0..=bottom {
-            old_rows[i] = if i + scroll.lines <= bottom {
-                old_rows[i + scroll.lines].clone()
-            } else {
-                blank.clone()
-            };
         }
     }
 }
@@ -416,6 +445,7 @@ fn style_on(style: &CellStyle) -> String {
 mod tests {
     use super::*;
     use crate::snapshot::CellStyle;
+    use serial_test::serial;
 
     #[test]
     fn full_redraw_basic() {
@@ -425,7 +455,7 @@ mod tests {
 
         let vt = DisplayDiff::full_redraw(&snap);
         assert!(vt.contains("\x1b[2J")); // clear screen
-        assert!(vt.contains("\x1b[H"));  // move to top-left
+        assert!(vt.contains("\x1b[H")); // move to top-left
         assert!(vt.contains("Hi"));
     }
 
@@ -460,9 +490,9 @@ mod tests {
             ..CellStyle::default_style()
         };
         let s = style_on(&style);
-        assert!(s.contains("1"));   // bold
-        assert!(s.contains("38"));  // fg 256-color
-        assert!(s.contains("5"));   // palette mode
+        assert!(s.contains("1")); // bold
+        assert!(s.contains("38")); // fg 256-color
+        assert!(s.contains("5")); // palette mode
     }
 
     #[test]
@@ -606,7 +636,10 @@ mod tests {
         assert!(!vt.contains("\x1b[2J"), "must not repaint: {vt:?}");
         // Only the newly exposed line is drawn.
         assert!(vt.contains("six"));
-        assert!(!vt.contains("three"), "unchanged rows were repainted: {vt:?}");
+        assert!(
+            !vt.contains("three"),
+            "unchanged rows were repainted: {vt:?}"
+        );
     }
 
     #[test]
@@ -625,7 +658,10 @@ mod tests {
         old.cursor_y = 0;
 
         let vt = DisplayDiff::diff(&old, &new);
-        assert!(vt.contains("\x1b[1;4r"), "expected a scrolling region: {vt:?}");
+        assert!(
+            vt.contains("\x1b[1;4r"),
+            "expected a scrolling region: {vt:?}"
+        );
         assert!(vt.contains("\x1b[r"), "region must be reset: {vt:?}");
         assert!(!vt.contains("\x1b[2J"));
     }
@@ -634,12 +670,92 @@ mod tests {
     fn identical_frames_are_not_mistaken_for_a_scroll() {
         let cols = 10u16;
         let mut old = ScreenSnapshot::new(cols, 3);
-        for y in 0..3 {
-            old.rows[y] = text_row(cols, "same");
+        for row in &mut old.rows {
+            *row = text_row(cols, "same");
         }
         let new = old.clone();
         let vt = DisplayDiff::diff(&old, &new);
         assert!(!vt.contains('\n'), "no scroll should be emitted: {vt:?}");
+    }
+
+    /// Draws `text` as morsh sees it onto a terminal that clusters graphemes,
+    /// through `paint`, and returns what morsh expected next to what landed.
+    fn paint_on_clustering_terminal(
+        text: &str,
+        paint: fn(&ScreenSnapshot, &ScreenSnapshot) -> String,
+    ) -> (ScreenSnapshot, ScreenSnapshot) {
+        let mut host = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        host.write(text.as_bytes());
+        let expected = host.snapshot().unwrap();
+
+        let mut user = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        user.write(b"\x1b[?2027h");
+        let blank = user.snapshot().unwrap();
+        user.write(paint(&blank, &expected).as_bytes());
+        (expected, user.snapshot().unwrap())
+    }
+
+    fn column_of(snap: &ScreenSnapshot, text: &str) -> Option<usize> {
+        snap.rows[0].iter().position(|c| c.text == text)
+    }
+
+    /// A terminal that clusters may disagree about a sequence's width, in
+    /// either direction. Whatever it does, the text after it stays put.
+    #[test]
+    #[serial]
+    fn text_after_a_disputed_cluster_stays_in_its_column() {
+        let paints: [fn(&ScreenSnapshot, &ScreenSnapshot) -> String; 2] =
+            [DisplayDiff::diff, |_, new| DisplayDiff::full_redraw(new)];
+        for paint in paints {
+            for cluster in ["👍🏽", "👨\u{200d}👩\u{200d}👧", "🇯🇵", "❤\u{fe0f}"] {
+                let (expected, user) = paint_on_clustering_terminal(&format!("{cluster}xy"), paint);
+                assert_eq!(
+                    column_of(&user, "x"),
+                    column_of(&expected, "x"),
+                    "{cluster}"
+                );
+                assert_eq!(
+                    column_of(&user, "y"),
+                    column_of(&expected, "y"),
+                    "{cluster}"
+                );
+            }
+        }
+    }
+
+    /// Folding a cell into its neighbour leaves its columns unwritten, so
+    /// whatever was there before has to be cleared.
+    #[test]
+    #[serial]
+    fn a_folded_cell_leaves_nothing_stale_behind() {
+        let mut host = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        host.write("abcdefgh".as_bytes());
+        let old = host.snapshot().unwrap();
+        host.write("\x1b[H👍🏽".as_bytes());
+        let new = host.snapshot().unwrap();
+
+        let mut user = crate::MoshTerminal::new(20, 3, 0).unwrap();
+        user.write(b"\x1b[?2027h");
+        let blank = user.snapshot().unwrap();
+        user.write(DisplayDiff::diff(&blank, &old).as_bytes());
+        user.write(DisplayDiff::diff(&old, &new).as_bytes());
+        let screen = user.snapshot().unwrap();
+        for stale in ["c", "d"] {
+            assert_eq!(column_of(&screen, stale), None, "{stale}");
+        }
+        assert_eq!(column_of(&screen, "e"), column_of(&new, "e"));
+    }
+
+    /// Repositioning costs bytes, so plain wide text must not pay for it.
+    #[test]
+    fn undisputed_text_is_not_repositioned() {
+        let mut new = ScreenSnapshot::new(10, 1);
+        new.rows[0][0].text = "日".to_string();
+        new.rows[0][0].wide = true;
+        new.rows[0][1].spacer = true;
+        new.rows[0][2].text = "x".to_string();
+        let vt = DisplayDiff::diff(&ScreenSnapshot::new(10, 1), &new);
+        assert!(vt.contains("日x"), "{vt:?}");
     }
 
     /// A wide glyph covers two columns; emitting a filler space over the
@@ -696,7 +812,20 @@ mod tests {
     }
 
     fn text_rows(snap: &ScreenSnapshot) -> Vec<String> {
-        snap.rows.iter().map(|r| r.iter().map(|c| if c.text.is_empty() { " " } else { c.text.as_str() }).collect()).collect()
+        snap.rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|c| {
+                        if c.text.is_empty() {
+                            " "
+                        } else {
+                            c.text.as_str()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Replays a stock mosh-server session (from a real log) into a model
@@ -705,11 +834,14 @@ mod tests {
     /// cursor move (Ctrl-A -> CSI 3;3 H), which exposed vertical drift when the
     /// raw bytes were written straight to the Windows console.
     #[test]
+    #[serial]
     fn rendering_reproduces_model_across_frames() {
         use crate::MoshTerminal;
         let (cols, rows) = (40u16, 10u16);
         let mut first = String::from("\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[?25l");
-        for _ in 0..rows { first.push_str("\x1b[K\n"); }
+        for _ in 0..rows {
+            first.push_str("\x1b[K\n");
+        }
         first.push_str("\x1b[K\x1b[1;1H\x1b[?25h\x1b[0m");
         let frames: Vec<&str> = vec![
             &first,
@@ -734,7 +866,11 @@ mod tests {
             screen.write(out.as_bytes());
             let shown = screen.snapshot().unwrap();
             assert_eq!(text_rows(&shown), text_rows(&snap), "after frame {f:?}");
-            assert_eq!((shown.cursor_x, shown.cursor_y), (snap.cursor_x, snap.cursor_y), "cursor after frame {f:?}");
+            assert_eq!(
+                (shown.cursor_x, shown.cursor_y),
+                (snap.cursor_x, snap.cursor_y),
+                "cursor after frame {f:?}"
+            );
             displayed = Some(snap);
         }
         let last = displayed.unwrap();

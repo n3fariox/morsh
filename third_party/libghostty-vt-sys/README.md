@@ -6,7 +6,13 @@ Raw FFI bindings for libghostty-vt.
 - Exposes checked-in generated bindings in `src/bindings.rs`.
 - Static linking is the baseline rather than a Cargo feature. Enable the
   additive `link-dynamic` feature to link the shared library instead.
+- Builds apply the backports in `patches/` to fetched, cached, and overridden
+  sources before invoking Zig. Already-applied patches are detected locally.
+  Cached checkouts record the patch-set fingerprint beside `.ghostty-commit`;
+  changing the patches restores the cached checkout before reapplying them.
+  Explicit source overrides are never reset.
 - Set `GHOSTTY_SOURCE_DIR` to force the build to use a local Ghostty checkout.
+  The checkout must be writable or already include these backports.
 - Set `GHOSTTY_ZIG_SYSTEM_DIR` to force Zig package resolution through a
   pre-fetched `zig build --system` directory. This is intended for Nix and other
   sandboxed package managers that cannot fetch during build scripts.

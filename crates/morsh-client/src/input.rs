@@ -23,6 +23,11 @@ pub enum TermEvent {
     /// Show (true) or take down (false) the escape key help.
     EscapeHelp(bool),
     Quit,
+    /// The terminal has no more input to give (end of file or a read error).
+    Closed,
+    /// The escape key's Ctrl-Z. The main loop handles it, since it has to
+    /// hand the terminal back and repaint.
+    Suspend,
 }
 
 /// The escape key and how to type it literally, set from `MOSH_ESCAPE_KEY`
@@ -110,6 +115,8 @@ pub struct Filtered {
     pub help: Option<bool>,
     /// The user typed the quit sequence. Input after it is dropped.
     pub quit: bool,
+    /// The user typed the suspend sequence.
+    pub suspend: bool,
 }
 
 /// Recognizes the two-keystroke escape sequence in the input stream, as
@@ -152,10 +159,8 @@ impl EscapeFilter {
                         out.quit = true;
                         return out;
                     }
-                    // Ctrl-Z: suspend, not yet implemented. Swallowed rather
-                    // than passed through so it does not reach the remote
-                    // shell and stop the wrong process.
-                    0x1A => {}
+                    // Ctrl-Z: suspend the client, not the remote process.
+                    0x1A => out.suspend = true,
                     b if b == config.pass_key || b == config.pass_key2 => out.send.push(config.key),
                     other => out.send.extend_from_slice(&[config.key, other]),
                 }
@@ -181,6 +186,16 @@ impl EscapeFilter {
     }
 }
 
+/// The local window's size, unless it is reported as empty: some terminals
+/// say 0x0 while starting up or being reattached, and a remote pty that
+/// small makes every line of output wrap at every character. (Stock mosh
+/// sends it on; the client already ignores it at startup.)
+fn window_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size()
+        .ok()
+        .filter(|&(cols, rows)| cols > 0 && rows > 0)
+}
+
 /// Pass one chunk of raw input through the escape filter and publish the
 /// result. Returns false once the receiver is gone.
 fn publish(escape: &mut EscapeFilter, bytes: &[u8], term_tx: &mpsc::Sender<TermEvent>) -> bool {
@@ -196,6 +211,9 @@ fn publish(escape: &mut EscapeFilter, bytes: &[u8], term_tx: &mpsc::Sender<TermE
         if term_tx.blocking_send(TermEvent::EscapeHelp(show)).is_err() {
             return false;
         }
+    }
+    if filtered.suspend && term_tx.blocking_send(TermEvent::Suspend).is_err() {
+        return false;
     }
     // Keep reading after a quit: the main loop may still be waiting for the
     // server to acknowledge the shutdown, and it is the one that decides to
@@ -217,7 +235,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
         Ok(mut winch) => {
             tokio::spawn(async move {
                 while winch.recv().await.is_some() {
-                    if let Ok((w, h)) = crossterm::terminal::size() {
+                    if let Some((w, h)) = window_size() {
                         if resize_tx
                             .send(TermEvent::Resize(w as i32, h as i32))
                             .await
@@ -241,7 +259,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
                 Ok(0) => break,
                 Ok(n) => {
                     if !publish(&mut escape, &buf[..n], &term_tx) {
-                        break;
+                        return;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -251,6 +269,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
                 }
             }
         }
+        let _ = term_tx.blocking_send(TermEvent::Closed);
     });
 }
 
@@ -290,6 +309,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
                     "ReadConsoleInputW failed: {}",
                     std::io::Error::last_os_error()
                 );
+                let _ = term_tx.blocking_send(TermEvent::Closed);
                 break;
             }
 
@@ -319,7 +339,7 @@ pub fn spawn_input_reader(term_tx: mpsc::Sender<TermEvent>, escape: Option<Escap
             // The record holds the buffer size, not the window size; ask for
             // the latter.
             if resized {
-                if let Ok((w, h)) = crossterm::terminal::size() {
+                if let Some((w, h)) = window_size() {
                     if term_tx
                         .blocking_send(TermEvent::Resize(w as i32, h as i32))
                         .is_err()
@@ -435,23 +455,9 @@ pub fn handle_term_event(
             }
             prediction.set_local_frame_sent(transport.sender.sent_state_last());
 
-            let (cols, rows) = (
-                local_framebuffer.cols as usize,
-                local_framebuffer.rows_count as usize,
-            );
-
             for byte in bytes {
                 if !paste {
-                    let (cur_row, cur_col) = prediction.cursor_pos().unwrap_or((
-                        local_framebuffer.cursor_y as usize,
-                        local_framebuffer.cursor_x as usize,
-                    ));
-                    prediction.new_user_byte(byte as char, cur_row, cur_col, cols, rows, |r, c| {
-                        local_framebuffer
-                            .cell(c as u16, r as u16)
-                            .and_then(|d| d.text.chars().next())
-                            .unwrap_or(' ')
-                    });
+                    prediction.new_user_byte(byte as char, local_framebuffer);
                 }
                 transport.sender.current_state_mut().push_key(byte);
             }
@@ -471,16 +477,26 @@ pub fn handle_term_event(
             tracing::info!("Resize: {w}x{h}");
             false
         }
-        TermEvent::Quit => {
-            if transport.has_remote_addr() {
-                notifications.set_notification("Exiting on user request...".to_string(), true);
-                transport.start_shutdown();
-                false
-            } else {
-                true
-            }
-        }
+        TermEvent::Quit => shut_down(transport, notifications, "Exiting on user request..."),
+        // Like stock mosh, losing the terminal ends the session.
+        TermEvent::Closed => shut_down(transport, notifications, "Exiting..."),
+        TermEvent::Suspend => false,
     }
+}
+
+/// Tell the server we are leaving, saying why. Returns true if there is no
+/// server to tell, so the client should exit straight away.
+fn shut_down(
+    transport: &mut ClientTransport,
+    notifications: &mut NotificationEngine,
+    why: &str,
+) -> bool {
+    if !transport.has_remote_addr() {
+        return true;
+    }
+    notifications.set_notification(why.to_string(), true);
+    transport.start_shutdown();
+    false
 }
 
 #[cfg(test)]
@@ -509,7 +525,7 @@ mod tests {
         Filtered {
             send: bytes.to_vec(),
             help: Some(false),
-            quit: false,
+            ..Default::default()
         }
     }
 
@@ -555,8 +571,8 @@ mod tests {
             escape.feed(&[b'l', b's', ESC, b'.', b'x']),
             Filtered {
                 send: b"ls".to_vec(),
-                help: None,
                 quit: true,
+                ..Default::default()
             }
         );
     }
@@ -590,9 +606,15 @@ mod tests {
     }
 
     #[test]
-    fn escape_then_ctrl_z_is_swallowed() {
+    fn escape_then_ctrl_z_suspends() {
         let mut escape = filter();
-        assert_eq!(escape.feed(&[ESC, 0x1A, b'.']), after_escape(b"."));
+        assert_eq!(
+            escape.feed(&[ESC, 0x1A, b'.']),
+            Filtered {
+                suspend: true,
+                ..after_escape(b".")
+            }
+        );
     }
 
     #[test]
@@ -652,8 +674,8 @@ mod tests {
             escape.feed(b"\r~."),
             Filtered {
                 send: b"\r".to_vec(),
-                help: None,
                 quit: true,
+                ..Default::default()
             }
         );
         // Typed twice after a newline, the second tilde is literal.

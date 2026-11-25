@@ -15,3 +15,11 @@ tracing = "0.1"
 
 [dev-dependencies]
 serial_test = "3"
+morsh-crypto = { path = "../morsh-crypto" }
+serde_json = "1"
+hex = "0.4"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[[bench]]
+name = "performance"
+harness = false

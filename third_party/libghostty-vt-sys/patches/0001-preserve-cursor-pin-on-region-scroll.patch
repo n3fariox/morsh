@@ -1,0 +1,53 @@
+Subject: Preserve the cursor pin and page-local style references during region scroll
+Upstream: 77190bd02301e2666adf926a1b7a891dc2189353
+
+Backport the cursorScrollRegionUpSlow pin restoration from the upstream
+scroll-region refactor, without changing the pinned Ghostty revision.
+eraseRowBounded moves the tracked cursor pin across pages without migrating
+its style reference. cursorDown then releases a style on the wrong page,
+corrupting reference counts and aborting on a later release. Keep the pin on
+its original page and refresh the cached row/cell pointers instead.
+
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -1515,31 +1515,21 @@
+         // Otherwise use a fast path function from PageList to efficiently
+         // scroll the contents of the scrolling region.
+ 
+-        // Preserve old cursor just for assertions
+-        const old_cursor = screen.cursor;
++        // Keep the original cursor pin: eraseRowBounded moves tracked pins
++        // across pages but does not migrate the cursor's page-local style refs.
++        const old_pin = screen.cursor.page_pin.*;
+ 
+         try screen.pages.eraseRowBounded(
+             .{ .active = .{ .y = self.scrolling_region.top } },
+             self.scrolling_region.bottom - self.scrolling_region.top,
+         );
+ 
+-        // eraseRow and eraseRowBounded will end up moving the cursor pin
+-        // up by 1, so we need to move it back down. A `cursorReload`
+-        // would be better option but this is more efficient and this is
+-        // a super hot path so we do this instead.
+-        assert(screen.cursor.x == old_cursor.x);
+-        assert(screen.cursor.y == old_cursor.y);
+-        screen.cursor.y -= 1;
+-        screen.cursorDown(1);
+-
+-        // The operations above can prune our cursor style so we need to
+-        // update. This should never fail because the above can only FREE
+-        // memory.
+-        screen.manualStyleUpdate() catch |err| {
+-            std.log.warn("deleteLines manualStyleUpdate err={}", .{err});
+-            screen.cursor.style = .{};
+-            screen.manualStyleUpdate() catch unreachable;
+-        };
++        // Restore the pin directly instead of cursorDown/cursorChangePin,
++        // which would release a style from a page that never owned it.
++        screen.cursor.page_pin.* = old_pin;
++        const page_rac = screen.cursor.page_pin.rowAndCell();
++        screen.cursor.page_row = page_rac.row;
++        screen.cursor.page_cell = page_rac.cell;
+ 
+         return;
+     }

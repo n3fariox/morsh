@@ -14,7 +14,13 @@ prost = "0.14"
 flate2 = "1"
 tracing = "0.1"
 socket2 = "0.5"
-futures = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "wire"
+harness = false

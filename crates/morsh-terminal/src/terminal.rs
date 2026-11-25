@@ -1,8 +1,10 @@
+use crate::queries::{Query, QueryParser};
 use libghostty_vt::render::RenderState;
-use libghostty_vt::style::RgbColor as VtRgbColor;
 use libghostty_vt::screen::CellWide;
+use libghostty_vt::style::RgbColor as VtRgbColor;
 use libghostty_vt::terminal::Mode;
 use libghostty_vt::{Terminal, TerminalOptions};
+use std::io::Write as _;
 
 use crate::snapshot::{
     CellData, CellStyle, MouseEncoding, MouseReporting, ScreenSnapshot, StyleColor,
@@ -14,6 +16,7 @@ pub struct MoshTerminal {
     cols: u16,
     rows: u16,
     frame: u64,
+    queries: QueryParser,
 }
 
 impl MoshTerminal {
@@ -31,12 +34,42 @@ impl MoshTerminal {
             cols,
             rows,
             frame: 0,
+            queries: QueryParser::default(),
         })
     }
 
     /// Feed raw VT output bytes from the server (or PTY) into the terminal.
     pub fn write(&mut self, data: &[u8]) {
-        self.terminal.vt_write(data);
+        let _ = self.write_with_replies(data);
+    }
+
+    /// Apply host output and return the query replies stock mosh sends to the PTY.
+    /// Replies use the cursor at the query, even if later bytes move it again.
+    pub fn write_with_replies(&mut self, data: &[u8]) -> Vec<u8> {
+        let (plain_prefix, data) = self.queries.normalize(data);
+        if plain_prefix {
+            self.terminal.vt_write(&[0xc2]);
+            let _ = self.queries.advance(0xc2);
+        }
+        let mut replies = Vec::new();
+        let mut start = 0;
+        while let Some((end, query)) = self.queries.next_query(&data[start..]) {
+            let end = start + end;
+            self.terminal.vt_write(&data[start..end]);
+            start = end;
+            match query {
+                Query::PrimaryAttributes => replies.extend_from_slice(b"\x1b[?62c"),
+                Query::SecondaryAttributes => replies.extend_from_slice(b"\x1b[>1;10;0c"),
+                Query::Status => replies.extend_from_slice(b"\x1b[0n"),
+                Query::Cursor => {
+                    let row = u32::from(self.terminal.cursor_y().unwrap_or(0)) + 1;
+                    let col = u32::from(self.terminal.cursor_x().unwrap_or(0)) + 1;
+                    let _ = write!(replies, "\x1b[{row};{col}R");
+                }
+            }
+        }
+        self.terminal.vt_write(&data[start..]);
+        replies
     }
 
     /// Resize the terminal (cell_width_px/cell_height_px default to 0 when unknown).
@@ -86,7 +119,10 @@ impl MoshTerminal {
 
         // Cursor position
         let (cursor_x, cursor_y) = match snapshot.cursor_viewport().ok().flatten() {
-            Some(cv) => (cv.x.min(cols.saturating_sub(1)), cv.y.min(rows.saturating_sub(1))),
+            Some(cv) => (
+                cv.x.min(cols.saturating_sub(1)),
+                cv.y.min(rows.saturating_sub(1)),
+            ),
             None => (0, 0),
         };
         let cursor_visible = snapshot.cursor_visible().unwrap_or(true);
@@ -103,7 +139,11 @@ impl MoshTerminal {
                 (fg, bg, palette)
             }
             Err(_) => (
-                VtRgbColor { r: 255, g: 255, b: 255 },
+                VtRgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                },
                 VtRgbColor { r: 0, g: 0, b: 0 },
                 [VtRgbColor { r: 0, g: 0, b: 0 }; 256],
             ),
@@ -111,8 +151,8 @@ impl MoshTerminal {
 
         // Read all cells
         let mut screen_rows: Vec<Vec<CellData>> = Vec::with_capacity(rows as usize);
-        let mut row_iter =
-            libghostty_vt::render::RowIterator::new().map_err(|e| format!("RowIterator::new: {e:?}"))?;
+        let mut row_iter = libghostty_vt::render::RowIterator::new()
+            .map_err(|e| format!("RowIterator::new: {e:?}"))?;
         let mut cell_iter = libghostty_vt::render::CellIterator::new()
             .map_err(|e| format!("CellIterator::new: {e:?}"))?;
 
@@ -121,12 +161,12 @@ impl MoshTerminal {
             .map_err(|e| format!("RowIterator::update: {e:?}"))?;
 
         // Iterate rows — RowIteration doesn't implement Iterator, use next() manually
-        // We need to collect into a Vec first since RowIteration borrows row_iter
-        let mut row_snapshots: Vec<(bool, Vec<CellData>)> = Vec::new();
         {
             let mut ri = row_iteration;
-            while let Some(row) = ri.next() {
-                let dirty = row.dirty().unwrap_or(false);
+            while screen_rows.len() < rows as usize {
+                let Some(row) = ri.next() else {
+                    break;
+                };
                 let mut cells = Vec::with_capacity(cols as usize);
                 let cell_iteration = cell_iter
                     .update(row)
@@ -134,9 +174,23 @@ impl MoshTerminal {
                 {
                     let mut ci = cell_iteration;
                     while let Some(cell) = ci.next() {
-                        let graphemes = cell
-                            .graphemes()
-                            .map_err(|_| "Cell::graphemes failed".to_string())?;
+                        // Most cells contain at most one codepoint. Keep that
+                        // scratch storage on the stack; clusters use the full API.
+                        let len = cell
+                            .graphemes_len()
+                            .map_err(|_| "Cell::graphemes_len failed".to_string())?;
+                        let mut single = ['\0'];
+                        let cluster;
+                        let graphemes = if len <= 1 {
+                            cell.graphemes_buf(&mut single)
+                                .map_err(|_| "Cell::graphemes_buf failed".to_string())?;
+                            &single[..len]
+                        } else {
+                            cluster = cell
+                                .graphemes()
+                                .map_err(|_| "Cell::graphemes failed".to_string())?;
+                            &cluster
+                        };
                         let text: String = graphemes.iter().collect();
 
                         let style = match cell.style() {
@@ -152,8 +206,7 @@ impl MoshTerminal {
                             .and_then(|raw| raw.wide())
                             .unwrap_or(CellWide::Narrow);
                         let wide = width == CellWide::Wide;
-                        let spacer =
-                            width == CellWide::SpacerTail || width == CellWide::SpacerHead;
+                        let spacer = width == CellWide::SpacerTail || width == CellWide::SpacerHead;
 
                         // Canonicalise blank cells. ghostty reports a blank
                         // as either an empty grapheme list or a single space
@@ -180,21 +233,14 @@ impl MoshTerminal {
                 while cells.len() < cols as usize {
                     cells.push(CellData::empty());
                 }
-                row_snapshots.push((dirty, cells));
+                screen_rows.push(cells);
             }
-
-        }
-
-        // Take only `rows` worth of rows
-        for (_, cells) in row_snapshots.into_iter().take(rows as usize) {
-            screen_rows.push(cells);
         }
 
         // Pad if fewer rows than expected
-        let empty_row: Vec<CellData> = (0..cols).map(|_| CellData::empty()).collect();
-        while screen_rows.len() < rows as usize {
-            screen_rows.push(empty_row.clone());
-        }
+        screen_rows.resize_with(rows as usize, || {
+            (0..cols).map(|_| CellData::empty()).collect()
+        });
 
         Ok(ScreenSnapshot {
             rows: screen_rows,
@@ -209,6 +255,7 @@ impl MoshTerminal {
             mouse_encoding: self.mouse_encoding(),
             mouse_focus_event: self.mode(Mode::FOCUS_EVENT),
             mouse_alternate_scroll: self.mode(Mode::ALT_SCROLL),
+            grapheme_cluster: self.mode(Mode::GRAPHEME_CLUSTER),
             fg,
             bg,
             palette,

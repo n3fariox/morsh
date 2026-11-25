@@ -23,5 +23,9 @@ prost = "0.14"
 tracing = "0.1"
 morsh-log = { path = "../morsh-log" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+

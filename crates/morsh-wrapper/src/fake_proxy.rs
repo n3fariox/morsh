@@ -7,8 +7,9 @@
 //! `MOSH IP <addr>` (the wrapper sends its UDP there), then shuttle bytes
 //! between ssh and the socket like netcat.
 
+use crate::family::Family;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream};
 use std::process::exit;
 
 /// The flag that selects this mode; checked before normal argument parsing.
@@ -16,7 +17,7 @@ pub const FLAG: &str = "--fake-proxy";
 
 /// The `ProxyCommand` value that makes ssh run this mode, or `None` if our
 /// own path is unknown.
-pub fn proxy_command() -> Option<String> {
+pub fn proxy_command(family: Family) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let exe = exe.to_str()?;
     // ssh runs the command through `$SHELL -c` on Unix and parses it itself
@@ -27,7 +28,10 @@ pub fn proxy_command() -> Option<String> {
     let exe = crate::shell_quote(exe);
     // `%` would otherwise start an ssh token.
     let exe = exe.replace('%', "%%");
-    Some(format!("{exe} {FLAG} -- %h %p"))
+    Some(format!(
+        "{exe} {FLAG} --family={} -- %h %p",
+        family.as_str()
+    ))
 }
 
 /// Pick the address out of a `MOSH IP <addr>` line.
@@ -37,7 +41,18 @@ pub fn parse_ip_line(line: &str) -> Option<&str> {
 
 /// Run the proxy; `args` are the arguments after `--fake-proxy`.
 pub fn run(args: &[String]) -> ! {
-    let args: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--").collect();
+    let (family, args) = match args.first().and_then(|s| s.strip_prefix("--family=")) {
+        Some(value) => (
+            value.parse::<Family>().unwrap_or_else(|e| fail(&e)),
+            &args[1..],
+        ),
+        None => (Family::default(), args),
+    };
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--")
+        .collect();
     let (host, port) = match args[..] {
         [host, port] => match port.parse::<u16>() {
             Ok(port) => (host, port),
@@ -46,8 +61,11 @@ pub fn run(args: &[String]) -> ! {
         _ => fail("usage: morsh --fake-proxy -- HOST PORT"),
     };
 
-    let stream = connect(host, port);
-    let ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let stream = connect(host, port, family);
+    let ip = stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
     eprintln!("MOSH IP {ip}");
 
     let mut to_server = stream.try_clone().unwrap_or_else(|e| fail(&e.to_string()));
@@ -61,12 +79,8 @@ pub fn run(args: &[String]) -> ! {
 
 /// Connect to the first reachable address, IPv4 first (mosh's default
 /// `--family=prefer-inet`).
-fn connect(host: &str, port: u16) -> TcpStream {
-    let mut addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .unwrap_or_else(|e| fail(&format!("could not resolve {host}: {e}")))
-        .collect();
-    addrs.sort_by_key(|a| !a.is_ipv4());
+fn connect(host: &str, port: u16, family: Family) -> TcpStream {
+    let addrs = family.resolve(host, port).unwrap_or_else(|e| fail(&e));
 
     let mut last = String::from("no addresses");
     for addr in addrs {
@@ -107,14 +121,20 @@ mod tests {
 
     #[test]
     fn the_ip_line_is_recognised() {
-        assert_eq!(parse_ip_line("MOSH IP 203.0.113.9\r\n"), Some("203.0.113.9"));
+        assert_eq!(
+            parse_ip_line("MOSH IP 203.0.113.9\r\n"),
+            Some("203.0.113.9")
+        );
         assert_eq!(parse_ip_line("MOSH IP 2001:db8::1"), Some("2001:db8::1"));
         assert_eq!(parse_ip_line("Warning: Permanently added"), None);
     }
 
     #[test]
     fn the_proxy_command_passes_sshs_host_and_port_tokens() {
-        let cmd = proxy_command().unwrap();
-        assert!(cmd.ends_with(" --fake-proxy -- %h %p"), "{cmd}");
+        let cmd = proxy_command(Family::PreferInet6).unwrap();
+        assert!(
+            cmd.ends_with(" --fake-proxy --family=prefer-inet6 -- %h %p"),
+            "{cmd}"
+        );
     }
 }
